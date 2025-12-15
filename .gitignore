@@ -1,7 +1,14 @@
+# Build configuration
 make.sys
+
+# Project management
 TODO
+
+# Release archives
 wien2wannier-*.tar
 wien2wannier-*.tar.gz
+
+# Compiled executables
 SRC_trig/convham
 SRC_trig/findbands
 SRC_trig/join_vectorfiles
@@ -11,17 +18,31 @@ SRC_trig/vec2ascii
 SRC_trig/w2waddsp
 SRC_trig/write_inwplot
 SRC_trig/write_win_backend
-SRC_trig/*.o
+SRC_w2w/w2w
+SRC_w2w/w2wc
+SRC_wplot/wplot
+SRC_wplot/wplotc
+
+# Build artifacts - object files and modules
+*.o
+*.mod
+*.a
+
+# Build directories
+SRC_trig/lib/
 SRC_w2w/lib/
 SRC_w2w/libc/
 SRC_w2w/libr/
-SRC_w2w/w2w
-SRC_w2w/w2wc
 SRC_wplot/lib/
 SRC_wplot/libc/
 SRC_wplot/libr/
-SRC_wplot/wplot
-SRC_wplot/wplotc
+
+# Test and benchmark results
+tests/benchmark_results/
+tests/*.log
+tests/*.json
+
+# Documentation build artifacts
 doc/wien2wannier_userguide*.log
 doc/wien2wannier_userguide.aux*
 doc/wien2wannier_userguide.d
@@ -32,5 +53,29 @@ doc/wien2wannier_userguide.out*
 doc/wien2wannier_userguide.out.make
 doc/wien2wannier_userguide.tdo
 doc/wien2wannier_userguide.toc*
-doc/auto
+doc/auto/
+
+# Editor/IDE artifacts
 TAGS
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+NUL
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.egg
+
+# AI assistant files
+.claude/
+CLAUDE.md
+.clinerules

@@ -72,6 +72,117 @@ contains
 end module assleg
 
 
+module gaunt_cache
+  !! Precomputed Gaunt coefficients for performance optimization.
+  !! Gaunt coefficients only depend on (L1,L2,LJ,M1,M2,MJ) and are
+  !! constant throughout the calculation. Precomputing them avoids
+  !! redundant recomputation in the innermost loops of l2Mmn.
+  !!
+  !! Storage: For LMAX=5, we need coefficients for L1,L2,LJ in [0,5]
+  !! and M values in [-L,L]. Using linearized indexing:
+  !!   index(L,M) = L*(L+1) + M + 1  (1-based, size = (LMAX+1)^2)
+  !!
+  !! Reference: Abramowitz & Stegun, "Handbook of Mathematical Functions"
+
+  use param, only: Lmax2
+  use const, only: R8
+
+  implicit none
+  private; save
+
+  ! Cache dimensions: indices run from 1 to (Lmax2+1)^2
+  integer, parameter :: GMAX = (Lmax2+1)**2
+
+  ! Gaunt coefficient cache: gaunt_tab(idx1, idx2, idxj)
+  ! where idx = L*(L+1) + M + 1
+  real(R8), allocatable, public :: gaunt_tab(:,:,:)
+  logical, public :: gaunt_initialized = .false.
+
+  public :: init_gaunt_cache, cleanup_gaunt_cache, get_gaunt
+
+contains
+
+  subroutine init_gaunt_cache()
+    !! Initialize Gaunt coefficient cache by precomputing all needed values
+    use assleg, only: YR, N
+
+    implicit none
+
+    integer  :: L1, L2, LJ, M1, M2, MJ, idx1, idx2, idxj, I
+    real(R8) :: S
+    real(R8), parameter :: W(6) = (/ &
+         0.24914704581340D+0, 0.23349253653836D+0, &
+         0.20316742672307D+0, 0.16007832854335D+0, &
+         0.10693932599532D+0, 0.04717533638651D+0 /)
+
+    if (gaunt_initialized) return
+
+    ! Allocate cache
+    if (.not. allocated(gaunt_tab)) then
+       allocate(gaunt_tab(GMAX, GMAX, GMAX))
+    endif
+    gaunt_tab = 0.0_R8
+
+    ! Precompute all Gaunt coefficients
+    ! gaunt(L2,LJ,L1,M2,MJ,M1) = integral of Y*(L2,M2) * Y(LJ,MJ) * Y(L1,M1)
+    do L1 = 0, Lmax2
+       do M1 = -L1, L1
+          idx1 = L1*(L1+1) + M1 + 1
+
+          do L2 = 0, Lmax2
+             do M2 = -L2, L2
+                idx2 = L2*(L2+1) + M2 + 1
+
+                do LJ = 0, Lmax2
+                   do MJ = -LJ, LJ
+                      idxj = LJ*(LJ+1) + MJ + 1
+
+                      ! Selection rules: M2 + MJ = M1 (or equivalently M1 - M2 = MJ)
+                      ! and triangle inequality |L1-L2| <= LJ <= L1+L2
+                      ! and L1+L2+LJ even
+                      if (M1 /= M2 + MJ) cycle
+                      if (LJ < abs(L1-L2) .or. LJ > L1+L2) cycle
+                      if (mod(L1+L2+LJ, 2) /= 0) cycle
+
+                      ! Compute Gaunt coefficient using Gaussian quadrature
+                      S = 0.0_R8
+                      do I = 1, N
+                         S = S + W(I) * YR(I, idx2) * YR(I, idxj) * YR(I, idx1)
+                      end do
+
+                      gaunt_tab(idx2, idxj, idx1) = S
+                   end do
+                end do
+             end do
+          end do
+       end do
+    end do
+
+    gaunt_initialized = .true.
+  end subroutine init_gaunt_cache
+
+  subroutine cleanup_gaunt_cache()
+    implicit none
+    if (allocated(gaunt_tab)) deallocate(gaunt_tab)
+    gaunt_initialized = .false.
+  end subroutine cleanup_gaunt_cache
+
+  real(R8) pure function get_gaunt(L2, LJ, L1, M2, MJ, M1)
+    !! Fast lookup of precomputed Gaunt coefficient
+    implicit none
+    integer, intent(in) :: L1, L2, LJ, M1, M2, MJ
+    integer :: idx1, idx2, idxj
+
+    idx1 = L1*(L1+1) + M1 + 1
+    idx2 = L2*(L2+1) + M2 + 1
+    idxj = LJ*(LJ+1) + MJ + 1
+
+    get_gaunt = gaunt_tab(idx2, idxj, idx1)
+  end function get_gaunt
+
+end module gaunt_cache
+
+
 module bessel
   use const, only: R8
   implicit none
@@ -195,6 +306,39 @@ module loabc
 
   ! abc calculates the cofficients a,b,c of the lo
   real(R8), public :: alo(0:LOmax, Nloat, Nrf)
+
+  ! Overlap integrals for multiple LOs (indexed by l, jlo)
+  ! pi12lo(l,jlo) = <u | LO_jlo> overlap between LAPW u and LO
+  ! pe12lo(l,jlo) = <u_dot | LO_jlo> overlap between LAPW u-dot and LO
+  ! pilolo(l,jlo1,jlo2) = <LO_jlo1 | LO_jlo2> LO self/cross overlap
+  real(R8), allocatable, public :: pi12lo(:,:)   ! (0:lomax, nloat)
+  real(R8), allocatable, public :: pe12lo(:,:)   ! (0:lomax, nloat)
+  real(R8), allocatable, public :: pilolo(:,:,:) ! (0:lomax, nloat, nloat)
+
+  public :: init_loabc, cleanup_loabc
+
+contains
+  subroutine init_loabc()
+    !! Initialize allocatable overlap arrays for multiple LO handling
+    implicit none
+
+    if (.not. allocated(pi12lo)) allocate(pi12lo(0:lomax, nloat))
+    if (.not. allocated(pe12lo)) allocate(pe12lo(0:lomax, nloat))
+    if (.not. allocated(pilolo)) allocate(pilolo(0:lomax, nloat, nloat))
+
+    pi12lo = 0.0_R8
+    pe12lo = 0.0_R8
+    pilolo = 0.0_R8
+  end subroutine init_loabc
+
+  subroutine cleanup_loabc()
+    !! Deallocate overlap arrays
+    implicit none
+
+    if (allocated(pi12lo)) deallocate(pi12lo)
+    if (allocated(pe12lo)) deallocate(pe12lo)
+    if (allocated(pilolo)) deallocate(pilolo)
+  end subroutine cleanup_loabc
 end module loabc
 
 

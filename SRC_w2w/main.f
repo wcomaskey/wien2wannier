@@ -35,6 +35,7 @@ program wf
   use clio,      only: croak
   use structmod, only: struct_t, struct_read
   use inwfmod,   only: inwf_t, inwf_read
+  use gaunt_cache, only: init_gaunt_cache, cleanup_gaunt_cache
 
   !! procedure includes
   use read_vec_m
@@ -190,6 +191,7 @@ program wf
 
   call init_bessel(Lmax2, inwf%LJmax, Nrad, Nrf)
   call gaunt2
+  call init_gaunt_cache()  ! Precompute Gaunt coefficients for performance
 
   write(unit_out, "(////,30X,50(1H-),/,33X,'S T R U C T U R A L   ', &
          & 'I N F O R M A T I O N',/,30X,50(1H-),//)")
@@ -246,6 +248,7 @@ program wf
      call ptime('l2Amn')
   endif
 
+  call cleanup_gaunt_cache()  ! Free Gaunt coefficient cache
   call ERRCLR(ERRFN)
   print "('W2W END')"
 end program wf
