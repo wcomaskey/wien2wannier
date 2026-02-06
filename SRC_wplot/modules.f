@@ -772,8 +772,9 @@ subroutine auggen(stru, large)
   logical   :: rlo(1:nloat,0:lomax)
   integer   :: i, k, l, m, jatom, jlo, jrf, irf, nodes, kappa
   real(DPk) :: cfac, RMT2, rnorm, uve, duve, uv, uvb, duvb, duv
-  real(DPk) :: dele, delei, fl, ei, e1, cross, r_m
-  real(DPk) :: pi12lo, pe12lo, xac, xbc, xcc, alonorm
+  real(DPk) :: dele, delei, fl, ei, e1, cross, r_m, deles
+  real(DPk) :: pi12lo, pe12lo, pilolo, xac, xbc, xcc, alonorm
+  logical   :: is_secder
   real(DPk) :: E(0:LMAX7), ELO(0:LOMAX,NLOAT), PEI(0:LMAX7)
 
   real(DPk), dimension(Nrad)             :: AE, BE, VR
@@ -899,6 +900,11 @@ subroutine auggen(stru, large)
               DELEI=0.25D0/DELE
               FL=L
               EI=elo(l,jlo)/2.d0
+
+              ! Detect HDLO (second-derivative LO)
+              is_secder = (.not.lapw(l,jatom)) .and. (jlo > 1) .and. &
+                   (abs(elo(l,jlo) - e(l)) < 2.0d0*DELE)
+
               if(rlo(jlo,l)) then
                  ei=elo(l,nloat)/2.d0
                  kappa=l
@@ -910,26 +916,107 @@ subroutine auggen(stru, large)
                          2*vr(m)/r_m)/(2*clight))
                     b(m)=b(m)*clight
                  enddo
-              else
+                 call RINT13(stru%rel,A,B,A,B,RNORM,JATOM, stru)
+                 RNORM = 1.0d0/sqrt(RNORM)
+                 do M=1,stru%Npt(jatom)
+                    RAD1(M,L,irf) = RNORM*A(M)
+                    RAD2(M,L,irf) = RNORM*B(M)
+                 enddo
+                 P(L,irf,jatom)  = RNORM*UV
+                 DP(L,irf,jatom) = RNORM*DUV
+              else if(is_secder) then
+                 ! HDLO: 5-point finite difference second derivative
+                 DELES = DELE * 2.0d0
+
+                 ! f(EI): center point, coefficient -30
                  call outwin(stru, jatom, Vr, EI, FL, UV, DUV, Nodes)
+                 call RINT13(stru%rel,A,B,A,B,RNORM,JATOM, stru)
+                 RNORM = 1.0d0/sqrt(RNORM)
+                 UV  = -30.0d0*RNORM*UV
+                 DUV = -30.0d0*RNORM*DUV
+                 do M=1,stru%Npt(jatom)
+                    AE(M) = -30.0d0*RNORM*A(M)
+                    BE(M) = -30.0d0*RNORM*B(M)
+                 end do
+
+                 ! f(EI - 2h): coefficient -1
+                 E1 = EI - 2.0d0*DELES
+                 call outwin(stru, jatom, Vr, E1, FL, UVB, DUVB, Nodes)
+                 call RINT13(stru%rel,A,B,A,B,RNORM,JATOM, stru)
+                 RNORM = 1.0d0/sqrt(RNORM)
+                 UV  = UV  - RNORM*UVB
+                 DUV = DUV - RNORM*DUVB
+                 do M=1,stru%Npt(jatom)
+                    AE(M) = AE(M) - RNORM*A(M)
+                    BE(M) = BE(M) - RNORM*B(M)
+                 end do
+
+                 ! f(EI - h): coefficient +16
+                 E1 = EI - DELES
+                 call outwin(stru, jatom, Vr, E1, FL, UVB, DUVB, Nodes)
+                 call RINT13(stru%rel,A,B,A,B,RNORM,JATOM, stru)
+                 RNORM = 1.0d0/sqrt(RNORM)
+                 UV  = UV  + 16.0d0*RNORM*UVB
+                 DUV = DUV + 16.0d0*RNORM*DUVB
+                 do M=1,stru%Npt(jatom)
+                    AE(M) = AE(M) + 16.0d0*RNORM*A(M)
+                    BE(M) = BE(M) + 16.0d0*RNORM*B(M)
+                 end do
+
+                 ! f(EI + 2h): coefficient -1
+                 E1 = EI + 2.0d0*DELES
+                 call outwin(stru, jatom, Vr, E1, FL, UVE, DUVE, Nodes)
+                 call RINT13(stru%rel,A,B,A,B,RNORM,JATOM, stru)
+                 RNORM = 1.0d0/sqrt(RNORM)
+                 UV  = UV  - RNORM*UVE
+                 DUV = DUV - RNORM*DUVE
+                 do M=1,stru%Npt(jatom)
+                    AE(M) = AE(M) - RNORM*A(M)
+                    BE(M) = BE(M) - RNORM*B(M)
+                 end do
+
+                 ! f(EI + h): coefficient +16, complete stencil
+                 E1 = EI + DELES
+                 call outwin(stru, jatom, Vr, E1, FL, UVE, DUVE, Nodes)
+                 call RINT13(stru%rel,A,B,A,B,RNORM,JATOM, stru)
+                 RNORM = 1.0d0/sqrt(RNORM)
+                 P(L,irf,jatom) = (UV + 16.0d0*RNORM*UVE) &
+                      / (12.0d0*4.0d0*DELES*DELES)
+                 DP(L,irf,jatom) = (DUV + 16.0d0*RNORM*DUVE) &
+                      / (12.0d0*4.0d0*DELES*DELES)
+                 do M=1,stru%Npt(jatom)
+                    RAD1(M,L,irf) = (AE(M) + 16.0d0*RNORM*A(M)) &
+                         / (12.0d0*4.0d0*DELES*DELES)
+                    RAD2(M,L,irf) = (BE(M) + 16.0d0*RNORM*B(M)) &
+                         / (12.0d0*4.0d0*DELES*DELES)
+                 end do
+              else
+                 ! Regular LO
+                 call outwin(stru, jatom, Vr, EI, FL, UV, DUV, Nodes)
+                 call RINT13(stru%rel,A,B,A,B,RNORM,JATOM, stru)
+                 RNORM = 1.0d0/sqrt(RNORM)
+                 do M=1,stru%Npt(jatom)
+                    RAD1(M,L,irf) = RNORM*A(M)
+                    RAD2(M,L,irf) = RNORM*B(M)
+                 enddo
+                 P(L,irf,jatom)  = RNORM*UV
+                 DP(L,irf,jatom) = RNORM*DUV
               endif
-              call RINT13(stru%rel,A,B,A,B,RNORM,JATOM, stru)
-              RNORM = 1.0d0/sqrt(RNORM)
-              do M=1,stru%Npt(jatom)
-                 RAD1(M,L,irf) = RNORM*A(M)
-                 RAD2(M,L,irf) = RNORM*B(M)
-              enddo
-              P(L,irf,jatom)  = RNORM*UV
-              DP(L,irf,jatom) = RNORM*DUV
               call RINT13(stru%rel,RAD1(1,L,1),RAD2(1,L,1),RAD1(1,L,irf),RAD2(1,L,irf),PI12LO,JATOM, stru)
               call RINT13(stru%rel,RAD1(1,L,2),RAD2(1,L,2),RAD1(1,L,irf),RAD2(1,L,irf),PE12LO,JATOM, stru)
+              ! Compute LO self-overlap <LO_jlo | LO_jlo>
+              call RINT13(stru%rel,RAD1(1,L,irf),RAD2(1,L,irf),RAD1(1,L,irf),RAD2(1,L,irf),PILOLO,JATOM, stru)
+           else
+              pi12lo = 0.0d0
+              pe12lo = 0.0d0
+              pilolo = 1.0d0
            endif
 
            if (LAPW(L,JATOM)) then
               XAC=(P(L,irf,jatom)*DP(L,2,JATOM)-DP(L,irf,jatom)*P (L,2,JATOM))*RMT2
               XBC=(P(L,1,jatom)*DP(L,irf,JATOM)-P(L,irf,JATOM)*DP(L,1,jatom))*RMT2
               XCC=XAC*(XAC+2.0D0*PI12LO) &
-                   + XBC*(XBC*PEI(L)+2.0D0*PE12LO)+1.0D0
+                   + XBC*(XBC*PEI(L)+2.0D0*PE12LO)+PILOLO
               ALO(L,jlo,irf,JATOM) = 1.0D0/max( sqrt(XCC) , 0.005D0 )
               ALO(L,jlo,1,JATOM)=XAC*ALO(L,jlo,irf,JATOM)
               ALO(L,jlo,2,JATOM)=XBC*ALO(L,jlo,irf,JATOM)
@@ -940,7 +1027,7 @@ subroutine auggen(stru, large)
                  ALO(L,jlo,2,JATOM)=-P(L,1,JATOM)/P(L,2,JATOM)/alonorm
               else
                  xbc=-P(l,1,jatom)/P(L,irf,jatom)
-                 xac=sqrt(1+xbc**2+2*xbc*PI12LO)
+                 xac=sqrt(1.d0+pilolo*xbc**2+2.d0*xbc*PI12LO)
                  ALO(l,jlo,1,jatom)=1.d0/xac
                  ALO(l,jlo,irf,jatom)=xbc/xac
               endif

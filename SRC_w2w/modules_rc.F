@@ -411,8 +411,8 @@ subroutine l2Amn(stru, inwf, num_kpts)
   use const,     only: R8, C16, TAU
   use xa,        only: BK, FJ, DFJ, PHS, BKrot, BKRloc
   use xa3,       only: A, XK,YK,ZK, GX,GY,GZ, BKX,BKY,BKZ, vecsz
-  use lolog,     only: nlo,nlov,nlon,loor,ilo,lapw
-  use loabc,     only: alo
+  use lolog,     only: nlo,nlov,nlon,loor,ilo,lapw,n_rad
+  use loabc,     only: alo, pi12lo_arr => pi12lo
   use atspdt,    only: P, DP
   use const,     only: R8, C16
   use radfu,     only: RF1, RF2
@@ -441,10 +441,10 @@ subroutine l2Amn(stru, inwf, num_kpts)
   complex(C16) :: h_blyl( (Lmax2+1)**2, iblock)
   complex(C16) :: Alm   ( (Lmax2+1)**2, inwf%bmax-inwf%bmin+1, stru%Nat, Nrf)
 
-  integer  :: i,ii,i3,l, m,mu,m1, n, ipr, ib, iY
+  integer  :: i,ii,i3,l, m,mu,m1, n, ipr, ib, iY, irf_lo
   integer  :: jatom,jlo,jneq, idx, ibb,iscf,irf, lda,ldb,ldc, latom,lfirst
   integer  :: kkk, max, itap,itape,jtape, Nb
-  real(R8) :: fac, arg, pi12lo(0:Lmax2)
+  real(R8) :: fac, arg
 
   Nb = inwf%bmax-inwf%bmin+1
   projection = 0
@@ -464,11 +464,8 @@ subroutine l2Amn(stru, inwf, num_kpts)
      write(unit_out, '(7X,  "rotij", 10X, "transij")')
      write(unit_out, '(6X, 23("-"))')
 
-     pi12lo = 0
-     do l = 0,LOmax
-        if (loor(l)) call rint13(stru, jatom, rf1(:,l,1), rf2(:,l,1), &
-             &                   rf1(:,l,3), rf2(:,l,3), pi12lo(l))
-     end do
+     ! pi12lo overlap integrals are now computed in atpar() and stored
+     ! in the loabc module arrays (pi12lo_arr), indexed by (l, jlo)
 
      kpoints: do KKK=1,NUM_KPTS
         N=vecsz(kkk)
@@ -638,12 +635,26 @@ subroutine l2Amn(stru, inwf, num_kpts)
                     ! idx is the compound index to Alm
                     idx = l**2 + m + l + 1
 
+                    ! LAPW u contribution (irf=1) — always present
                     projection(ib, ipr, kkk) = projection(ib, ipr, kkk) &
                          & + conjg(Alm(idx, ib, mu, 1))                 &
-                         &   * inwf%projections(ipr)%coeff(iY)          &
-                         & + conjg(Alm(idx, ib, mu, 3))                 &
-                         &   * inwf%projections(ipr)%coeff(iY)          &
-                         &   * pi12lo(l)
+                         &   * inwf%projections(ipr)%coeff(iY)
+
+                    ! Loop over ALL LOs for this l (handles multiple LOs)
+                    do jlo = 1, ilo(l)
+                       if (lapw(l)) then
+                          irf_lo = 2 + jlo  ! LAPW: u(1), u_dot(2), LO1(3), LO2(4)...
+                       else
+                          irf_lo = 1 + jlo  ! APW: u(1), LO1(2), LO2(3)...
+                       endif
+
+                       if (irf_lo <= n_rad(l)) then
+                          projection(ib, ipr, kkk) = projection(ib, ipr, kkk) &
+                               & + conjg(Alm(idx, ib, mu, irf_lo))            &
+                               &   * inwf%projections(ipr)%coeff(iY)          &
+                               &   * pi12lo_arr(l, jlo)
+                       endif
+                    enddo
                  enddo
               enddo
            enddo

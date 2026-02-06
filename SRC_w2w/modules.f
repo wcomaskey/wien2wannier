@@ -356,7 +356,7 @@ end module radfu
 
 !---------------------------  Procedure modules  ---------------------------
 module     abc_m; contains
-subroutine abc(l, rmt, pei, pi12lo, pe12lo, jlo, lapw)
+subroutine abc(l, rmt, pei, pi12lo_val, pe12lo_val, pilolo_val, jlo, lapw)
   use param,  only: unit_out, Nrf
   use loabc,  only: alo
   use atspdt, only: P, DP
@@ -365,7 +365,7 @@ subroutine abc(l, rmt, pei, pi12lo, pe12lo, jlo, lapw)
   implicit none
 
   integer,  intent(in) :: l, jlo
-  real(R8), intent(in) :: rmt, pei, pi12lo, pe12lo
+  real(R8), intent(in) :: rmt, pei, pi12lo_val, pe12lo_val, pilolo_val
   logical,  intent(in) :: lapw
 
   integer  :: irf
@@ -383,8 +383,8 @@ subroutine abc(l, rmt, pei, pi12lo, pe12lo, jlo, lapw)
      xac= xac * rmt**2
      xbc=p(l,irf)*dp(l,1)-dp(l,irf)*p(l,1)
      xbc= -xbc * rmt**2
-     clo=xac*(xac+2.0D0*pi12lo)+xbc* &
-          (xbc*pei+2.0D0*pe12lo)+1.0D0
+     clo=xac*(xac+2.0D0*pi12lo_val)+xbc* &
+          (xbc*pei+2.0D0*pe12lo_val)+pilolo_val
      clo=1.0D0/sqrt(clo)
      write(unit_out,*)clo
      if (clo.gt.2.0D2) clo=2.0d2
@@ -399,7 +399,7 @@ subroutine abc(l, rmt, pei, pi12lo, pe12lo, jlo, lapw)
         alo(l,jlo,2)=-P(l,1)/P(l,2)/alonorm
      else
         xbc=-P(l,1)/P(l,1+jlo)
-        xac=sqrt(1+xbc**2+2*xbc*PI12LO)
+        xac=sqrt(1.d0+pilolo_val*xbc**2+2.d0*xbc*pi12lo_val)
         alo(l,jlo,1)=1.d0/xac
         alo(l,jlo,1+jlo)=xbc/xac
      end if
@@ -467,6 +467,10 @@ subroutine atpar(stru, jatom, itape, jtape)
   use const,      only: R8, clight
   use uhelp,      only: A, B
   use radfu,      only: RF1, RF2
+  use loabc,      only: init_loabc, &
+       &                pi12lo_arr => pi12lo, &
+       &                pe12lo_arr => pe12lo, &
+       &                pilolo_arr => pilolo
 
   !! procedure includes
   use diracout_m
@@ -482,10 +486,11 @@ subroutine atpar(stru, jatom, itape, jtape)
 
   real(R8) :: VR(Nrad), AE(Nrad), BE(Nrad)
   logical  :: rlo(1:nloat, 0:lomax)
+  logical  :: is_secder
   real(r8) :: emist(0:lomax,nloat),E(0:LMAX2),elo(0:LOMAX,nloat),pei(0:lmax2)
   integer  :: imax,irf, jlo, kappa, i,k,l, node,nodes,nodel, m
   real(R8) :: dele,delei, fl, ei,e1, uvb,duvb,uv,duv,uve,duve, ovlp, trx
-  real(R8) :: try, r_m, pi12lo, pe12lo, cross
+  real(R8) :: try, r_m, cross, deles
 
   !.....READ TOTAL SPHERICAL POTENTIAL V(0,0) OF TAPEjtape=VSP
   !     NORM OF V(0,0)=V00(R)*R/SQRT(4.D0*PI)
@@ -623,6 +628,7 @@ subroutine atpar(stru, jatom, itape, jtape)
   end do lloop
 
 ! nun fur lo
+  call init_loabc()
   loloop: do l=0,lomax
      irf=2
      iloloop: do jlo=1,ilo(l)
@@ -632,6 +638,13 @@ subroutine atpar(stru, jatom, itape, jtape)
            DELEI=0.25D0/DELE
            FL=L
            EI=elo(l,jlo)/2.d0
+
+           ! Detect HDLO (second-derivative LO): if the LO energy
+           ! parameter matches the primary u function energy within
+           ! tolerance AND it's APW mode AND jlo>1, then it's a
+           ! second-derivative local orbital (CONT 2 in case.in1c).
+           is_secder = (.not.lapw(l)) .and. (jlo > 1) .and. &
+                (abs(elo(l,jlo) - e(l)) < 2.0d0*DELE)
 
            ! Calculate function at EI
            if(rlo(jlo,l)) then
@@ -645,27 +658,124 @@ subroutine atpar(stru, jatom, itape, jtape)
                       2.d0*vr(m)/r_m)/(2.d0*clight))
                  b(m)=b(m)*clight
               enddo
-           else
+
+              call RINT13(stru, jatom, A, B, A, B, OVLP)
+              TRX=1.0d0/sqrt(OVLP)
+              P(l,irf)=TRX*UV
+              DP(l,irf)=TRX*DUV
+              IMAX=stru%Npt(JATOM)
+              do M=1,IMAX
+                 rf1(M,l,irf)=TRX*A(M)
+                 rf2(M,l,irf)=TRX*B(M)
+              end do
+           else if(is_secder) then
+              ! HDLO: compute second energy derivative using
+              ! 5-point finite difference stencil:
+              !   d²u/dE² ≈ [-u(E-2h) + 16u(E-h) - 30u(E)
+              !              + 16u(E+h) - u(E+2h)] / (12h²)
+              DELES = DELE * 2.0d0
+
+              ! f(EI): center point with coefficient -30
               call outwin(stru, jatom, Vr, ei, fl, uv, duv, nodes)
+              call RINT13(stru, jatom, A, B, A, B, OVLP)
+              TRX=1.0d0/sqrt(OVLP)
+              UV  = -30.0d0*TRX*UV
+              DUV = -30.0d0*TRX*DUV
+              IMAX=stru%Npt(JATOM)
+              do M=1,IMAX
+                 AE(M) = -30.0d0*TRX*A(M)
+                 BE(M) = -30.0d0*TRX*B(M)
+              end do
+
+              ! f(EI - 2h): coefficient -1
+              E1 = EI - 2.0d0*DELES
+              call outwin(stru, jatom, Vr, E1, fl, UVB, DUVB, NODEL)
+              call RINT13(stru, jatom, A, B, A, B, OVLP)
+              TRX=1.0d0/sqrt(OVLP)
+              UV  = UV  - TRX*UVB
+              DUV = DUV - TRX*DUVB
+              do M=1,IMAX
+                 AE(M) = AE(M) - TRX*A(M)
+                 BE(M) = BE(M) - TRX*B(M)
+              end do
+
+              ! f(EI - h): coefficient +16
+              E1 = EI - DELES
+              call outwin(stru, jatom, Vr, E1, fl, UVB, DUVB, NODEL)
+              call RINT13(stru, jatom, A, B, A, B, OVLP)
+              TRX=1.0d0/sqrt(OVLP)
+              UV  = UV  + 16.0d0*TRX*UVB
+              DUV = DUV + 16.0d0*TRX*DUVB
+              do M=1,IMAX
+                 AE(M) = AE(M) + 16.0d0*TRX*A(M)
+                 BE(M) = BE(M) + 16.0d0*TRX*B(M)
+              end do
+
+              ! f(EI + 2h): coefficient -1
+              E1 = EI + 2.0d0*DELES
+              call outwin(stru, jatom, Vr, E1, fl, UVE, DUVE, NODE)
+              call RINT13(stru, jatom, A, B, A, B, OVLP)
+              TRX=1.0d0/sqrt(OVLP)
+              UV  = UV  - TRX*UVE
+              DUV = DUV - TRX*DUVE
+              do M=1,IMAX
+                 AE(M) = AE(M) - TRX*A(M)
+                 BE(M) = BE(M) - TRX*B(M)
+              end do
+
+              ! f(EI + h): coefficient +16, complete the stencil
+              E1 = EI + DELES
+              call outwin(stru, jatom, Vr, E1, fl, UVE, DUVE, NODE)
+              call RINT13(stru, jatom, A, B, A, B, OVLP)
+              TRX=1.0d0/sqrt(OVLP)
+              ! Complete: divide by 12*4*h² = 48*h²
+              P(l,irf) = (UV + 16.0d0*TRX*UVE) &
+                   / (12.0d0*4.0d0*DELES*DELES)
+              DP(l,irf) = (DUV + 16.0d0*TRX*DUVE) &
+                   / (12.0d0*4.0d0*DELES*DELES)
+              do M=1,IMAX
+                 rf1(M,l,irf) = (AE(M) + 16.0d0*TRX*A(M)) &
+                      / (12.0d0*4.0d0*DELES*DELES)
+                 rf2(M,l,irf) = (BE(M) + 16.0d0*TRX*B(M)) &
+                      / (12.0d0*4.0d0*DELES*DELES)
+              end do
+              write(unit_out,*) '            LOCAL ORBITAL(SECDER)'
+           else
+              ! Regular LO: compute function at energy EI
+              call outwin(stru, jatom, Vr, ei, fl, uv, duv, nodes)
+
+              call RINT13(stru, jatom, A, B, A, B, OVLP)
+              TRX=1.0d0/sqrt(OVLP)
+              P(l,irf)=TRX*UV
+              DP(l,irf)=TRX*DUV
+              IMAX=stru%Npt(JATOM)
+              do M=1,IMAX
+                 rf1(M,l,irf)=TRX*A(M)
+                 rf2(M,l,irf)=TRX*B(M)
+              end do
            endif
 
-           call RINT13(stru, jatom, A, B, A, B, OVLP)
-           TRX=1.0d0/sqrt(OVLP)
-           P(l,irf)=TRX*UV
-           DP(l,irf)=TRX*DUV
-           IMAX=stru%Npt(JATOM)
            n_rad(l)=irf
-           do M=1,IMAX
-              rf1(M,l,irf)=TRX*A(M)
-              rf2(M,l,irf)=TRX*B(M)
-           end do
 
+           ! Compute and STORE overlap integrals for this specific jlo
+           ! <u | LO_jlo> overlap
            call RINT13(stru, jatom, rf1(:,l,1), rf2(:,l,1), &
-                &      rf1(:,l,irf), rf2(:,l,irf), pi12lo)
-           call RINT13(stru, jatom, rf1(1,l,2), rf2(1,l,2), &
-                &      rf1(:,l,irf), rf2(:,l,irf), pe12lo)
+                &      rf1(:,l,irf), rf2(:,l,irf), pi12lo_arr(l,jlo))
+           ! <u_dot | LO_jlo> overlap
+           call RINT13(stru, jatom, rf1(:,l,2), rf2(:,l,2), &
+                &      rf1(:,l,irf), rf2(:,l,irf), pe12lo_arr(l,jlo))
+           ! <LO_jlo | LO_jlo> self-overlap (diagonal)
+           call RINT13(stru, jatom, rf1(:,l,irf), rf2(:,l,irf), &
+                &      rf1(:,l,irf), rf2(:,l,irf), pilolo_arr(l,jlo,jlo))
+        else
+           ! For jlo=1 with non-LAPW (APW+lo), set overlap defaults
+           pi12lo_arr(l,jlo) = 0.0d0
+           pe12lo_arr(l,jlo) = 0.0d0
+           pilolo_arr(l,jlo,jlo) = 1.0d0
         end if
-        call abc (l, stru%RMT(jatom), pei(l), pi12lo, pe12lo, jlo, lapw(l))
+        call abc(l, stru%RMT(jatom), pei(l), &
+             pi12lo_arr(l,jlo), pe12lo_arr(l,jlo), &
+             pilolo_arr(l,jlo,jlo), jlo, lapw(l))
      end do iloloop
   end do loloop
 

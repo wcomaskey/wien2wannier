@@ -36,6 +36,7 @@ program wf
   use structmod, only: struct_t, struct_read
   use inwfmod,   only: inwf_t, inwf_read
   use gaunt_cache, only: init_gaunt_cache, cleanup_gaunt_cache
+  use loabc,       only: cleanup_loabc
 
   !! procedure includes
   use read_vec_m
@@ -249,6 +250,7 @@ program wf
   endif
 
   call cleanup_gaunt_cache()  ! Free Gaunt coefficient cache
+  call cleanup_loabc()        ! Free LO overlap arrays
   call ERRCLR(ERRFN)
   print "('W2W END')"
 end program wf

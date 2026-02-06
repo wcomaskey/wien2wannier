@@ -35,7 +35,7 @@ module param
   integer, parameter :: unit_def=1, unit_in=5, unit_out=6, unit_vector=10
   integer, parameter :: unit_vsp=18, unit_struct=20
   
-  integer, parameter :: Lmax2=5, LOmax=3, Nloat=3, Nrad=881, Nrf=4
+  integer, parameter :: Lmax2=5, LOmax=3, Nloat=3, Nrad=881, Nrf=5
 end module param
 
 module PS1
