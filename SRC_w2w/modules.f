@@ -275,13 +275,16 @@ end module pairs
 
 
 module lolog
-  use param, only: Lmax2, lomax
+  use param, only: Lmax2, lomax, Nrf
 
   implicit none
   private; save
 
   integer, public :: Nlo, Nlov, Nlon, n_rad(0:lmax2), ilo(0:lomax)
   logical, public :: loor(0:lomax), lapw(0:lmax2)
+  ! Flag: is_hdlo(l,irf) = .true. if radial function irf for angular
+  ! momentum l is a second-derivative local orbital (HDLO/CONT 2)
+  logical, public :: is_hdlo(0:lmax2, Nrf) = .false.
 end module lolog
 
 
@@ -462,12 +465,12 @@ subroutine atpar(stru, jatom, itape, jtape)
 
   use param,      only: unit_out, Nrad, Nloat, lomax, Lmax2
   use structmod,  only: struct_t
-  use lolog,      only: nlo,nlov,nlon,loor,ilo,lapw,n_rad
+  use lolog,      only: nlo,nlov,nlon,loor,ilo,lapw,n_rad,is_hdlo
   use atspdt,     only: P, DP
   use const,      only: R8, clight
   use uhelp,      only: A, B
   use radfu,      only: RF1, RF2
-  use loabc,      only: init_loabc, &
+  use loabc,      only: init_loabc, alo, &
        &                pi12lo_arr => pi12lo, &
        &                pe12lo_arr => pe12lo, &
        &                pilolo_arr => pilolo
@@ -557,6 +560,10 @@ subroutine atpar(stru, jatom, itape, jtape)
      end do
   end if
 
+  ! DIAGNOSTIC: Print nlo counts AFTER nlon computation
+  write(unit_out,'(A,3I5)') '  NLO COUNTS: nlo, nlov, nlon =', nlo, nlov, nlon
+  write(unit_out,'(A,I5)') '  NPW = N - (nlo+nlon+nlov) where nlo+nlon+nlov =', nlo+nlon+nlov
+
   write(unit_out, "(/10X,'ATOMIC PARAMETERS FOR ',A10/)") stru%aname(JATOM)
   write(unit_out, "(10X,' ENERGY PARAMETERS ARE',7F7.2)") E
   write(unit_out, "(/11X,1HL,5X,4HU(R),10X, 5HU'(R),9X,5HDU/DE,8X,6HDU'/DE,6X,7HNORM-U')")
@@ -629,6 +636,7 @@ subroutine atpar(stru, jatom, itape, jtape)
 
 ! nun fur lo
   call init_loabc()
+  is_hdlo = .false.
   loloop: do l=0,lomax
      irf=2
      iloloop: do jlo=1,ilo(l)
@@ -645,6 +653,7 @@ subroutine atpar(stru, jatom, itape, jtape)
            ! second-derivative local orbital (CONT 2 in case.in1c).
            is_secder = (.not.lapw(l)) .and. (jlo > 1) .and. &
                 (abs(elo(l,jlo) - e(l)) < 2.0d0*DELE)
+           is_hdlo(l, irf) = is_secder
 
            ! Calculate function at EI
            if(rlo(jlo,l)) then
