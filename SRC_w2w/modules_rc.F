@@ -411,8 +411,8 @@ subroutine l2Amn(stru, inwf, num_kpts)
   use const,     only: R8, C16, TAU
   use xa,        only: BK, FJ, DFJ, PHS, BKrot, BKRloc
   use xa3,       only: A, XK,YK,ZK, GX,GY,GZ, BKX,BKY,BKZ, vecsz
-  use lolog,     only: nlo,nlov,nlon,loor,ilo,lapw,n_rad
-  use loabc,     only: alo, pi12lo_arr => pi12lo
+  use lolog,     only: nlo,nlov,nlon,loor,ilo,lapw
+  use loabc,     only: alo
   use atspdt,    only: P, DP
   use const,     only: R8, C16
   use radfu,     only: RF1, RF2
@@ -441,10 +441,10 @@ subroutine l2Amn(stru, inwf, num_kpts)
   complex(C16) :: h_blyl( (Lmax2+1)**2, iblock)
   complex(C16) :: Alm   ( (Lmax2+1)**2, inwf%bmax-inwf%bmin+1, stru%Nat, Nrf)
 
-  integer  :: i,ii,i3,l, m,mu,m1, n, ipr, ib, iY, irf_lo
+  integer  :: i,ii,i3,l, m,mu,m1, n, ipr, ib, iY
   integer  :: jatom,jlo,jneq, idx, ibb,iscf,irf, lda,ldb,ldc, latom,lfirst
   integer  :: kkk, max, itap,itape,jtape, Nb
-  real(R8) :: fac, arg
+  real(R8) :: fac, arg, pi12lo(0:Lmax2)
 
   Nb = inwf%bmax-inwf%bmin+1
   projection = 0
@@ -464,8 +464,11 @@ subroutine l2Amn(stru, inwf, num_kpts)
      write(unit_out, '(7X,  "rotij", 10X, "transij")')
      write(unit_out, '(6X, 23("-"))')
 
-     ! pi12lo overlap integrals are now computed in atpar() and stored
-     ! in the loabc module arrays (pi12lo_arr), indexed by (l, jlo)
+     pi12lo = 0
+     do l = 0,LOmax
+        if (loor(l)) call rint13(stru, jatom, rf1(:,l,1), rf2(:,l,1), &
+             &                   rf1(:,l,3), rf2(:,l,3), pi12lo(l))
+     end do
 
      kpoints: do KKK=1,NUM_KPTS
         N=vecsz(kkk)
@@ -635,26 +638,12 @@ subroutine l2Amn(stru, inwf, num_kpts)
                     ! idx is the compound index to Alm
                     idx = l**2 + m + l + 1
 
-                    ! LAPW u contribution (irf=1) — always present
                     projection(ib, ipr, kkk) = projection(ib, ipr, kkk) &
                          & + conjg(Alm(idx, ib, mu, 1))                 &
-                         &   * inwf%projections(ipr)%coeff(iY)
-
-                    ! Loop over ALL LOs for this l (handles multiple LOs)
-                    do jlo = 1, ilo(l)
-                       if (lapw(l)) then
-                          irf_lo = 2 + jlo  ! LAPW: u(1), u_dot(2), LO1(3), LO2(4)...
-                       else
-                          irf_lo = 1 + jlo  ! APW: u(1), LO1(2), LO2(3)...
-                       endif
-
-                       if (irf_lo <= n_rad(l)) then
-                          projection(ib, ipr, kkk) = projection(ib, ipr, kkk) &
-                               & + conjg(Alm(idx, ib, mu, irf_lo))            &
-                               &   * inwf%projections(ipr)%coeff(iY)          &
-                               &   * pi12lo_arr(l, jlo)
-                       endif
-                    enddo
+                         &   * inwf%projections(ipr)%coeff(iY)          &
+                         & + conjg(Alm(idx, ib, mu, 3))                 &
+                         &   * inwf%projections(ipr)%coeff(iY)          &
+                         &   * pi12lo(l)
                  enddo
               enddo
            enddo
@@ -704,15 +693,6 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
   complex(C16), allocatable, dimension(:,:,:) :: A_
   complex(C16), allocatable, dimension(:,:) :: B_
 
-  ! Sparse index arrays for performance optimization
-  ! Instead of looping through all indices and checking a_null,
-  ! we store lists of non-null indices per k-point
-  integer, allocatable :: idx_list(:,:)      ! Non-null indices per k-point
-  integer, allocatable :: idx_fin_list(:,:)  ! Non-null final indices per k-point
-  integer, allocatable :: n_idx(:)           ! Count of non-null indices per k-point
-  integer, allocatable :: n_idx_fin(:)       ! Count of non-null final indices
-  integer :: n_i, n_j, list_i, list_j        ! Loop counters for sparse loops
-
   allocate(FAC(-(2*maxx+1):(2*maxx+1),-(2*maxy+1):(2*maxy+1),-(2*maxz+1):(2*maxz+1)) )
   allocate(A_(NB,0:(2*maxx+1)*(2*maxy+1)*(2*maxz+1)-1,NUM_KPTS) )
   allocate(B_(NB,0:(2*maxx+1)*(2*maxy+1)*(2*maxz+1)-1) )
@@ -727,14 +707,6 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
   t_b=0.d0
   t_prod=0.d0
 
-  ! Allocate sparse index lists (overestimate size as max+1)
-  allocate(idx_list(0:max, num_kpts))
-  allocate(idx_fin_list(0:max, num_kpts))
-  allocate(n_idx(num_kpts))
-  allocate(n_idx_fin(num_kpts))
-  n_idx = 0
-  n_idx_fin = 0
-
   call cpu_time(t1)
   A_=0
   a_null=.false.
@@ -748,12 +720,7 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
         I_Y=GY(I,kkk)+maxy
         I_Z=GZ(I,kkk)+maxz
         index=(I_Z*m2y+I_Y)*m2x+I_X
-        if (.not. a_null(index,kkk)) then
-           a_null(index,kkk)=.true.
-           ! Add to sparse index list
-           n_idx(kkk) = n_idx(kkk) + 1
-           idx_list(n_idx(kkk), kkk) = index
-        endif
+        a_null(index,kkk)=.true.
 
         A_(:,index,kkk)=A(I,:,kkk)
      end do
@@ -765,12 +732,7 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
            I_Y=GY(I,kk)+maxy-BQY(pair_index)
            I_Z=GZ(I,kk)+maxz-BQZ(pair_index)
            index=(I_Z*m2y+I_Y)*m2x+I_X
-           if (.not. a_null_fin(index,kkk)) then
-              a_null_fin(index,kkk)=.true.
-              ! Add to sparse final index list
-              n_idx_fin(kkk) = n_idx_fin(kkk) + 1
-              idx_fin_list(n_idx_fin(kkk), kkk) = index
-           endif
+           a_null_fin(index,kkk)=.true.
         end do
      end do
   end do
@@ -806,40 +768,37 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
      end do
   end do
   FAC(0,0,0)=FAC(0,0,0)+1
+
   call cpu_time(t2)
   write(unit_out,*)'t_init=',t2-t1
 
-  ! Compute B matrix and overlap using sparse index lists
-  ! This avoids O(max^2) iterations when only a small fraction of indices are non-null
+  ! read in k-point and basis vectors (original loop structure)
   pair_index=0
   do k1=1,num_kpts
      pair_index=pair_index+1
      kkk=KP(pair_index)
      call cpu_time(tt1)
      b_=0
-
-     ! OPTIMIZED: Loop only over non-null final indices using sparse list
-     do list_j = 1, n_idx_fin(kkk)
-        J = idx_fin_list(list_j, kkk)
-        SUM=0
-        JJ=J/m2x
-        iz2=jj/m2y
-        iy2=jj-iz2*m2y
-        ix2=j-jj*m2x
-
-        ! OPTIMIZED: Loop only over non-null indices using sparse list
-        do list_i = 1, n_idx(kkk)
-           I = idx_list(list_i, kkk)
-           II=I/m2x
-           iz1=II/m2y
-           iy1=II-iz1*m2y
-           ix1=I-II*m2x
-           FF=FAC(ix2-ix1,iy2-iy1,iz2-iz1)
-           sum=sum+a_(1:nb,I,k1)*FF
-        end do
-        b_(1:nb,j)=sum
+     do J=0,max
+        if (a_null_fin(J,kkk)) then
+           SUM=0
+           JJ=J/m2x
+           iz2=jj/m2y
+           iy2=jj-iz2*m2y
+           ix2=j-jj*m2x
+           do I=0,max
+              if(a_null(I,kkk)) then
+                 II=I/m2x
+                 iz1=II/m2y
+                 iy1=II-iz1*m2y
+                 ix1=I-II*m2x
+                 FF=FAC(ix2-ix1,iy2-iy1,iz2-iz1)
+                 sum=sum+a_(1:nb,I,k1)*FF
+              end if
+           end do
+           b_(1:nb,j)=sum
+        end if
      end do
-
      call cpu_time(tt2)
      do k2=1,NNTOT
         if (k2 > 1) pair_index=pair_index+1
@@ -848,13 +807,10 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
         id=-(BQZ(pair_index)*m2y+BQY(pair_index))*m2x-BQX(pair_index)-1
         SUMA=0
 
-        ! OPTIMIZED: Loop only over non-null indices using sparse list
-        do list_j = 1, n_idx(kkk)
-           j = idx_list(list_j, kkk)
-           ! Compute shifted id for this j
-           id = j - (BQZ(pair_index)*m2y+BQY(pair_index))*m2x - BQX(pair_index)
+        do J=0,max
+           id=id+1
 
-           if (0 <= id .and. id <= max) then
+           if (a_null(j,kkk) .and. 0 <= id .and. id < max) then
               do NUM1=1,NB
 #ifndef _COMPLEX_
                  SUMA(1:nb,num1)=SUMA(1:nb,num1)+a_(1:nb,j,kkk)*b_(num1,id)
@@ -866,6 +822,7 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
         end do
 
         overlap(1:nb,1:nb,pair_index) = overlap(1:nb,1:nb,pair_index) + SUMA
+
         write(unit_mmn,235)KP(pair_index),KPB(pair_index),BQX1(pair_index),BQY1(pair_index), &
              BQZ1(pair_index)
 
@@ -886,17 +843,14 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
 
 235 format(5i8)
 236 format(32f18.12)
+  return
 
-  ! Release memory before returning
+  !release the memory
   deallocate(FAC)
   deallocate(A_)
   deallocate(B_)
   deallocate(a_null)
   deallocate(a_null_fin)
-  deallocate(idx_list)
-  deallocate(idx_fin_list)
-  deallocate(n_idx)
-  deallocate(n_idx_fin)
 end subroutine PLANEW
 end module planew_m
 
