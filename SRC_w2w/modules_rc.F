@@ -853,7 +853,6 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
 
 235 format(5i8)
 236 format(32f18.12)
-  return
 
   !release the memory
   deallocate(FAC)
@@ -883,11 +882,13 @@ subroutine read_vec(NEmin, NEmax, Nneq, kkk, maxx, maxy, maxz, Efermi)
   integer, intent(inout) :: kkk
   real(R8),intent(in)    :: efermi
 
-  integer :: i, j, n, NB, NE, num
+  integer :: i, j, n, NB, NE, num, E_size
 
-  real(r8) :: E(1000)
+  real(r8), allocatable :: E(:)
 
   character(10)    BNAME
+
+  E_size = 0
 
   do I = 1, Nneq
      read(unit_vector)
@@ -906,6 +907,13 @@ subroutine read_vec(NEmin, NEmax, Nneq, kkk, maxx, maxy, maxz, Efermi)
         if (abs(GZ(I,kkk)) > maxz) maxz=abs(GZ(I,kkk))
      enddo
 
+     ! Ensure E array is large enough for NE bands
+     if (NE > E_size) then
+        if (allocated(E)) deallocate(E)
+        E_size = NE
+        allocate(E(E_size))
+     end if
+
      do J=1,NE
         read(unit_vector) num, E(num)
         if (num >= NEmin .and. num <= NEmax) then
@@ -921,7 +929,8 @@ subroutine read_vec(NEmin, NEmax, Nneq, kkk, maxx, maxy, maxz, Efermi)
      enddo
   end do kpoint
 
-998 write(unit_out,*)'vector read in',kkk
+998 if (allocated(E)) deallocate(E)
+  write(unit_out,*)'vector read in',kkk
 end subroutine read_vec
 end module read_vec_m
 

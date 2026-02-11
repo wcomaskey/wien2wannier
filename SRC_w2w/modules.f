@@ -416,6 +416,7 @@ end module     abc_m
 module     rint13_m; contains
 subroutine rint13(stru, jatom, A, B, X, Y, S)
   !     PERFORM RADIAL INTEGRALS REQUIRED BY BHDK13
+  !     Modified Simpson's rule on logarithmic radial grid
   !                            D.D.KOELLING
 
   use param,     only: Nrad
@@ -429,28 +430,36 @@ subroutine rint13(stru, jatom, A, B, X, Y, S)
   real(R8),       intent(in)  :: A(Nrad), B(Nrad), X(Nrad), Y(Nrad)
   real(R8),       intent(out) :: S
 
-  integer  :: j, j1
+  integer  :: j, j1, Npt
   real(R8) :: d, cin, r,r1, z2,z4, p1,p2
 
   cin = merge(1/clight**2, 1e-22_R8, stru%rel)
 
   D=exp(stru%DX(JATOM))
+  Npt=stru%Npt(JATOM)
 
-  J=3-mod(stru%Npt(JATOM),2)
+  J=3-mod(Npt,2)
   J1=J-1
   R=stru%R0(JATOM)*(D**(J-1))
   R1=R/D
   Z4=0
   Z2=0
-10 Z4=Z4+R*(A(J)*X(J)+CIN*B(J)*Y(J))
-  R=R*D
-  J=J+1
-  if(J >= stru%Npt(JATOM)) goto 20
-  Z2=Z2+R*(A(J)*X(J)+CIN*B(J)*Y(J))
-  R=R*D
-  J=J+1
-  goto 10
-20 P1=stru%R0(JATOM)*(A(1)*X(1)+CIN*B(1)*Y(1))
+
+  ! Simpson's rule: alternate weight-4 and weight-2 points
+  ! J steps by 2 each iteration; each iteration accumulates
+  ! one weight-4 point (at J) and one weight-2 point (at J+1)
+  do while (J < Npt)
+     Z4=Z4+R*(A(J)*X(J)+CIN*B(J)*Y(J))
+     R=R*D
+     J=J+1
+     if (J >= Npt) exit
+     Z2=Z2+R*(A(J)*X(J)+CIN*B(J)*Y(J))
+     R=R*D
+     J=J+1
+  end do
+
+  ! Endpoint contributions and composite Simpson's formula
+  P1=stru%R0(JATOM)*(A(1)*X(1)+CIN*B(1)*Y(1))
   P2=R1*(A(J1)*X(J1)+CIN*B(J1)*Y(J1))
   S=2*Z2+4*Z4+R*(A(J)*X(J)+CIN*B(J)*Y(J))+P2
   S=(stru%DX(JATOM)*S+P1)/3.0D0
