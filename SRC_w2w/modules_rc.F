@@ -85,6 +85,10 @@ subroutine almgen(Alm, stru, jatom, lfirst, NB, kkk)
   complex(C16) :: h_blyl((LMAX2+1)**2, iblock)
   complex(C16) :: ALMt  ((LMAX2+1)**2, Nb, Nrf, stru%mult(JATOM))
 
+  ! Precomputed conjugate spherical harmonics for each plane wave
+  complex(C16), allocatable :: YL_all(:,:)
+  integer  :: Npw
+
   real(R8) :: fac, arg, arg1, arg2, arg3
   integer  :: N, num, i,ii,i3, latom, mu, index, l, max, m,m1, irf,mirf, ibb, lda,ldb,ldc, jlo,jneq
 
@@ -100,39 +104,41 @@ subroutine almgen(Alm, stru, jatom, lfirst, NB, kkk)
 
   ! calculate Bessel functions j_l(|Q+k|*RMT)
   call harmon(stru, jatom, N, BKX, BKY, BKZ ,Lmax2, FJ, DFJ)
+
+  ! Precompute conjugate spherical harmonics for all LAPW plane waves.
+  ! YLM depends only on the direction of Q+k (via conv_rec), not on
+  ! atom position, so this can be done once before the mu loop.
+  Npw = N-(nlo+nlon+nlov)
+  allocate(YL_all((LMAX2+1)**2, Npw))
+  do I=1,Npw
+     BK = matmul(stru%conv_rec, (/BKX(I), BKY(I), BKZ(I)/))
+     call YLM(BK, LMAX2, YL)
+     YL_all(:,I) = conjg(YL)
+  end do
+
   do MU=1, stru%mult(jatom)
      latom=lfirst-1+mu
 
      ! matching of plane wave and atomic functions
-     do ii=1,N-(nlo+nlon+nlov),iblock
+     do ii=1,Npw,iblock
         i3=0
-        do i=ii,min(ii+iblock-1,N-(nlo+nlon+nlov))
+        do i=ii,min(ii+iblock-1,Npw)
            i3=i3+1
 
-           ! transform Q+k to cartesian coordinates
-           BK = matmul(stru%conv_rec, (/BKX(I), BKY(I), BKZ(I)/))
-
-           call YLM (BK,LMAX2,YL) ! calculate Y_lm(Q+k)
-
+           ! Phase factor exp(i(Q+k).R_j) depends on atom position
            ARG1=BKX(I) * stru%POS(1,LATOM)*TAU
            ARG2=BKY(I) * stru%POS(2,LATOM)*TAU
            ARG3=BKZ(I) * stru%POS(3,LATOM)*TAU
 
            PHSHEL=exp((0,1)*(ARG1+ARG2+ARG3)) ! exp(i(Q+k)R_j)
-           INDEX=0
-           do L=0,LMAX2
-              MAX=2*L+1
-              do M=1,MAX
-                 INDEX=INDEX+1
-                 h_yl(index,i3)=conjg(yl(index))*phshel
-              end do
-           end do
+           ! Combine precomputed conjg(YLM) with phase factor
+           h_yl(:,i3) = YL_all(:,I) * phshel
         end do
 
         INDEX=0
         do L=0,LMAX2
            i3=0
-           do i=ii,min(ii+iblock-1,N-(nlo+nlon+nlov))
+           do i=ii,min(ii+iblock-1,Npw)
               i3=i3+1
               if (lapw(l)) then
                  h_AL(i3)=DFJ(L,I)*P(L,2)-FJ(L,I)*DP(L,2)
@@ -147,7 +153,7 @@ subroutine almgen(Alm, stru, jatom, lfirst, NB, kkk)
            do M=1,MAX
               INDEX=INDEX+1
               i3=0
-              do i=ii,min(ii+iblock-1,N-(nlo+nlon+nlov))
+              do i=ii,min(ii+iblock-1,Npw)
                  i3=i3+1
                  h_alyl(index,i3)=h_AL(i3)*h_YL(INDEX,i3)
                  h_blyl(index,i3)=h_BL(i3)*h_YL(INDEX,i3)
@@ -155,7 +161,7 @@ subroutine almgen(Alm, stru, jatom, lfirst, NB, kkk)
            end do
         end do
 
-        ibb = min(iblock, N - (nlo+nlon+nlov) - ii + 1)
+        ibb = min(iblock, Npw - ii + 1)
 #ifndef _COMPLEX_
         lda=2*(LMAX2+1)**2
 #else
@@ -227,6 +233,7 @@ subroutine almgen(Alm, stru, jatom, lfirst, NB, kkk)
         end do
      end do
   end do
+  deallocate(YL_all)
 end subroutine almgen
 end module     almgen_m
 
@@ -684,6 +691,7 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
   integer  :: index, pair_index, m2x,m2y,m2z, max, i,j,k, ii,jj,kk
   integer  :: i_x,i_y,i_z, k1,k2, kkk, lfirst, jatom, latom, mu
   integer  :: num1,num2, id, ix1,ix2,iy1,iy2,iz1,iz2
+  integer  :: nvalid
   real(R8) :: t1,t2, tt1,tt2,tt3, t_b, t_prod, vv, bx,by,bz, x, arg
 
   logical, allocatable, dimension(:,:) :: a_null, a_null_fin
@@ -692,12 +700,31 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
   complex(C16)       PHSHEL
   complex(C16), allocatable, dimension(:,:,:) :: A_
   complex(C16), allocatable, dimension(:,:) :: B_
+  ! Workspace for gathering valid columns for BLAS zgemm in Step 2
+  complex(C16), allocatable, dimension(:,:) :: Agath, Bgath
+  ! Sparse compressed index lists for Step 1 loop acceleration
+  integer, allocatable :: idx_null(:,:), idx_fin(:,:)
+  integer, allocatable :: idx_null_ix(:,:), idx_null_iy(:,:), idx_null_iz(:,:)
+  integer, allocatable :: idx_fin_ix(:,:), idx_fin_iy(:,:), idx_fin_iz(:,:)
+  integer, allocatable :: n_null(:), n_fin(:)
+  integer :: ni, nj
 
   allocate(FAC(-(2*maxx+1):(2*maxx+1),-(2*maxy+1):(2*maxy+1),-(2*maxz+1):(2*maxz+1)) )
   allocate(A_(NB,0:(2*maxx+1)*(2*maxy+1)*(2*maxz+1)-1,NUM_KPTS) )
   allocate(B_(NB,0:(2*maxx+1)*(2*maxy+1)*(2*maxz+1)-1) )
   allocate(a_null(0:(2*maxx+1)*(2*maxy+1)*(2*maxz+1)-1,NUM_KPTS) )
   allocate(a_null_fin(0:(2*maxx+1)*(2*maxy+1)*(2*maxz+1)-1,NUM_KPTS) )
+  allocate(Agath(NB, (2*maxx+1)*(2*maxy+1)*(2*maxz+1)) )
+  allocate(Bgath(NB, (2*maxx+1)*(2*maxy+1)*(2*maxz+1)) )
+  allocate(idx_null((2*maxx+1)*(2*maxy+1)*(2*maxz+1), NUM_KPTS))
+  allocate(idx_fin((2*maxx+1)*(2*maxy+1)*(2*maxz+1), NUM_KPTS))
+  allocate(idx_null_ix((2*maxx+1)*(2*maxy+1)*(2*maxz+1), NUM_KPTS))
+  allocate(idx_null_iy((2*maxx+1)*(2*maxy+1)*(2*maxz+1), NUM_KPTS))
+  allocate(idx_null_iz((2*maxx+1)*(2*maxy+1)*(2*maxz+1), NUM_KPTS))
+  allocate(idx_fin_ix((2*maxx+1)*(2*maxy+1)*(2*maxz+1), NUM_KPTS))
+  allocate(idx_fin_iy((2*maxx+1)*(2*maxy+1)*(2*maxz+1), NUM_KPTS))
+  allocate(idx_fin_iz((2*maxx+1)*(2*maxy+1)*(2*maxz+1), NUM_KPTS))
+  allocate(n_null(NUM_KPTS), n_fin(NUM_KPTS))
 
   m2x=2*maxx+1
   m2y=2*maxy+1
@@ -734,6 +761,33 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
            index=(I_Z*m2y+I_Y)*m2x+I_X
            a_null_fin(index,kkk)=.true.
         end do
+     end do
+  end do
+
+  ! Build compressed index lists from a_null and a_null_fin.
+  ! Reduces Step 1 from O(max^2) to O(n_null * n_fin).
+  n_null = 0
+  n_fin  = 0
+  do kkk=1,num_kpts
+     do J=0,max
+        if (a_null(J, kkk)) then
+           n_null(kkk) = n_null(kkk) + 1
+           ni = n_null(kkk)
+           idx_null(ni, kkk) = J
+           JJ = J/m2x
+           idx_null_iz(ni, kkk) = JJ/m2y
+           idx_null_iy(ni, kkk) = JJ - idx_null_iz(ni,kkk)*m2y
+           idx_null_ix(ni, kkk) = J - JJ*m2x
+        end if
+        if (a_null_fin(J, kkk)) then
+           n_fin(kkk) = n_fin(kkk) + 1
+           nj = n_fin(kkk)
+           idx_fin(nj, kkk) = J
+           JJ = J/m2x
+           idx_fin_iz(nj, kkk) = JJ/m2y
+           idx_fin_iy(nj, kkk) = JJ - idx_fin_iz(nj,kkk)*m2y
+           idx_fin_ix(nj, kkk) = J - JJ*m2x
+        end if
      end do
   end do
 
@@ -779,32 +833,29 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
      kkk=KP(pair_index)
      call cpu_time(tt1)
      b_=0
-     do J=0,max
-        if (a_null_fin(J,kkk)) then
-           SUM=0
-           JJ=J/m2x
-           iz2=jj/m2y
-           iy2=jj-iz2*m2y
-           ix2=j-jj*m2x
-           do I=0,max
-              if(a_null(I,kkk)) then
-                 II=I/m2x
-                 iz1=II/m2y
-                 iy1=II-iz1*m2y
-                 ix1=I-II*m2x
-                 FF=FAC(ix2-ix1,iy2-iy1,iz2-iz1)
-                 !! Use explicit scalar loop to avoid gfortran
-                 !! vectorizer miscompilation (-ftree-vectorize,
-                 !! enabled at -O2 and above) on ARM targets.
-                 do num1=1,NB
-                    sum(num1)=sum(num1)+a_(num1,I,k1)*FF
-                 end do
-              end if
-           end do
+     ! Step 1: Compute B_ = A_ * FAC using compressed index lists.
+     do nj=1,n_fin(kkk)
+        J   = idx_fin(nj, kkk)
+        ix2 = idx_fin_ix(nj, kkk)
+        iy2 = idx_fin_iy(nj, kkk)
+        iz2 = idx_fin_iz(nj, kkk)
+        SUM=0
+        do ni=1,n_null(kkk)
+           I   = idx_null(ni, kkk)
+           ix1 = idx_null_ix(ni, kkk)
+           iy1 = idx_null_iy(ni, kkk)
+           iz1 = idx_null_iz(ni, kkk)
+           FF=FAC(ix2-ix1,iy2-iy1,iz2-iz1)
+           !! Use explicit scalar loop to avoid gfortran
+           !! vectorizer miscompilation (-ftree-vectorize,
+           !! enabled at -O2 and above) on ARM targets.
            do num1=1,NB
-              b_(num1,j)=sum(num1)
+              sum(num1)=sum(num1)+a_(num1,I,k1)*FF
            end do
-        end if
+        end do
+        do num1=1,NB
+           b_(num1,j)=sum(num1)
+        end do
      end do
      call cpu_time(tt2)
      do k2=1,NNTOT
@@ -812,26 +863,29 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
         kkk=KPB(pair_index)
 
         id=-(BQZ(pair_index)*m2y+BQY(pair_index))*m2x-BQX(pair_index)-1
-        SUMA=0
 
+        ! Gather valid column pairs into contiguous arrays for zgemm.
+        ! A_ and B_ are always complex(C16) in planew.
+        nvalid = 0
         do J=0,max
            id=id+1
-
-           !! Use explicit scalar loops (see comment above)
            if (a_null(j,kkk) .and. 0 <= id .and. id <= max) then
-              do NUM1=1,NB
-                 do NUM2=1,NB
+              nvalid = nvalid + 1
 #ifndef _COMPLEX_
-                    SUMA(num2,num1)=SUMA(num2,num1)+a_(num2,j,kkk)*b_(num1,id)
+              Agath(:,nvalid) = a_(1:NB,j,kkk)
 #else
-                    SUMA(num2,num1)=SUMA(num2,num1)+conjg(a_(num2,j,kkk))*b_(num1,id)
+              Agath(:,nvalid) = conjg(a_(1:NB,j,kkk))
 #endif
-                 end do
-              end do
+              Bgath(:,nvalid) = b_(1:NB,id)
            endif
         end do
 
-        overlap(1:nb,1:nb,pair_index) = overlap(1:nb,1:nb,pair_index) + SUMA
+        ! SUMA = Agath * Bgath^T via zgemm
+        if (nvalid > 0) then
+           call zgemm('N', 'T', NB, NB, nvalid,           &
+                &      (1._R8, 0._R8), Agath, NB, Bgath, NB, &
+                &      (1._R8, 0._R8), overlap(1,1,pair_index), size(overlap,1))
+        end if
 
         write(unit_mmn,235)KP(pair_index),KPB(pair_index),BQX1(pair_index),BQY1(pair_index), &
              BQZ1(pair_index)
@@ -860,6 +914,12 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
   deallocate(B_)
   deallocate(a_null)
   deallocate(a_null_fin)
+  deallocate(Agath)
+  deallocate(Bgath)
+  deallocate(idx_null, idx_fin)
+  deallocate(idx_null_ix, idx_null_iy, idx_null_iz)
+  deallocate(idx_fin_ix, idx_fin_iy, idx_fin_iz)
+  deallocate(n_null, n_fin)
 end subroutine PLANEW
 end module planew_m
 
