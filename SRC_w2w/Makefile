@@ -8,7 +8,7 @@
 ### Copyright 2013-2016 Elias Assmann
 
 # FC ........... compiler name
-# FOPT ......... optimization flags
+# FOPT ......... optimization flags (passed via make.sys or command line)
 # FGEN ......... code generation flags (flags not related to optimization)
 # LDFLAGS ...... linker flags
 # R_LIBS ....... libraries needed to build the REAL executable
@@ -16,6 +16,19 @@
 # DESTDIR ...... dir. where the executable should go (without trailing '/'!)
 # R_EXECNAME ... name of the resulting REAL executable (without prefixed path!)
 # C_EXECNAME ... name of the resulting COMPLEX executable ( -"- )
+#
+# IMPORTANT: When building standalone (outside WIEN2k), set FOPT not FFLAGS
+# on the command line, because FFLAGS is constructed from FOPT:
+#
+#   make FOPT="-O2" all              (correct)
+#   make FFLAGS="-O2" all            (WRONG: overrides -I$(O_DIR))
+#
+# Recommended FOPT for common compilers:
+#   ifort:    FOPT="-O2"
+#   gfortran: FOPT="-O2 -ffree-form"
+#
+# Note: gfortran -O3 is safe with this code. A previous vectorizer bug in
+# planew was fixed by using explicit scalar loops (see modules_rc.F).
 
 SHELL = /bin/sh
 .SUFFIXES:

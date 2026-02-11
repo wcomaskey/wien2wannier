@@ -269,7 +269,6 @@ subroutine l2Mmn(stru, inwf, num_kpts, NNTOT)
 
   real(R8) :: BM, tt2,tt3, t2, arg1, arg2, arg3
   integer  :: index1,index2,indexj, irf1,irf2, lj, m1,m2,mj, mu
-  complex(C16) :: diag_save  ! DIAGNOSTIC: saved overlap before atom contribution
   integer  :: latom, l_index, l1, l2
 
   integer :: k1_prog_itvl
@@ -310,34 +309,12 @@ subroutine l2Mmn(stru, inwf, num_kpts, NNTOT)
 
         call almgen(Alm, stru, jatom, lfirst, Nb, kkk)
 
-        ! DIAGNOSTIC: Print ALM norm for band 1, first k-point, first atom
-        if (k1 == 1 .and. jatom == 1) then
-           diag_save = (0._R8, 0._R8)
-           do index1=1,(LMAX2+1)**2
-              do irf1=1,Nrf
-                 diag_save = diag_save + ALM(1,irf1,index1,1)*conjg(ALM(1,irf1,index1,1))
-              end do
-           end do
-           write(unit_out,'(A,2E20.12)') '  DIAG ALM_norm2(band1,k1,at1): ', real(diag_save), aimag(diag_save)
-        end if
-
         k2loop: do k2=1,NNTOT
            if (k2 > 1) pair_index=pair_index+1
            kkk=KPB(pair_index)
            call cpu_time(tt0)
            call almgen(Blm, stru, jatom, lfirst, Nb, kkk)
            BLM=conjg(BLM)
-
-           ! DIAGNOSTIC: Print BLM norm for band 1, first pair, first atom
-           if (pair_index == 1 .and. jatom == 1) then
-              diag_save = (0._R8, 0._R8)
-              do index1=1,(LMAX2+1)**2
-                 do irf1=1,Nrf
-                    diag_save = diag_save + BLM(1,irf1,index1,1)*conjg(BLM(1,irf1,index1,1))
-                 end do
-              end do
-              write(unit_out,'(A,2E20.12)') '  DIAG BLM_norm2(band1,k1b,at1):', real(diag_save), aimag(diag_save)
-           end if
 
            call cpu_time(tt1)
 
@@ -352,20 +329,6 @@ subroutine l2Mmn(stru, inwf, num_kpts, NNTOT)
 
            ! compute radial intergrals <R(r)|j_(|b|*r)|R'(r)>
            call radint(stru, jatom, inwf%LJmax, bm)
-
-           ! DIAGNOSTIC: Print ri_mat for first pair, first atom
-           if (pair_index == 1 .and. jatom == 1) then
-              write(unit_out,'(A,E20.12)') '  DIAG BM (|b|):                ', bm
-              write(unit_out,'(A,E20.12)') '  DIAG ri_mat(1,1):             ', ri_mat(1,1)
-              write(unit_out,'(A,E20.12)') '  DIAG ri_mat(2,1):             ', ri_mat(2,1)
-              write(unit_out,'(A,E20.12)') '  DIAG ri_mat(3,1):             ', ri_mat(3,1)
-              write(unit_out,'(A,E20.12)') '  DIAG ri_mat(4,1):             ', ri_mat(4,1)
-              if (Nrf >= 3) then
-                 write(unit_out,'(A,I5)') '  DIAG n_rad(0), n_rad(1):      ', n_rad(0)
-                 write(unit_out,'(A,I5)') '  DIAG                          ', n_rad(1)
-              end if
-           end if
-
            ! computer Y_lm(b)
            call YLM (BK, inwf%LJmax, YLB)
 
@@ -377,12 +340,6 @@ subroutine l2Mmn(stru, inwf, num_kpts, NNTOT)
               enddo
            enddo
            call cpu_time(tt2)
-
-           ! DIAGNOSTIC: Save overlap(1,1) before this atom's contribution
-           if (pair_index == 1 .and. k2 == 1) then
-              diag_save = overlap(1,1,1)
-           end if
-
            muloop: do mu=1, stru%mult(jatom)
               latom=lfirst-1+mu
               arg1=Bx * stru%pos(1,latom)*TAU
@@ -422,16 +379,6 @@ subroutine l2Mmn(stru, inwf, num_kpts, NNTOT)
                  enddo l2loop
               enddo l1loop
            enddo muloop
-
-           ! DIAGNOSTIC: Print per-atom MT contribution for first pair
-           if (pair_index == 1 .and. k2 == 1) then
-              write(unit_out,'(A,I3,A,2E20.12)') '  DIAG MT_atom', jatom, &
-                   ' contrib(1,1): ', real(overlap(1,1,1)-diag_save), &
-                   aimag(overlap(1,1,1)-diag_save)
-              write(unit_out,'(A,I3,A,2E20.12)') '  DIAG MT_cumul_atom', jatom, &
-                   ' (1,1):        ', real(overlap(1,1,1)), aimag(overlap(1,1,1))
-           end if
-
            call cpu_time(tt3)
            talm=talm+tt1-tt0
            tmeas1=tmeas1+tt2-tt1
@@ -846,10 +793,17 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
                  iy1=II-iz1*m2y
                  ix1=I-II*m2x
                  FF=FAC(ix2-ix1,iy2-iy1,iz2-iz1)
-                 sum=sum+a_(1:nb,I,k1)*FF
+                 !! Use explicit scalar loop to avoid gfortran
+                 !! vectorizer miscompilation (-ftree-vectorize,
+                 !! enabled at -O2 and above) on ARM targets.
+                 do num1=1,NB
+                    sum(num1)=sum(num1)+a_(num1,I,k1)*FF
+                 end do
               end if
            end do
-           b_(1:nb,j)=sum
+           do num1=1,NB
+              b_(num1,j)=sum(num1)
+           end do
         end if
      end do
      call cpu_time(tt2)
@@ -863,31 +817,21 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
         do J=0,max
            id=id+1
 
-           if (a_null(j,kkk) .and. 0 <= id .and. id < max) then
+           !! Use explicit scalar loops (see comment above)
+           if (a_null(j,kkk) .and. 0 <= id .and. id <= max) then
               do NUM1=1,NB
+                 do NUM2=1,NB
 #ifndef _COMPLEX_
-                 SUMA(1:nb,num1)=SUMA(1:nb,num1)+a_(1:nb,j,kkk)*b_(num1,id)
+                    SUMA(num2,num1)=SUMA(num2,num1)+a_(num2,j,kkk)*b_(num1,id)
 #else
-                 SUMA(1:nb,num1)=SUMA(1:nb,num1)+conjg(a_(1:nb,j,kkk))*b_(num1,id)
+                    SUMA(num2,num1)=SUMA(num2,num1)+conjg(a_(num2,j,kkk))*b_(num1,id)
 #endif
+                 end do
               end do
            endif
         end do
 
-        ! DIAGNOSTIC: Print MT and interstitial contributions for first pair M(1,1)
-        if (pair_index == 1) then
-           write(unit_out,'(A,2E20.12)') '  MT   overlap(1,1): ', &
-                real(conjg(overlap(1,1,1))), aimag(conjg(overlap(1,1,1)))
-           write(unit_out,'(A,2E20.12)') '  INT  SUMA(1,1):    ', &
-                real(conjg(SUMA(1,1))), aimag(conjg(SUMA(1,1)))
-        end if
-
         overlap(1:nb,1:nb,pair_index) = overlap(1:nb,1:nb,pair_index) + SUMA
-
-        if (pair_index == 1) then
-           write(unit_out,'(A,2E20.12)') '  TOT  overlap(1,1): ', &
-                real(conjg(overlap(1,1,1))), aimag(conjg(overlap(1,1,1)))
-        end if
 
         write(unit_mmn,235)KP(pair_index),KPB(pair_index),BQX1(pair_index),BQY1(pair_index), &
              BQZ1(pair_index)
