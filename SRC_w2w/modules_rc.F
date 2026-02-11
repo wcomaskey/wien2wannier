@@ -821,7 +821,20 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
            endif
         end do
 
+        ! DIAGNOSTIC: Print MT and interstitial contributions for first pair M(1,1)
+        if (pair_index == 1) then
+           write(unit_out,'(A,2E20.12)') '  MT   overlap(1,1): ', &
+                real(conjg(overlap(1,1,1))), aimag(conjg(overlap(1,1,1)))
+           write(unit_out,'(A,2E20.12)') '  INT  SUMA(1,1):    ', &
+                real(conjg(SUMA(1,1))), aimag(conjg(SUMA(1,1)))
+        end if
+
         overlap(1:nb,1:nb,pair_index) = overlap(1:nb,1:nb,pair_index) + SUMA
+
+        if (pair_index == 1) then
+           write(unit_out,'(A,2E20.12)') '  TOT  overlap(1,1): ', &
+                real(conjg(overlap(1,1,1))), aimag(conjg(overlap(1,1,1)))
+        end if
 
         write(unit_mmn,235)KP(pair_index),KPB(pair_index),BQX1(pair_index),BQY1(pair_index), &
              BQZ1(pair_index)
