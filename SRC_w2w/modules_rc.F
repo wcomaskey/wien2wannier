@@ -278,6 +278,17 @@ subroutine l2Mmn(stru, inwf, num_kpts, NNTOT)
   integer  :: index1,index2,indexj, irf1,irf2, lj, m1,m2,mj, mu
   integer  :: latom, l_index, l1, l2
 
+  ! --- Batched zgemm variables (Opt 3: zgeru → zgemm) ---
+  ! Column map: col_a(irf, index) → flat column 1..Na for active (irf, L,M)
+  integer  :: col_map(NRF, (LMAX2+1)**2)
+  integer  :: Na          ! number of active columns
+  integer  :: ca, cb, ll  ! column indices for ALM/BLM
+  ! Coefficient matrix: S_base(col_b, col_a) accumulates ri_mat*YLB*gaunt
+  ! (without PHSHEL, which is factored out per mu)
+  complex(C16), allocatable :: S_base(:,:)
+  ! Gathered 2D views and workspace for zgemm
+  complex(C16), allocatable :: ALM_2d(:,:), BLM_2d(:,:), W(:,:)
+
   integer :: k1_prog_itvl
   k1_prog_itvl = min(max(num_kpts/10, 1), 100)
 
@@ -305,6 +316,25 @@ subroutine l2Mmn(stru, inwf, num_kpts, NNTOT)
      call atpar(stru, JATOM, itape, jtape)
      fac=2*TAU * stru%RMT(jatom)**2 / sqrt(stru%vol)
      rewind(itape)
+
+     ! Build column map: enumerate active (irf, L, M) combinations
+     ! col_map(irf, index) = flat column number 1..Na, or 0 if inactive
+     col_map = 0
+     Na = 0
+     do ll = 0, LMAX2
+        do m1 = -ll, ll
+           index1 = ll*(ll+1) + m1 + 1
+           do irf1 = 1, n_rad(ll)
+              Na = Na + 1
+              col_map(irf1, index1) = Na
+           end do
+        end do
+     end do
+     write(unit_out, "(' Batched zgemm: Na=', I4, ' active columns')") Na
+
+     ! Allocate work arrays for batched zgemm
+     allocate(S_base(Na, Na))
+     allocate(ALM_2d(Nb, Na), BLM_2d(Nb, Na), W(Nb, Na))
 
      pair_index=0
      k1loop: do k1=1,num_kpts      !   loop over k1
@@ -347,6 +377,47 @@ subroutine l2Mmn(stru, inwf, num_kpts, NNTOT)
               enddo
            enddo
            call cpu_time(tt2)
+
+           ! --- Opt 3: Build S_base coefficient matrix (without PHSHEL) ---
+           ! S_base(col_b, col_a) = sum over (LJ,MJ) of
+           !   ri_mat(R_index,L_index) * YLB(indexj) * gaunt(L2,LJ,L1,M2,MJ,M1)
+           ! where col_a = col_map(irf1, index1), col_b = col_map(irf2, index2).
+           ! PHSHEL is factored out (varies per mu only).
+           S_base = (0.0_R8, 0.0_R8)
+           L_index=0
+           do L1=0,LMAX2
+              do L2=0,LMAX2
+                 do LJ = abs(L1-L2), min(L1+L2, inwf%LJmax), 2
+                    if (mod((L1+L2+LJ),2) == 1) cycle
+                    if ((L1+L2-LJ) < 0         &
+                         .or. (L1-L2+LJ) < 0   &
+                         .or. (-L1+L2+LJ) < 0) &
+                         & cycle
+                    L_index=L_index+1
+                    do M1=-L1,L1
+                       index1=L1*(L1+1)+M1+1
+                       do MJ = max(-LJ, -L2-M1), min(LJ, L2-M1)
+                          M2=M1+MJ
+                          index2=L2*(L2+1)+M2+1
+                          indexj=LJ*(LJ+1)+MJ+1
+                          tmp=YLB(indexj)*get_gaunt(L2,LJ,L1,M2,MJ,M1)
+                          R_index=0
+                          do irf1=1,n_rad(L1)
+                             do irf2=1,n_rad(L2)
+                                R_index=R_index+1
+                                ca = col_map(irf1, index1)
+                                cb = col_map(irf2, index2)
+                                S_base(cb, ca) = S_base(cb, ca) &
+                                     + ri_mat(R_index,L_index) * tmp
+                             enddo
+                          enddo
+                       enddo
+                    enddo
+                 enddo
+              enddo
+           enddo
+
+           ! --- Per mu: scale by PHSHEL, gather ALM/BLM, two zgemms ---
            muloop: do mu=1, stru%mult(jatom)
               latom=lfirst-1+mu
               arg1=Bx * stru%pos(1,latom)*TAU
@@ -354,37 +425,29 @@ subroutine l2Mmn(stru, inwf, num_kpts, NNTOT)
               arg3=Bz * stru%pos(3,latom)*TAU
               PHSHEL=exp((0,1)*(ARG1+ARG2+ARG3))*2*TAU
 
-              L_index=0
-              l1loop: do L1=0,LMAX2
-                 l2loop: do L2=0,LMAX2
-                    ljloop: do LJ = abs(L1-L2), min(L1+L2, inwf%LJmax), 2
-                       if (mod((L1+L2+LJ),2) == 1) cycle
-                       if ((L1+L2-LJ) < 0         &
-                            .or. (L1-L2+LJ) < 0   &
-                            .or. (-L1+L2+LJ) < 0) &
-                            & cycle
-                       L_index=L_index+1
-                       m1loop: do M1=-L1,L1
-                          ! OPTIMIZED: Hoist index1 outside MJ loop (depends only on L1, M1)
-                          index1=L1*(L1+1)+M1+1
-                          mjloop: do MJ = max(-LJ, -L2-M1), min(LJ, L2-M1)
-                             M2=M1+MJ                   ! abs(m2) <= l2 !
-                             index2=L2*(L2+1)+M2+1
-                             indexj=LJ*(LJ+1)+MJ+1
-                             tmp=YLB(indexj)*PHSHEL*get_gaunt(L2,LJ,L1,M2,MJ,M1)
-                             R_index=0
-                             do irf1=1,n_rad(L1)
-                                do irf2=1,n_rad(L2)
-                                   R_index=R_index+1
-                                   tmp1=ri_mat(R_index,L_index)*tmp
-                                   call zgeru(NB,NB,tmp1,BLM(1,irf2,index2,mu),1,ALM(1,irf1,index1,mu),1,overlap(1,1,pair_index),size(overlap,1))
-                                enddo
-                             enddo
-                          enddo mjloop
-                       enddo m1loop
-                    enddo ljloop
-                 enddo l2loop
-              enddo l1loop
+              ! Gather ALM and BLM into contiguous 2D arrays (Nb x Na)
+              do ll = 0, LMAX2
+                 do m1 = -ll, ll
+                    index1 = ll*(ll+1) + m1 + 1
+                    do irf1 = 1, n_rad(ll)
+                       ca = col_map(irf1, index1)
+                       ALM_2d(:, ca) = ALM(:, irf1, index1, mu)
+                       BLM_2d(:, ca) = BLM(:, irf1, index1, mu)
+                    end do
+                 end do
+              end do
+
+              ! W(Nb, Na) = BLM_2d(Nb, Na) * (PHSHEL * S_base(Na, Na))
+              ! overlap += W * ALM_2d^T
+              ! zgemm 1: W = BLM_2d * S_base, scaled by PHSHEL (alpha)
+              call zgemm('N', 'N', Nb, Na, Na, PHSHEL, &
+                   BLM_2d, Nb, S_base, Na, &
+                   (0.0_R8, 0.0_R8), W, Nb)
+              ! zgemm 2: overlap += W * ALM_2d^T
+              call zgemm('N', 'T', Nb, Nb, Na, (1.0_R8, 0.0_R8), &
+                   W, Nb, ALM_2d, Nb, &
+                   (1.0_R8, 0.0_R8), overlap(1,1,pair_index), &
+                   size(overlap,1))
            enddo muloop
            call cpu_time(tt3)
            talm=talm+tt1-tt0
@@ -396,7 +459,7 @@ subroutine l2Mmn(stru, inwf, num_kpts, NNTOT)
              write(unit_out, "('k1=', I5, ' /', I5, ' (', I3, '%)')") &
              &    k1, num_kpts, (100*k1)/num_kpts
      end do k1loop
-     deallocate(ALM,BLM)
+     deallocate(ALM, BLM, S_base, ALM_2d, BLM_2d, W)
 
      call cpu_time(t2)
      talm=talm*(NNTOT+1)/NNTOT
