@@ -708,6 +708,16 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
   integer, allocatable :: idx_fin_ix(:,:), idx_fin_iy(:,:), idx_fin_iz(:,:)
   integer, allocatable :: n_null(:), n_fin(:)
   integer :: ni, nj
+#ifdef HAVE_FFTW
+  include 'fftw3.f'
+  integer  :: Nfx, Nfy, Nfz, Nfft_total
+  integer*8 :: plan_fwd, plan_bwd
+  complex(C16), allocatable :: FAC_hat(:,:,:)
+  complex(C16), allocatable :: work3d(:,:,:)
+  real(R8) :: inv_Nfft
+  integer  :: band, wrap_ix, wrap_iy, wrap_iz
+  logical  :: use_fft
+#endif
 
   allocate(FAC(-(2*maxx+1):(2*maxx+1),-(2*maxy+1):(2*maxy+1),-(2*maxz+1):(2*maxz+1)) )
   allocate(A_(NB,0:(2*maxx+1)*(2*maxy+1)*(2*maxz+1)-1,NUM_KPTS) )
@@ -733,6 +743,23 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
   write(unit_out,*)'MAX Q:',maxx,maxy,maxz
   t_b=0.d0
   t_prod=0.d0
+
+#ifdef HAVE_FFTW
+  ! FFT grid: 2*m2x per dim guarantees no circular aliasing
+  ! (kernel support [-(m2x-1), m2x-1] has width 2*m2x-1 <= 2*m2x = Nfx)
+  Nfx = 2 * m2x
+  Nfy = 2 * m2y
+  Nfz = 2 * m2z
+  Nfft_total = Nfx * Nfy * Nfz
+  inv_Nfft = 1.0_R8 / Nfft_total
+  allocate(FAC_hat(Nfx, Nfy, Nfz), work3d(Nfx, Nfy, Nfz))
+  ! Create FFTW plans (ESTIMATE: no destructive benchmarking)
+  call dfftw_plan_dft_3d(plan_fwd, Nfx, Nfy, Nfz, &
+       work3d, work3d, FFTW_FORWARD, FFTW_ESTIMATE)
+  call dfftw_plan_dft_3d(plan_bwd, Nfx, Nfy, Nfz, &
+       work3d, work3d, FFTW_BACKWARD, FFTW_ESTIMATE)
+  write(unit_out,*) 'FFT grid:', Nfx, Nfy, Nfz, ' total=', Nfft_total
+#endif
 
   call cpu_time(t1)
   A_=0
@@ -823,6 +850,26 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
   end do
   FAC(0,0,0)=FAC(0,0,0)+1
 
+#ifdef HAVE_FFTW
+  ! Pre-transform FAC kernel into Fourier space.
+  ! Place FAC(dx,dy,dz) into padded grid with circular wraparound:
+  !   non-negative d → position d+1 (Fortran 1-based)
+  !   negative d     → position Nf+d+1 (wraps to end of array)
+  ! Populate only [-(m2x-1), m2x-1] — the actual convolution support.
+  FAC_hat = (0.0_R8, 0.0_R8)
+  do k = -(m2z-1), m2z-1
+     wrap_iz = merge(k + 1, Nfz + k + 1, k >= 0)
+     do j = -(m2y-1), m2y-1
+        wrap_iy = merge(j + 1, Nfy + j + 1, j >= 0)
+        do i = -(m2x-1), m2x-1
+           wrap_ix = merge(i + 1, Nfx + i + 1, i >= 0)
+           FAC_hat(wrap_ix, wrap_iy, wrap_iz) = FAC(i, j, k)
+        end do
+     end do
+  end do
+  call dfftw_execute_dft(plan_fwd, FAC_hat, FAC_hat)
+#endif
+
   call cpu_time(t2)
   write(unit_out,*)'t_init=',t2-t1
 
@@ -832,8 +879,45 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
      pair_index=pair_index+1
      kkk=KP(pair_index)
      call cpu_time(tt1)
+     ! Step 1: Compute B_ = A_ conv FAC (interstitial overlap kernel).
      b_=0
-     ! Step 1: Compute B_ = A_ * FAC using compressed index lists.
+#ifdef HAVE_FFTW
+     ! Runtime crossover: use FFT when sparse convolution is expensive.
+     ! The constant 16 accounts for FFT overhead (3 transforms + gather/scatter)
+     ! vs the simple multiply-add of the sparse loop.
+     use_fft = (int(n_null(kkk),8) * int(n_fin(kkk),8)) > &
+               (int(Nfft_total,8) * 16_8)
+     if (k1 == 1) write(unit_out,'(A,I6,A,I6,A,I10,A,L1)') &
+          ' FFT crossover: n_null=', n_null(kkk), ' n_fin=', n_fin(kkk), &
+          ' product=', n_null(kkk)*n_fin(kkk), ' use_fft=', use_fft
+     if (use_fft) then
+        ! FFT-based convolution: B = IFFT(FFT(A) * FAC_hat) per band
+        do band = 1, NB
+           ! (a) Scatter A_ for this band into zero-padded 3D grid
+           work3d = (0.0_R8, 0.0_R8)
+           do ni = 1, n_null(kkk)
+              work3d(idx_null_ix(ni,kkk)+1, &
+                     idx_null_iy(ni,kkk)+1, &
+                     idx_null_iz(ni,kkk)+1) = A_(band, idx_null(ni,kkk), k1)
+           end do
+           ! (b) Forward FFT
+           call dfftw_execute_dft(plan_fwd, work3d, work3d)
+           ! (c) Pointwise multiply by pre-transformed kernel
+           work3d = work3d * FAC_hat
+           ! (d) Inverse FFT
+           call dfftw_execute_dft(plan_bwd, work3d, work3d)
+           ! (e) Gather B_ at output positions, with 1/N normalization
+           !     (FFTW backward transform is unnormalized)
+           do nj = 1, n_fin(kkk)
+              B_(band, idx_fin(nj,kkk)) = &
+                   work3d(idx_fin_ix(nj,kkk)+1, &
+                          idx_fin_iy(nj,kkk)+1, &
+                          idx_fin_iz(nj,kkk)+1) * inv_Nfft
+           end do
+        end do
+     else
+#endif
+     ! Sparse convolution using compressed index lists.
      do nj=1,n_fin(kkk)
         J   = idx_fin(nj, kkk)
         ix2 = idx_fin_ix(nj, kkk)
@@ -857,6 +941,9 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
            b_(num1,j)=sum(num1)
         end do
      end do
+#ifdef HAVE_FFTW
+     end if
+#endif
      call cpu_time(tt2)
      do k2=1,NNTOT
         if (k2 > 1) pair_index=pair_index+1
@@ -909,6 +996,11 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
 236 format(32f18.12)
 
   !release the memory
+#ifdef HAVE_FFTW
+  call dfftw_destroy_plan(plan_fwd)
+  call dfftw_destroy_plan(plan_bwd)
+  deallocate(FAC_hat, work3d)
+#endif
   deallocate(FAC)
   deallocate(A_)
   deallocate(B_)
