@@ -1492,9 +1492,13 @@ module inwfmod
   type inwf_t
      !! Structure to represent a ‘inwf’ file
      character(len=4)        :: mode
-     logical                 :: Mmn, Amn
+     logical                 :: Mmn, Amn, PDWF
      integer                 :: bmin, bmax, Nproj, LJmax
      type(proj), allocatable :: projections(:)
+     !! PDWF parameters (only used when PDWF=.true.)
+     real(DPk)               :: pdwf_p_high  = 0.90_DPk ! frozen threshold
+     real(DPk)               :: pdwf_p_low   = 0.05_DPk ! exclusion threshold
+     real(DPk)               :: pdwf_margin  = 0.50_DPk ! energy window margin (eV)
   end type inwf_t
 
 contains
@@ -1509,6 +1513,10 @@ contains
     integer             :: w, y, NY
     real(DPk)           :: re, im
 
+    inwf%PDWF = .false.
+    inwf%Amn  = .false.
+    inwf%Mmn  = .false.
+
     read(lun, *) inwf%mode
 
     select case (uppercase(inwf%mode))
@@ -1519,6 +1527,9 @@ contains
     case('BOTH')
        inwf%Amn = .true.
        inwf%Mmn = .true.
+    case('PDWF')
+       inwf%PDWF = .true.
+       inwf%Amn  = .true.
     case default
        call croak('unknown MODE in inwf, '//inwf%mode)
     end select
@@ -1527,26 +1538,32 @@ contains
     if (inwf%bmax < inwf%bmin) &
          call croak('bmin > bmax in inwf')
 
-    read(lun,*) inwf%LJmax, inwf%Nproj
+    if (inwf%PDWF) then
+       read(lun, *) inwf%LJmax
+       read(lun, *) inwf%pdwf_p_high, inwf%pdwf_p_low, inwf%pdwf_margin
+       inwf%Nproj = 0
+    else
+       read(lun,*) inwf%LJmax, inwf%Nproj
 
-    if (inwf%Amn) then
-       allocate(inwf%projections(inwf%Nproj))
-       do w = 1, inwf%Nproj
-          read(lun, *) NY
-          inwf%projections(w)%NY = NY
-          allocate( inwf%projections(w)%iat  (NY), &
-               &    inwf%projections(w)%l    (NY), &
-               &    inwf%projections(w)%m    (NY), &
-               &    inwf%projections(w)%coeff(NY))
+       if (inwf%Amn) then
+          allocate(inwf%projections(inwf%Nproj))
+          do w = 1, inwf%Nproj
+             read(lun, *) NY
+             inwf%projections(w)%NY = NY
+             allocate( inwf%projections(w)%iat  (NY), &
+                  &    inwf%projections(w)%l    (NY), &
+                  &    inwf%projections(w)%m    (NY), &
+                  &    inwf%projections(w)%coeff(NY))
 
-          ylm: do y = 1,NY
-             read(lun, *) inwf%projections(w)%iat(y), &
-                  &       inwf%projections(w)%l  (y), &
-                  &       inwf%projections(w)%m  (y), &
-                  re, im
-             inwf%projections(w)%coeff(y) = cmplx(re, im, DPk)
-          end do ylm
-       end do
+             ylm: do y = 1,NY
+                read(lun, *) inwf%projections(w)%iat(y), &
+                     &       inwf%projections(w)%l  (y), &
+                     &       inwf%projections(w)%m  (y), &
+                     re, im
+                inwf%projections(w)%coeff(y) = cmplx(re, im, DPk)
+             end do ylm
+          end do
+       end if
     end if
   end subroutine inwf_read_unit
 

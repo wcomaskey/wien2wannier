@@ -874,6 +874,7 @@ subroutine read_vec(NEmin, NEmax, Nneq, kkk, maxx, maxy, maxz, Efermi)
   use w2w,    only: unit_eig
   use const,  only: R8, Ryd_eV
   use xa3,    only: XK,YK,ZK, GX,GY,GZ, vecsz, A
+  use eigenval_store, only: eigvals
 
   implicit none
 
@@ -926,6 +927,7 @@ subroutine read_vec(NEmin, NEmax, Nneq, kkk, maxx, maxy, maxz, Efermi)
      do NUM=NEMIN,NEMAX
         NB=NUM-NEMIN+1
         write(unit_eig,"(2I12,F22.16)")NB,kkk, Ryd_eV*(E(NUM)-efermi)
+        if (allocated(eigvals)) eigvals(NB, kkk) = Ryd_eV*(E(NUM)-efermi)
      enddo
   end do kpoint
 

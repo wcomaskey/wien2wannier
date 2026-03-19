@@ -37,6 +37,8 @@ program wf
   use inwfmod,   only: inwf_t, inwf_read
   use gaunt_cache, only: init_gaunt_cache, cleanup_gaunt_cache
   use loabc,       only: cleanup_loabc
+  use eigenval_store, only: init_eigenval_store, cleanup_eigenval_store
+  use pdwf_m,      only: pdwf_target_t, build_targets, pdwf_compute
 
   !! procedure includes
   use read_vec_m
@@ -48,6 +50,7 @@ program wf
   implicit none
 
   type(inwf_t) :: inwf
+  type(pdwf_target_t) :: pdwf_targets
 
   character(len=   11)  :: status,form
   character(len=BUFSZ)  :: deffn, errfn, aline
@@ -144,8 +147,10 @@ program wf
   Nb = inwf%bmax - inwf%bmin + 1
 
   write(unit_out, "(' MODE=')", ADVANCE='no')
-  if (inwf%Mmn) write(unit_out, '(" Mmn")', ADVANCE='no')
-  if (inwf%Amn) write(unit_out, '(" Amn")', ADVANCE='no')
+  if (inwf%PDWF) write(unit_out, '(" PDWF")', ADVANCE='no')
+  if (inwf%Mmn)  write(unit_out, '(" Mmn")', ADVANCE='no')
+  if (inwf%Amn .and. .not. inwf%PDWF) &
+       write(unit_out, '(" Amn")', ADVANCE='no')
   write(unit_out,*)
   write(unit_out, '(" band window = [", I0, ", ", I0, "]")') &
        inwf%bmin, inwf%bmax
@@ -155,6 +160,8 @@ program wf
   call init_Amn_Mmn(Nb, N_pair)
 
   read(unit_fermi, *) efermi
+
+  if (inwf%PDWF) call init_eigenval_store(Nb, Nk)
 
   kkk=0
   maxx=0; maxy=0; maxz=0
@@ -171,7 +178,13 @@ program wf
   if(kkk /= Nk) call croak('inconsistent numbers of k-points between&
        & vector and energy files')
 
-  read_proj: if (inwf%Amn) then
+  read_proj: if (inwf%PDWF) then
+     write(unit_out, *)
+     write(unit_out, '(A)') ' PDWF automatic projection mode'
+     write(unit_out, '(A,F6.3)') '   p_high  = ', inwf%pdwf_p_high
+     write(unit_out, '(A,F6.3)') '   p_low   = ', inwf%pdwf_p_low
+     write(unit_out, '(A,F6.3)') '   margin  = ', inwf%pdwf_margin
+  else if (inwf%Amn) then
      write(unit_out, *)
      write(unit_out,*)'Initial orbital projections:'
 
@@ -198,7 +211,11 @@ program wf
          & 'I N F O R M A T I O N',/,30X,50(1H-),//)")
   write(unit_out, "(3X,'SUBSTANCE',20X,'= ',A80,/)") stru%title
 
-  if (inwf%Amn) then
+  if (inwf%PDWF) then
+     call build_targets(stru, pdwf_targets)
+     write(unit_amn,'(A20)')  stru%title
+     write(unit_amn,'(3I12)') Nb, Nk, pdwf_targets%Ntarget
+  else if (inwf%Amn) then
      write(unit_amn,'(A20)')  stru%title
      write(unit_amn,'(3I12)') Nb, Nk, inwf%Nproj
   endif
@@ -243,7 +260,12 @@ program wf
      call ptime('planew')
   endif
 
-  if (inwf%Amn) then
+  if (inwf%PDWF) then
+     call ptime(unit_out)
+     call pdwf_compute(stru, inwf, pdwf_targets, Nb, Nk)
+     call ptime('PDWF')
+     call cleanup_eigenval_store()
+  else if (inwf%Amn) then
      call ptime(unit_out)
      call l2amn(stru, inwf, Nk)
      call ptime('l2Amn')

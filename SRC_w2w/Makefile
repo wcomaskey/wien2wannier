@@ -110,7 +110,7 @@ OBJS = $(filter-out $(R_OBJS) $(RC_OBJS), \
 #  The two versions go to different directories so we can keep both
 #  versions around.
 #
-R_OBJS = modules_rc.o
+R_OBJS = modules_rc.o pdwf.o
 C_OBJS = $(R_OBJS)
 
 #........................................................................
@@ -127,13 +127,15 @@ RC_OBJS = $(filter-out $(R_OBJS), $(modrc_users))
 #
 
 ## util_w2w.F:   utilities used in SRC_w2w, SRC_wplot, SRC_trig
-util_users   = mod_w2w.o modules.o modules_rc.o main.o
+util_users   = mod_w2w.o modules.o modules_rc.o pdwf.o main.o
 ## mod_w2w.f:    modules and procedures shared by SRC_w2w and SRC_wplot
-modw2w_users = modules.o modules_rc.o main.o
+modw2w_users = modules.o modules_rc.o pdwf.o main.o
 ## modules.f:    modules and procedures for SRC_w2w
-mod_users    = modules_rc.o main.o
+mod_users    = modules_rc.o pdwf.o main.o
 ## modules_rc.f: modules and procedures for SRC_w2w -- real/complex
-modrc_users  = main.o
+modrc_users  = pdwf.o main.o
+## pdwf.F:       PDWF module -- real/complex (main.o needs pdwf_m.mod)
+pdwf_users   = main.o
 
 #........................................................................
 #
@@ -192,3 +194,7 @@ $(util_users):   $(O_DIR)/util_w2w.o
 # real/complex versions
 $(foreach o, $(modrc_users), $(R_DIR)/$o): $(R_DIR)/modules_rc.o
 $(foreach o, $(modrc_users), $(C_DIR)/$o): $(C_DIR)/modules_rc.o
+
+# Dependencies on 'pdwf.o'; main.o needs pdwf_m.mod
+$(foreach o, $(pdwf_users), $(R_DIR)/$o): $(R_DIR)/pdwf.o
+$(foreach o, $(pdwf_users), $(C_DIR)/$o): $(C_DIR)/pdwf.o

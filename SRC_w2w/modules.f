@@ -52,6 +52,25 @@ module w2w
 end module w2w
 
 
+module eigenval_store
+  use const, only: R8
+  implicit none
+  public; save
+
+  real(R8), allocatable :: eigvals(:,:)  ! (Nb, Nk) in eV relative to Ef
+contains
+  subroutine init_eigenval_store(Nb, Nk)
+    integer, intent(in) :: Nb, Nk
+    allocate(eigvals(Nb, Nk))
+    eigvals = 0
+  end subroutine init_eigenval_store
+
+  subroutine cleanup_eigenval_store()
+    if (allocated(eigvals)) deallocate(eigvals)
+  end subroutine cleanup_eigenval_store
+end module eigenval_store
+
+
 module assleg
   use const, only: R8
 
