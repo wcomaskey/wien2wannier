@@ -25,6 +25,7 @@ module pdwf_m
   private
 
   public :: pdwf_target_t, build_targets, pdwf_compute
+  public :: write_win_parameters
 
   integer, parameter :: BAND_FROZEN      = 1
   integer, parameter :: BAND_DISENTANGLE = 2
@@ -194,29 +195,54 @@ end subroutine build_targets
 
 
 !-----------------------------------------------------------------------
-! Classify bands into frozen/disentangle/excluded based on projectability
+! Classify bands into frozen/disentangle/excluded using
+! Fermi-proximity-weighted relevance scores (PDWF method).
+!
+! Strategy:
+!   1. Compute relevance = avg(p) * exp(-|E_avg - E_F| / sigma)
+!   2. EXCLUDED:     avg(p) < p_low
+!   3. FROZEN:       relevance >= p_high (high projectability near E_F)
+!   4. DISENTANGLE:  everything else with avg(p) >= p_low
+!
+! The Fermi weighting ensures bands near E_F are preferentially frozen,
+! protecting the Fermi surface in the Wannier interpolation.
+! eigvals are in eV relative to E_F (E_F = 0).
 !-----------------------------------------------------------------------
-subroutine classify_bands(proj_avg, Nb, p_high, p_low, band_class, &
-     &                    n_frozen, n_disent, n_excluded)
+subroutine classify_bands(eigvals, proj_avg, Nb, Nk, p_low, &
+     &                    band_class, n_frozen, n_disent, n_excluded)
+  real(R8), intent(in)  :: eigvals(Nb, Nk)
   real(R8), intent(in)  :: proj_avg(Nb)
-  integer,  intent(in)  :: Nb
-  real(R8), intent(in)  :: p_high, p_low
+  integer,  intent(in)  :: Nb, Nk
+  real(R8), intent(in)  :: p_low
   integer,  intent(out) :: band_class(Nb)
   integer,  intent(out) :: n_frozen, n_disent, n_excluded
 
-  integer :: ib
+  integer  :: ib, ik
+  real(R8) :: e_avg, fermi_weight, relevance
+  ! Fermi-weighting sigma: bands within ~sigma eV of E_F get full weight
+  real(R8), parameter :: SIGMA_EV = 5.0d0
+  ! Relevance threshold for freezing: projectability × fermi_weight
+  real(R8), parameter :: P_FROZEN = 0.05d0
 
   n_frozen = 0; n_disent = 0; n_excluded = 0
   do ib = 1, Nb
-     if (proj_avg(ib) >= p_high) then
-        band_class(ib) = BAND_FROZEN
-        n_frozen = n_frozen + 1
-     else if (proj_avg(ib) >= p_low) then
-        band_class(ib) = BAND_DISENTANGLE
-        n_disent = n_disent + 1
-     else
+     if (proj_avg(ib) < p_low) then
         band_class(ib) = BAND_EXCLUDED
         n_excluded = n_excluded + 1
+     else
+        ! Compute k-averaged energy (relative to E_F = 0)
+        e_avg = sum(eigvals(ib,:)) / dble(Nk)
+        ! Fermi-proximity weight: exp(-|E|/sigma)
+        fermi_weight = exp(-abs(e_avg) / SIGMA_EV)
+        relevance = proj_avg(ib) * fermi_weight
+
+        if (relevance >= P_FROZEN) then
+           band_class(ib) = BAND_FROZEN
+           n_frozen = n_frozen + 1
+        else
+           band_class(ib) = BAND_DISENTANGLE
+           n_disent = n_disent + 1
+        end if
      end if
   end do
 end subroutine classify_bands
@@ -225,18 +251,18 @@ end subroutine classify_bands
 !-----------------------------------------------------------------------
 ! Determine energy windows from eigenvalues and band classification
 !-----------------------------------------------------------------------
-subroutine determine_windows(eigvals, band_class, Nb, Nk, margin, &
-     &                       froz_min, froz_max, dis_min, dis_max, &
-     &                       has_frozen, has_disent)
-  real(R8), intent(in)  :: eigvals(Nb, Nk)
-  integer,  intent(in)  :: band_class(Nb)
-  integer,  intent(in)  :: Nb, Nk
-  real(R8), intent(in)  :: margin
-  real(R8), intent(out) :: froz_min, froz_max, dis_min, dis_max
-  logical,  intent(out) :: has_frozen, has_disent
+subroutine determine_windows(eigvals, band_class, Nb, Nk, n_wann, &
+     &                       margin, froz_min, froz_max, dis_min, &
+     &                       dis_max, has_frozen, has_disent)
+  real(R8), intent(in)    :: eigvals(Nb, Nk)
+  integer,  intent(in)    :: band_class(Nb)
+  integer,  intent(in)    :: Nb, Nk, n_wann
+  real(R8), intent(in)    :: margin
+  real(R8), intent(out)   :: froz_min, froz_max, dis_min, dis_max
+  logical,  intent(inout) :: has_frozen, has_disent
 
-  integer  :: ib, ik
-  real(R8) :: emin, emax
+  integer  :: ib, ik, n_in_froz, n_kf
+  real(R8) :: emin
 
   has_frozen = .false.
   has_disent = .false.
@@ -261,13 +287,60 @@ subroutine determine_windows(eigvals, band_class, Nb, Nk, margin, &
   end do
 
   ! Apply margins
+  ! Frozen window: pad around frozen bands to ensure Fermi surface
+  ! is fully captured. Use proportional padding (10% of bandwidth,
+  ! minimum 0.5 eV).
   if (has_frozen) then
-     froz_min = froz_min - margin
-     froz_max = froz_max + margin
+     emin = froz_max - froz_min  ! frozen bandwidth
+     emin = max(0.5d0, 0.1d0 * emin)  ! padding
+     froz_min = froz_min - emin
+     froz_max = froz_max + emin
   end if
+  ! Disentanglement window: wider to capture full manifold
   if (has_disent) then
      dis_min = dis_min - margin
      dis_max = dis_max + margin
+  end if
+
+  ! Enforce Wannier90 constraint: frozen window inside disentangle window
+  if (has_frozen .and. has_disent) then
+     if (froz_min < dis_min) froz_min = dis_min
+     if (froz_max > dis_max) froz_max = dis_max
+  end if
+
+  ! Critical Wannier90 constraint: at every k-point, the number of
+  ! non-excluded bands inside the frozen window must be <= num_wann.
+  ! Shrink froz_max if necessary to satisfy this.
+  if (has_frozen) then
+     shrink: do
+        ! Count max bands inside frozen window at any k-point
+        n_in_froz = 0
+        do ik = 1, Nk
+           n_kf = 0
+           do ib = 1, Nb
+              if (band_class(ib) == BAND_EXCLUDED) cycle
+              if (eigvals(ib,ik) >= froz_min .and. &
+                   eigvals(ib,ik) <= froz_max) then
+                 n_kf = n_kf + 1
+              end if
+           end do
+           if (n_kf > n_in_froz) n_in_froz = n_kf
+        end do
+        if (n_in_froz <= n_wann) exit shrink
+        ! Too many bands: shrink froz_max by 0.5 eV
+        froz_max = froz_max - 0.5d0
+        if (froz_max <= froz_min) then
+           has_frozen = .false.
+           write(unit_out, '(A)') &
+                ' WARNING: Could not find valid frozen window, disabling'
+           exit shrink
+        end if
+     end do shrink
+     if (has_frozen) then
+        write(unit_out, '(A,I3,A,I3)') &
+             ' PDWF: max bands in frozen window = ', n_in_froz, &
+             ' / num_wann = ', n_wann
+     end if
   end if
 
   ! Validate: check for excluded bands inside frozen window
@@ -360,7 +433,11 @@ end subroutine write_pdwf_diagnostics
 !   - Accumulates |Alm|^2 into proj_k for projectability
 ! After all atoms: classifies bands, determines windows, writes AMN.
 !-----------------------------------------------------------------------
-subroutine pdwf_compute(stru, inwf, targets, Nb, Nk)
+subroutine pdwf_compute(stru, inwf, targets, Nb, Nk, &
+     &                    froz_min_out, froz_max_out, &
+     &                    dis_min_out, dis_max_out, &
+     &                    has_frozen_out, has_disent_out, &
+     &                    band_class_out)
   use xa,        only: BK, FJ, DFJ, PHS, BKrot, BKRloc
   use xa3,       only: A, XK,YK,ZK, GX,GY,GZ, BKX,BKY,BKZ, vecsz
   use lolog,     only: nlo,nlov,nlon,loor,ilo,lapw
@@ -377,10 +454,14 @@ subroutine pdwf_compute(stru, inwf, targets, Nb, Nk)
 
   implicit none
 
-  type(struct_t),      intent(in) :: stru
-  type(inwf_t),        intent(in) :: inwf
-  type(pdwf_target_t), intent(in) :: targets
-  integer,             intent(in) :: Nb, Nk
+  type(struct_t),      intent(in)  :: stru
+  type(inwf_t),        intent(in)  :: inwf
+  type(pdwf_target_t), intent(in)  :: targets
+  integer,             intent(in)  :: Nb, Nk
+  real(R8),            intent(out) :: froz_min_out, froz_max_out
+  real(R8),            intent(out) :: dis_min_out, dis_max_out
+  logical,             intent(out) :: has_frozen_out, has_disent_out
+  integer,             intent(out) :: band_class_out(Nb)
 
   ! Local arrays
   complex(C16), allocatable :: A_full(:,:,:) ! (Nb, Ntarget, Nk) AMN matrix
@@ -609,7 +690,7 @@ subroutine pdwf_compute(stru, inwf, targets, Nb, Nk)
      proj_avg(ib) = sum(proj_k(ib,:)) / dble(Nk)
   end do
 
-  call classify_bands(proj_avg, Nb, inwf%pdwf_p_high, inwf%pdwf_p_low, &
+  call classify_bands(eigvals, proj_avg, Nb, Nk, inwf%pdwf_p_low, &
        &              band_class, n_frozen, n_disent, n_excluded)
 
   write(unit_out, '(A,I4,A)') ' PDWF: ', n_frozen,   ' frozen bands'
@@ -618,7 +699,8 @@ subroutine pdwf_compute(stru, inwf, targets, Nb, Nk)
 
   ! ------ Phase 4: Determine energy windows ------
 
-  call determine_windows(eigvals, band_class, Nb, Nk, inwf%pdwf_margin, &
+  call determine_windows(eigvals, band_class, Nb, Nk, &
+       &                 targets%Ntarget, inwf%pdwf_margin, &
        &                 froz_min, froz_max, dis_min, dis_max, &
        &                 has_frozen, has_disent)
 
@@ -639,8 +721,222 @@ subroutine pdwf_compute(stru, inwf, targets, Nb, Nk)
      enddo
   enddo
 
+  ! Copy results to output arguments
+  froz_min_out  = froz_min
+  froz_max_out  = froz_max
+  dis_min_out   = dis_min
+  dis_max_out   = dis_max
+  has_frozen_out  = has_frozen
+  has_disent_out  = has_disent
+  band_class_out  = band_class
+
   ! Cleanup
   deallocate(A_full, proj_k, proj_avg, band_class)
 end subroutine pdwf_compute
+
+
+!-----------------------------------------------------------------------
+! Write PDWF window parameters to a snippet file (case.pdwf_windows)
+! and patch the existing .win file if present.
+!
+! The snippet file can be used with write_win or pasted manually.
+! The .win file is patched in-place by inserting PDWF parameters at
+! the top and removing conflicting existing lines.
+!-----------------------------------------------------------------------
+subroutine write_win_parameters(winfn, stru, targets, Nb, &
+     &  froz_min, froz_max, dis_min, dis_max, has_frozen, has_disent, &
+     &  band_class, bmin)
+  implicit none
+
+  character(len=*),    intent(in) :: winfn
+  type(struct_t),      intent(in) :: stru
+  type(pdwf_target_t), intent(in) :: targets
+  integer,             intent(in) :: Nb, bmin
+  real(R8),            intent(in) :: froz_min, froz_max, dis_min, dis_max
+  logical,             intent(in) :: has_frozen, has_disent
+  integer,             intent(in) :: band_class(Nb)
+
+  integer, parameter :: u_snip = 97, u_win = 99, u_tmp = 98
+  character(len=1024) :: line, snippetfn
+  character(len=1)    :: lchar
+  integer :: ios, ib, n_excl, ipos, itgt, prev_atom
+  logical :: file_exists
+
+  ! Derive snippet filename: case.win -> case.pdwf_windows
+  snippetfn = winfn
+  ipos = index(snippetfn, '.win', back=.true.)
+  if (ipos > 0) then
+     snippetfn = snippetfn(1:ipos-1) // '.pdwf_windows'
+  else
+     snippetfn = trim(snippetfn) // '.pdwf_windows'
+  end if
+
+  ! Count excluded bands
+  n_excl = 0
+  do ib = 1, Nb
+     if (band_class(ib) == BAND_EXCLUDED) n_excl = n_excl + 1
+  end do
+
+  ! --- Write standalone snippet file ---
+  open(u_snip, file=trim(snippetfn), status='replace', form='formatted')
+  call write_pdwf_keys(u_snip)
+  call write_pdwf_projections(u_snip)
+  close(u_snip)
+  write(unit_out, '(A,A)') ' PDWF windows written to: ', trim(snippetfn)
+
+  ! --- Patch existing .win file if present ---
+  inquire(file=trim(winfn), exist=file_exists)
+  if (.not. file_exists) then
+     write(unit_out, '(A,A)') ' No .win file found at: ', trim(winfn)
+     write(unit_out, '(A)') &
+          ' Use write_win or paste .pdwf_windows into your .win'
+     return
+  end if
+
+  open(u_win, file=trim(winfn), status='old', form='formatted', &
+       iostat=ios)
+  if (ios /= 0) then
+     write(unit_out, '(A)') ' WARNING: Could not open .win for patching'
+     return
+  end if
+
+  open(u_tmp, file=trim(winfn)//'.tmp', status='replace', &
+       form='formatted')
+
+  ! Write PDWF block at top
+  write(u_tmp, '(A)') '! === PDWF auto-generated parameters ==='
+  call write_pdwf_keys(u_tmp)
+  write(u_tmp, '(A)') '! === end PDWF parameters ==='
+  write(u_tmp, *)
+
+  ! Copy existing lines, skipping conflicting keywords and old projections
+  do
+     read(u_win, '(A)', iostat=ios) line
+     if (ios /= 0) exit
+     if (is_pdwf_conflict(line)) cycle
+     ! Skip old projections block — we write a new one
+     if (index(line, 'begin projections') > 0) then
+        do
+           read(u_win, '(A)', iostat=ios) line
+           if (ios /= 0) exit
+           if (index(line, 'end projections') > 0) exit
+        end do
+        cycle
+     end if
+     if (index(line, 'guiding_centres') > 0 .and. &
+          index(line, '!') /= 1) cycle
+     write(u_tmp, '(A)') trim(line)
+  end do
+  close(u_win)
+
+  ! Append new projections block
+  call write_pdwf_projections(u_tmp)
+
+  close(u_tmp)
+
+  ! Replace original with patched version
+  open(u_win, file=trim(winfn), status='replace', form='formatted')
+  open(u_tmp, file=trim(winfn)//'.tmp', status='old', form='formatted')
+  do
+     read(u_tmp, '(A)', iostat=ios) line
+     if (ios /= 0) exit
+     write(u_win, '(A)') trim(line)
+  end do
+  close(u_tmp, status='delete')
+  close(u_win)
+
+  write(unit_out, '(A,A)') ' PDWF parameters patched into: ', trim(winfn)
+
+contains
+
+  subroutine write_pdwf_keys(u)
+    integer, intent(in) :: u
+    integer :: jb
+
+    write(u, '(A,I0)') 'num_wann        = ', targets%Ntarget
+    write(u, '(A,I0)') 'num_bands       = ', Nb
+    if (has_frozen) then
+       write(u, '(A,F12.6)') 'dis_froz_min    = ', froz_min
+       write(u, '(A,F12.6)') 'dis_froz_max    = ', froz_max
+    end if
+    if (has_disent .and. Nb > targets%Ntarget) then
+       write(u, '(A,F12.6)') 'dis_win_min     = ', dis_min
+       write(u, '(A,F12.6)') 'dis_win_max     = ', dis_max
+    end if
+    if (n_excl > 0) then
+       write(u, '(A)', advance='no') 'exclude_bands   = '
+       do jb = 1, Nb
+          if (band_class(jb) == BAND_EXCLUDED) then
+             write(u, '(I0,",")', advance='no') jb
+          end if
+       end do
+       write(u, *)
+    end if
+    ! Convergence tolerances
+    if (Nb > targets%Ntarget) then
+       write(u, '(A)') 'dis_num_iter    = 5000'
+       write(u, '(A)') 'dis_conv_tol    = 1.0e-10'
+       write(u, '(A)') 'dis_conv_window = 5'
+    end if
+    write(u, '(A)') 'num_iter        = 5000'
+    write(u, '(A)') 'conv_tol        = 1.0e-10'
+    write(u, '(A)') 'conv_window     = 5'
+  end subroutine write_pdwf_keys
+
+  subroutine write_pdwf_projections(u)
+    integer, intent(in) :: u
+    integer :: jt
+
+    write(u, *)
+    write(u, '(A)') 'guiding_centres = T'
+    write(u, '(A)') 'begin projections'
+    prev_atom = -1
+    do jt = 1, targets%Ntarget
+       select case(targets%l(jt))
+       case(0); lchar = 's'
+       case(1); lchar = 'p'
+       case(2); lchar = 'd'
+       case(3); lchar = 'f'
+       end select
+       ! Write atom:l format — only one entry per (atom,l) group
+       ! since Wannier90 expands l into all m components
+       if (targets%m(jt) == -targets%l(jt)) then
+          ! First m of this l-shell: write the projection line
+          write(u, '(I0,":",A)') targets%atom(jt), lchar
+       end if
+    end do
+    write(u, '(A)') 'end projections'
+  end subroutine write_pdwf_projections
+
+  logical function is_pdwf_conflict(s)
+    character(len=*), intent(in) :: s
+    is_pdwf_conflict = .false.
+    if (index(adjustl(s), '!') == 1) then
+       if (index(s, 'PDWF auto-generated') > 0 .or. &
+            index(s, 'end PDWF parameters') > 0) then
+          is_pdwf_conflict = .true.
+       end if
+       return
+    end if
+    if (index(s, 'dis_froz_min')   > 0) is_pdwf_conflict = .true.
+    if (index(s, 'dis_froz_max')   > 0) is_pdwf_conflict = .true.
+    if (index(s, 'dis_win_min')    > 0) is_pdwf_conflict = .true.
+    if (index(s, 'dis_win_max')    > 0) is_pdwf_conflict = .true.
+    if (index(s, 'num_wann')       > 0) is_pdwf_conflict = .true.
+    if (index(s, 'num_bands')      > 0) is_pdwf_conflict = .true.
+    if (index(s, 'exclude_bands')  > 0) is_pdwf_conflict = .true.
+    if (index(s, 'dis_num_iter')   > 0) is_pdwf_conflict = .true.
+    if (index(s, 'dis_conv_tol')   > 0) is_pdwf_conflict = .true.
+    if (index(s, 'dis_conv_window') > 0) is_pdwf_conflict = .true.
+    if (index(s, 'num_iter')       > 0 .and. &
+         index(s, 'dis_num_iter')  == 0) is_pdwf_conflict = .true.
+    if (index(s, 'conv_tol')       > 0 .and. &
+         index(s, 'dis_conv_tol')  == 0) is_pdwf_conflict = .true.
+    if (index(s, 'conv_window')    > 0 .and. &
+         index(s, 'dis_conv_window') == 0) is_pdwf_conflict = .true.
+  end function is_pdwf_conflict
+
+end subroutine write_win_parameters
+
 
 end module pdwf_m

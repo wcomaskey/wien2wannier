@@ -38,7 +38,8 @@ program wf
   use gaunt_cache, only: init_gaunt_cache, cleanup_gaunt_cache
   use loabc,       only: cleanup_loabc
   use eigenval_store, only: init_eigenval_store, cleanup_eigenval_store
-  use pdwf_m,      only: pdwf_target_t, build_targets, pdwf_compute
+  use pdwf_m,      only: pdwf_target_t, build_targets, pdwf_compute, &
+       &                  write_win_parameters
 
   !! procedure includes
   use read_vec_m
@@ -54,10 +55,15 @@ program wf
 
   character(len=   11)  :: status,form
   character(len=BUFSZ)  :: deffn, errfn, aline
-  character(len=BUFSZ)  :: fname, vecfn, enefn, iomsg
+  character(len=BUFSZ)  :: fname, vecfn, enefn, iomsg, winfn
 
   integer :: iloop, i, j, ios, iproc, irecl, iunit
   integer :: maxx,maxy,maxz, maxg, n, n_pair, nen
+
+  ! PDWF window parameters
+  real(r8) :: pdwf_froz_min, pdwf_froz_max, pdwf_dis_min, pdwf_dis_max
+  logical  :: pdwf_has_frozen, pdwf_has_disent
+  integer, allocatable :: pdwf_band_class(:)
   integer :: Nb, Nk, nntot, kkk, iostat
 
   real(r8) :: efermi
@@ -86,6 +92,15 @@ program wf
      end select
   end do def
 20 close(unit_def)
+
+  ! Derive .win filename from .amn filename
+  inquire(unit=unit_amn, name=fname)
+  i = index(fname, '.amn', back=.true.)
+  if (i > 0) then
+     winfn = fname(1:i-1) // '.win'
+  else
+     winfn = trim(fname) // '.win'
+  end if
 
   write(unit_out, '("W2W ", A /)') wien2wannier_version
 
@@ -261,9 +276,20 @@ program wf
   endif
 
   if (inwf%PDWF) then
+     allocate(pdwf_band_class(Nb))
      call ptime(unit_out)
-     call pdwf_compute(stru, inwf, pdwf_targets, Nb, Nk)
+     call pdwf_compute(stru, inwf, pdwf_targets, Nb, Nk, &
+          &            pdwf_froz_min, pdwf_froz_max, &
+          &            pdwf_dis_min, pdwf_dis_max, &
+          &            pdwf_has_frozen, pdwf_has_disent, &
+          &            pdwf_band_class)
      call ptime('PDWF')
+     call write_win_parameters(winfn, stru, pdwf_targets, Nb, &
+          &  pdwf_froz_min, pdwf_froz_max, &
+          &  pdwf_dis_min, pdwf_dis_max, &
+          &  pdwf_has_frozen, pdwf_has_disent, &
+          &  pdwf_band_class, inwf%bmin)
+     deallocate(pdwf_band_class)
      call cleanup_eigenval_store()
   else if (inwf%Amn) then
      call ptime(unit_out)
