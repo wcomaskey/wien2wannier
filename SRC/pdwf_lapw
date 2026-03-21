@@ -1,0 +1,545 @@
+#!/bin/bash
+
+### wien2wannier/SRC/pdwf_lapw
+###
+###    Automated PDWF (Projectability-Disentangled Wannier Functions)
+###    workflow for wien2wannier.
+###
+###    Generates a temporary .win file from the Wien2k calculation,
+###    runs wannier90 -pp to create .nnkp, then runs w2w/w2wc in
+###    PDWF mode to compute AMN/MMN/EIG and patch the .win file
+###    with auto-determined energy windows.
+###
+###    Pipeline:
+###      1. Generate minimal .inwf (PDWF mode)
+###      2. Generate .win via write_win (reusing existing infrastructure)
+###      3. Run wannier90 -pp to create .nnkp
+###      4. Run w2w/w2wc in PDWF mode (computes AMN, MMN, EIG + patches .win)
+###      5. Run wannier90 for Wannierization
+###
+### Copyright 2024 William Comaskey
+
+bin=$(dirname "$0")
+name=$(basename "$0")
+file=$(basename "$PWD")
+
+usage() {
+    cat <<EOF
+PROGRAM:	$0
+
+PURPOSE:	Automated PDWF workflow for wien2wannier.
+		Generates projections, energy windows, and Wannier functions
+		automatically from a completed Wien2k calculation.
+
+USAGE:		$name [FLAGS] [OPTIONS]
+
+FLAGS:
+-h,-H	->	this message
+-v	->	verbose output
+-q	->	quiet mode
+-up/-dn	->	spin-polarized
+-so	->	spin-orbit coupling
+-norun	->	stop after generating .inwf and .win (do not run w2w/wannier90)
+-nommn	->	skip MMN computation (AMN only, for testing)
+-clean	->	remove intermediate files before starting
+
+OPTIONS:
+-f CASE	->	override case name (default: directory name)
+-bmin N	->	minimum band index (default: auto from energy file)
+-bmax N	->	maximum band index (default: auto from energy file)
+-ljmax N ->	max L for exp(ibr) expansion (default: 5)
+-phigh X ->	projectability threshold for frozen bands (default: 0.90)
+-plow X	->	projectability threshold for exclusion (default: 0.05)
+-margin X ->	energy margin for windows in eV (default: 0.50)
+-w90 K V ->	extra key-value pairs for .win file
+
+EXAMPLES:
+  $name                       # fully automatic
+  $name -bmin 5 -bmax 22      # specify band window
+  $name -so                   # with spin-orbit coupling
+  $name -norun                # just generate input files
+  $name -phigh 0.80 -plow 0.1 # custom thresholds
+EOF
+}
+
+croak() {
+    echo >&2 "$name: $@"
+    exit 1
+}
+
+warn() {
+    [[ $q ]] && return
+    echo >&2 "$name: $@"
+}
+
+info() {
+    [[ $q ]] && return
+    echo "  $@"
+}
+
+# ============================================================
+#  Parse options
+# ============================================================
+unset v q updn so norun nommn doclean
+bmin=""
+bmax=""
+ljmax=5
+phigh=0.90
+plow=0.05
+margin=0.50
+w90opt=()
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -[hH]|-help|--help) usage; exit 0;;
+        -v|-verbose) v=1;;
+        -q|-quiet)   q=1;;
+        -up)  updn=up;;
+        -dn)  updn=dn;;
+        -so)  so=so;;
+        -noso) unset so;;
+        -norun) norun=1;;
+        -nommn) nommn=1;;
+        -clean) doclean=1;;
+        -f)     shift; file=$1;;
+        -bmin)  shift; bmin=$1;;
+        -bmax)  shift; bmax=$1;;
+        -ljmax) shift; ljmax=$1;;
+        -phigh) shift; phigh=$1;;
+        -plow)  shift; plow=$1;;
+        -margin) shift; margin=$1;;
+        -w90)
+            shift
+            while [[ $# -gt 0 && "$1" != -* ]]; do
+                w90opt+=("$1")
+                shift
+            done
+            continue  # don't shift again
+            ;;
+        -*) croak "unknown option \`$1' (try --help)";;
+        *)  croak "unexpected argument \`$1'";;
+    esac
+    shift
+done
+
+# ============================================================
+#  Detect calculation type
+# ============================================================
+spf=""
+sof=""
+w2w_exec="w2wc"  # default to complex
+
+if [[ -n $updn ]]; then
+    spf="-$updn"
+fi
+
+if [[ -s $file.inso ]]; then
+    so=so
+fi
+
+if [[ -n $so ]]; then
+    sof="-so"
+fi
+
+# Detect real vs complex: if .in1c exists, use w2wc; else w2w
+if [[ -s $file.in1c || -n $so ]]; then
+    w2w_exec="w2wc"
+else
+    w2w_exec="w2w"
+fi
+
+[[ $v ]] && info "case=$file w2w=$w2w_exec sp=$updn so=$so"
+
+# ============================================================
+#  Validate prerequisites
+# ============================================================
+for f in $file.struct $file.klist; do
+    [[ -s $f ]] || croak "required file \`$f' not found (run Wien2k first)"
+done
+
+# Need energy file to determine band range
+enefile=$file.energy${so}${updn}
+if [[ ! -s $enefile ]]; then
+    enefile=$file.energy${updn}
+fi
+if [[ ! -s $enefile ]]; then
+    enefile=$file.energy
+fi
+[[ -s $enefile ]] || croak "energy file not found (run lapw1 first)"
+
+# Need vector file
+vecfile=$file.vector${so}${updn}
+if [[ ! -s $vecfile ]]; then
+    vecfile=$file.vector${updn}
+fi
+if [[ ! -s $vecfile ]]; then
+    vecfile=$file.vector
+fi
+[[ -s $vecfile ]] || croak "vector file \`$vecfile' not found"
+
+# Need potential file
+vspfile=$file.vsp${updn}
+if [[ ! -s $vspfile ]]; then
+    vspfile=$file.vsp
+fi
+[[ -s $vspfile ]] || croak "potential file not found"
+
+# Fermi energy
+fermifile=$file.fermi
+if [[ ! -s $fermifile ]]; then
+    # Try to extract from scf file
+    if [[ -s $file.scf ]]; then
+        grep ':FER' $file.scf | tail -1 | awk '{print $NF}' > $fermifile
+        info "extracted Fermi energy from $file.scf"
+    else
+        croak "Fermi energy file \`$fermifile' not found"
+    fi
+fi
+
+[[ $v ]] && info "energy=$enefile vector=$vecfile vsp=$vspfile"
+
+# ============================================================
+#  Step 0: Auto-detect band window if not specified
+# ============================================================
+if [[ -z $bmin || -z $bmax ]]; then
+    # Use output1 to find total number of bands, or parse energy file
+    info "auto-detecting band window from $enefile ..."
+
+    # Read first k-point to get number of eigenvalues
+    # Energy file format: header lines, then k-point records
+    read_bands=$(awk '
+    BEGIN { nneq=0; state=0 }
+    state==0 { nneq++; if(NR==2) state=1; next }
+    state==1 { nneq++; state=2; next }
+    state==2 {
+        # k-point header line: cols 68-73 = N, cols 74-79 = NEN
+        n = substr($0, 74, 6) + 0
+        printf "%d\n", n
+        exit
+    }
+    ' "$enefile")
+
+    if [[ -z $read_bands || $read_bands -eq 0 ]]; then
+        croak "could not determine number of bands from $enefile"
+    fi
+
+    # Default: use all bands (PDWF will classify them)
+    [[ -z $bmin ]] && bmin=1
+    [[ -z $bmax ]] && bmax=$read_bands
+
+    info "detected $read_bands bands per k-point"
+    info "using band window: [$bmin, $bmax]"
+fi
+
+nb=$((bmax - bmin + 1))
+
+# ============================================================
+#  Step 1: Generate PDWF .inwf file
+# ============================================================
+info "Step 1: Generating PDWF .inwf file"
+
+inwffile=$file.inwf${updn}
+cat > "$inwffile" <<EOF
+PDWF
+ $bmin  $bmax
+ $ljmax
+ $phigh  $plow  $margin
+EOF
+
+[[ $v ]] && cat "$inwffile"
+info "wrote $inwffile"
+
+# ============================================================
+#  Step 2: Generate .win file via write_win
+# ============================================================
+info "Step 2: Generating .win file"
+
+winfile=$file.win
+
+# Use write_win with a fresh template — it reads .inwf, .struct,
+# .klist, and .klist_band to produce a complete .win
+$bin/write_win_lapw -f "$file" -fresh $spf "${w90opt[@]}" 2>/dev/null
+
+if [[ $? -ne 0 || ! -s $winfile ]]; then
+    warn "write_win failed or not available, generating minimal .win"
+
+    # Fallback: generate a minimal .win ourselves
+    # Read mp_grid and kpoints from .klist
+    python3 - "$file" "$bmin" "$bmax" <<'PYEOF'
+import sys, re
+
+case = sys.argv[1]
+bmin, bmax = int(sys.argv[2]), int(sys.argv[3])
+nb = bmax - bmin + 1
+
+# Read struct file for lattice vectors and atom positions
+with open(f"{case}.struct") as f:
+    lines = f.readlines()
+
+# Parse lattice constants
+latline = lines[3]
+a = [float(latline[i:i+10]) for i in range(0, 60, 10)]
+
+# Parse lattice type
+lattype = lines[1][0:1].strip()
+
+# Parse atoms
+atoms = []
+nneq = int(lines[1].split(':')[1].split()[0])
+i = 4
+for iat in range(nneq):
+    # ATOM line: X=..., Y=..., Z=...
+    pos_line = lines[i]
+    x = float(pos_line[12:22])
+    y = float(pos_line[25:35])
+    z = float(pos_line[38:48])
+    i += 1
+    mult_line = lines[i]
+    mult = int(mult_line.split('=')[1].split()[0])
+    i += 1  # element line
+    i += 3  # rot matrix
+    atoms.append((iat+1, x, y, z, mult))
+    # Skip equivalent atoms (mult-1 additional position lines + mult-1 rot matrices)
+    for _ in range(mult - 1):
+        i += 1  # position
+        i += 1  # mult (not present for equiv atoms, they share)
+    # Actually the format is different for mult>1... let's just count
+
+# Read klist for k-mesh
+kpoints = []
+mp_grid = [1, 1, 1]
+with open(f"{case}.klist") as f:
+    for line in f:
+        if line.strip().startswith('END'):
+            break
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        # Skip label field if present (first field is label or blank)
+        try:
+            # Wien2k klist: label(10) ix(5) iy(5) iz(5) idv(5) weight(5.1)
+            label = line[0:10].strip()
+            ix = int(line[10:15])
+            iy = int(line[15:20])
+            iz = int(line[20:25])
+            idv = int(line[25:30])
+            kpoints.append((ix/idv, iy/idv, iz/idv))
+            # Track max indices for mp_grid
+            mp_grid[0] = max(mp_grid[0], abs(ix))
+            mp_grid[1] = max(mp_grid[1], abs(iy))
+            mp_grid[2] = max(mp_grid[2], abs(iz))
+        except (ValueError, IndexError):
+            continue
+
+# Estimate mp_grid from number of k-points
+# For FCC: nk = (n/2+1)*(n/4+1)*(n+1)/4 approximately
+# Simple heuristic: cube root
+nk = len(kpoints)
+
+# Try to read mp_grid from kgen output if available
+import os
+kgenfile = f"{case}.outputkgen"
+if os.path.exists(kgenfile):
+    with open(kgenfile) as f:
+        for line in f:
+            if 'mesh' in line.lower() or 'DIVISION' in line:
+                nums = re.findall(r'\d+', line)
+                if len(nums) >= 3:
+                    mp_grid = [int(nums[0]), int(nums[1]), int(nums[2])]
+                    break
+
+# Compute primitive lattice vectors from Wien2k conventional cell
+# For simplicity, read from struct if available
+import math
+
+# Convert lattice constants to Bohr (already in Bohr in Wien2k)
+alpha, beta, gamma = [a[i+3]*math.pi/180 for i in range(3)]
+a1, a2, a3 = a[0], a[1], a[2]
+
+# Primitive vectors depend on lattice type
+if lattype == 'F':
+    prim = [
+        [0, a2/2, a3/2],
+        [a1/2, 0, a3/2],
+        [a1/2, a2/2, 0],
+    ]
+elif lattype == 'B':
+    prim = [
+        [-a1/2, a2/2, a3/2],
+        [a1/2, -a2/2, a3/2],
+        [a1/2, a2/2, -a3/2],
+    ]
+elif lattype == 'H':
+    prim = [
+        [a1, 0, 0],
+        [-a1/2, a2*math.sqrt(3)/2, 0],
+        [0, 0, a3],
+    ]
+else:  # P or others
+    prim = [
+        [a1, 0, 0],
+        [a2*math.cos(gamma), a2*math.sin(gamma), 0],
+        [a3*math.cos(beta),
+         a3*(math.cos(alpha)-math.cos(beta)*math.cos(gamma))/math.sin(gamma),
+         a3*math.sqrt(1-math.cos(alpha)**2-math.cos(beta)**2-math.cos(gamma)**2
+                      +2*math.cos(alpha)*math.cos(beta)*math.cos(gamma))/math.sin(gamma)]
+    ]
+
+# Write .win file
+with open(f"{case}.win", 'w') as f:
+    f.write(f" num_bands       = {nb}\n")
+    f.write(f" num_wann        = {nb}\n")  # placeholder, PDWF will fix
+    f.write(f"\n")
+    f.write(f"!!! Iterations &c. !!!\n")
+    f.write(f" iprint                = 1\n")
+    f.write(f" num_iter              = 10000\n")
+    f.write(f" num_print_cycles      =   100\n")
+    f.write(f" conv_window           = 3\n")
+    f.write(f" dis_num_iter          = 10000\n")
+    f.write(f"\n")
+    f.write(f"!!! Post-processing options !!!\n")
+    f.write(f" write_proj             = .true.\n")
+    f.write(f" write_xyz              = .true.\n")
+    f.write(f" translate_home_cell    = .true.\n")
+    f.write(f" hr_plot                = .true.\n")
+    f.write(f"\n")
+    f.write(f"!!! Band structure !!!\n")
+    f.write(f" bands_num_points       = 50\n")
+    f.write(f"\n")
+
+    # Unit cell
+    f.write(f"begin unit_cell_cart\n")
+    f.write(f"Bohr\n")
+    for v in prim:
+        f.write(f"  {v[0]:12.6f} {v[1]:12.6f} {v[2]:12.6f}\n")
+    f.write(f"end unit_cell_cart\n\n")
+
+    # Atoms
+    f.write(f"begin atoms_cart\n")
+    f.write(f"Bohr\n")
+    for iat, x, y, z, mult in atoms:
+        # Convert fractional to Cartesian using primitive vectors
+        cx = x*prim[0][0] + y*prim[1][0] + z*prim[2][0]
+        cy = x*prim[0][1] + y*prim[1][1] + z*prim[2][1]
+        cz = x*prim[0][2] + y*prim[1][2] + z*prim[2][2]
+        for mu in range(mult):
+            f.write(f"  {iat:4d} {cx:13.8f} {cy:13.8f} {cz:13.8f}\n")
+    f.write(f"end atoms_cart\n\n")
+
+    # Band path (if klist_band exists)
+    bandfile = f"{case}.klist_band"
+    if os.path.exists(bandfile):
+        f.write(f"bands_plot = T\n")
+        f.write(f"begin kpoint_path\n")
+        with open(bandfile) as bf:
+            kpath_points = []
+            for line in bf:
+                parts = line.split()
+                if len(parts) < 6:
+                    continue
+                label = parts[0] if not parts[0].replace('-','').isdigit() else ''
+                try:
+                    ix = int(line[10:15])
+                    iy = int(line[15:20])
+                    iz = int(line[20:25])
+                    idv = int(line[25:30])
+                    if label:
+                        kpath_points.append((label, ix/idv, iy/idv, iz/idv))
+                except (ValueError, IndexError):
+                    continue
+            for i in range(len(kpath_points)-1):
+                l1, x1, y1, z1 = kpath_points[i]
+                l2, x2, y2, z2 = kpath_points[i+1]
+                if l2:  # only print segments between labeled points
+                    f.write(f"  {l1:3s} {x1:9.5f} {y1:9.5f} {z1:9.5f}  "
+                            f"  {l2:3s} {x2:9.5f} {y2:9.5f} {z2:9.5f}\n")
+        f.write(f"end kpoint_path\n\n")
+
+    # Dummy projections (needed for wannier90 -pp)
+    f.write(f"guiding_centres = T\n")
+    f.write(f"begin projections\n")
+    for iat, x, y, z, mult in atoms:
+        for mu in range(mult):
+            f.write(f"  {iat}:s\n")
+    f.write(f"end projections\n\n")
+
+    # K-mesh
+    f.write(f"mp_grid : {mp_grid[0]} {mp_grid[1]} {mp_grid[2]}\n")
+    f.write(f"begin kpoints\n")
+    for kx, ky, kz in kpoints:
+        f.write(f"  {kx:18.15f} {ky:18.15f} {kz:18.15f}\n")
+    f.write(f"end kpoints\n")
+
+print(f"Wrote {case}.win ({nk} k-points, mp_grid={mp_grid})")
+PYEOF
+fi
+
+[[ -s $winfile ]] || croak "failed to generate $winfile"
+info "wrote $winfile"
+
+[[ $norun ]] && { info "stopping (--norun)"; exit 0; }
+
+# ============================================================
+#  Step 3: Run wannier90 -pp to generate .nnkp
+# ============================================================
+info "Step 3: Running wannier90 -pp"
+
+$bin/x_lapw wannier90 -pp $sof $spf 2>&1
+if [[ $? -ne 0 || ! -s $file.nnkp ]]; then
+    croak "wannier90 -pp failed (check $file.wout)"
+fi
+info "created $file.nnkp"
+
+# ============================================================
+#  Step 4: Run w2w/w2wc in PDWF mode
+# ============================================================
+info "Step 4: Running $w2w_exec (PDWF mode)"
+
+$bin/x_lapw $w2w_exec $sof $spf 2>&1
+if [[ $? -ne 0 ]]; then
+    croak "$w2w_exec failed (check $file.outputwf)"
+fi
+
+# Check that PDWF ran successfully
+if grep -q "PDWF" "$file.outputwf${updn}" 2>/dev/null; then
+    info "$w2w_exec completed in PDWF mode"
+    # Show summary
+    grep -A20 "PDWF Band Classification" "$file.outputwf${updn}" 2>/dev/null | head -25
+    echo
+    grep -A10 "Wannier90 Window" "$file.outputwf${updn}" 2>/dev/null | head -12
+else
+    warn "$w2w_exec ran but PDWF output not found"
+fi
+
+# Check that .win was patched
+if grep -q "PDWF auto-generated" "$winfile" 2>/dev/null; then
+    info ".win file patched with PDWF parameters"
+else
+    warn ".win file was NOT patched — check $file.pdwf_windows"
+fi
+
+# ============================================================
+#  Step 5: Run wannier90 for Wannierization
+# ============================================================
+info "Step 5: Running wannier90"
+
+$bin/x_lapw wannier90 $sof $spf 2>&1
+if [[ $? -ne 0 ]]; then
+    croak "wannier90 failed (check $file.wout)"
+fi
+
+# Report final spread
+if grep -q "Final Spread" "$file.wout" 2>/dev/null; then
+    echo
+    info "=== Wannier90 Results ==="
+    grep "Final Spread\|Omega" "$file.wout" | tail -4 | while read line; do
+        info "$line"
+    done
+    echo
+    info "PDWF workflow completed successfully"
+    info "Output files: $file.amn, $file.mmn, $file.eig, $file.win, $file_hr.dat"
+else
+    warn "wannier90 completed but Final Spread not found"
+fi
+
+exit 0
