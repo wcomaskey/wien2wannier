@@ -271,11 +271,19 @@ with open(f"{case}.struct") as f:
     slines = f.readlines()
 
 lattype = slines[1][0:1].strip()
-nneq = int(slines[1].split(':')[1].split()[0])
+# nneq: Wien2k uses "NONEQUIV.ATOMS:  2" or "NONEQUIV.ATOMS   2"
+nneq_match = re.search(r'ATOMS[:\s]+(\d+)', slines[1])
+nneq = int(nneq_match.group(1)) if nneq_match else int(slines[1].split()[3])
 latline = slines[3]
 a = [float(latline[i:i+10]) for i in range(0, 60, 10)]
 
 # Parse atoms (inequivalent only)
+# Wien2k struct format per inequivalent atom:
+#   ATOM line (position)        1 line
+#   MULT line                   1 line
+#   equiv atom positions        (mult-1) lines
+#   element/RMT line            1 line
+#   LOCAL ROT MATRIX            3 lines
 atoms = []
 i = 4
 for iat in range(nneq):
@@ -283,14 +291,12 @@ for iat in range(nneq):
     x = float(pos[12:22])
     y = float(pos[25:35])
     z = float(pos[38:48])
-    i += 1
+    i += 1  # now on MULT line
     mult = int(slines[i].split('=')[1].split()[0])
+    i += 1  # past MULT line
+    i += (mult - 1)  # skip equivalent atom position lines
     i += 1  # element/RMT line
-    i += 1  # skip element line
-    i += 3  # local rot matrix (3 lines)
-    # skip equivalent atoms: each has 1 position line + 3 rot lines
-    for _ in range(mult - 1):
-        i += 4
+    i += 3  # LOCAL ROT MATRIX (3 lines)
     atoms.append((iat + 1, x, y, z, mult))
 
 # ----- Primitive lattice vectors (Bohr) -----
@@ -435,10 +441,12 @@ with open(f"{case}.win", 'w') as f:
     # Dummy projections — one s orbital per atom (= num_wann = nat).
     # Only needed for wannier90 -pp to generate .nnkp.
     # PDWF replaces with real projections and num_wann afterward.
+    # Must emit one projection per TOTAL atom (including equivalents).
     f.write(f"guiding_centres = T\n")
     f.write(f"begin projections\n")
     for iat, x, y, z, mult in atoms:
-        f.write(f"  f={x:.8f},{y:.8f},{z:.8f}:s\n")
+        for mu in range(mult):
+            f.write(f"  f={x:.8f},{y:.8f},{z:.8f}:s\n")
     f.write(f"end projections\n\n")
 
     # K-mesh: transform from Wien2k conventional to primitive fractional

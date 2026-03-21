@@ -885,12 +885,12 @@ contains
 
   subroutine write_pdwf_projections(u)
     integer, intent(in) :: u
-    integer :: jt
+    integer :: jt, iat
+    real(R8) :: xf, yf, zf
 
     write(u, *)
     write(u, '(A)') 'guiding_centres = T'
     write(u, '(A)') 'begin projections'
-    prev_atom = -1
     do jt = 1, targets%Ntarget
        select case(targets%l(jt))
        case(0); lchar = 's'
@@ -898,11 +898,16 @@ contains
        case(2); lchar = 'd'
        case(3); lchar = 'f'
        end select
-       ! Write atom:l format — only one entry per (atom,l) group
+       ! Write f=x,y,z:l format — only one entry per (atom,l) group
        ! since Wannier90 expands l into all m components
        if (targets%m(jt) == -targets%l(jt)) then
-          ! First m of this l-shell: write the projection line
-          write(u, '(I0,":",A)') targets%atom(jt), lchar
+          ! Use fractional coordinates from struct
+          iat = targets%atom(jt)
+          xf = stru%pos(1, iat)
+          yf = stru%pos(2, iat)
+          zf = stru%pos(3, iat)
+          write(u, '("f=",F10.8,",",F10.8,",",F10.8,":",A)') &
+               xf, yf, zf, lchar
        end if
     end do
     write(u, '(A)') 'end projections'
