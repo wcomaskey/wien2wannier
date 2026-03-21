@@ -1530,6 +1530,7 @@ contains
     case('PDWF')
        inwf%PDWF = .true.
        inwf%Amn  = .true.
+       inwf%Mmn  = .true.
     case default
        call croak('unknown MODE in inwf, '//inwf%mode)
     end select
