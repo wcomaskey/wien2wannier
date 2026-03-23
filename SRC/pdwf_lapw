@@ -52,6 +52,7 @@ OPTIONS:
   -phigh X      projectability threshold for frozen bands (default: 0.90)
   -plow X       projectability threshold for exclusion (default: 0.05)
   -margin X     energy margin for windows in eV (default: 0.50)
+  -nkband N     k-points per band path segment (default: 100)
   -w2wdir DIR   directory containing w2w/w2wc executables
   -w90exe EXE   path to wannier90.x executable
 
@@ -88,6 +89,7 @@ ljmax=5
 phigh=0.60
 plow=0.15
 margin=0.50
+nkband=100
 w2wdir=""
 w90exe=""
 
@@ -109,6 +111,7 @@ while [[ $# -gt 0 ]]; do
         -phigh)  shift; phigh=$1;;
         -plow)   shift; plow=$1;;
         -margin) shift; margin=$1;;
+        -nkband) shift; nkband=$1;;
         -w2wdir) shift; w2wdir=$1;;
         -w90exe) shift; w90exe=$1;;
         -*) croak "unknown option \`$1' (try -h)";;
@@ -251,6 +254,77 @@ EOF
 info "wrote $inwffile"
 
 # ============================================================
+#  Step 1b: Generate dense klist_band (if klist_band exists)
+# ============================================================
+klistband=$file.klist_band
+if [[ -s $klistband ]]; then
+    info "Step 1b: Generating dense klist_band ($nkband pts/segment)"
+    python3 - "$file" "$nkband" <<'KBEOF'
+import sys, re
+import numpy as np
+
+case = sys.argv[1]
+npts = int(sys.argv[2])
+
+# Read existing klist_band — extract labeled high-symmetry points
+labels = []
+with open(f"{case}.klist_band") as f:
+    for line in f:
+        s = line.strip()
+        if s == 'END' or not s:
+            continue
+        label = line[0:10].strip()
+        if not label or label.replace('-','').replace('.','').isdigit():
+            continue
+        body = line[10:].split()
+        if len(body) < 4:
+            continue
+        ix, iy, iz, idv = int(body[0]), int(body[1]), int(body[2]), int(body[3])
+        labels.append((label, np.array([ix/idv, iy/idv, iz/idv])))
+
+if len(labels) < 2:
+    print(f"  klist_band has {len(labels)} labels, skipping densification")
+    sys.exit(0)
+
+# Find a common divisor that gives integer coords for all points
+# Use LCM of all original divisors, scaled to npts
+div = npts * 6  # 6 covers 1/2, 1/3, 1/4, 1/6 etc.
+
+# Write dense klist_band
+# Back up original
+import shutil
+shutil.copy(f"{case}.klist_band", f"{case}.klist_band.orig")
+
+with open(f"{case}.klist_band", 'w') as f:
+    for iseg in range(len(labels) - 1):
+        l1, k1 = labels[iseg]
+        l2, k2 = labels[iseg + 1]
+
+        for i in range(npts + 1):
+            if i == 0 and iseg > 0:
+                continue  # skip duplicate at boundary
+            t = i / npts
+            kp = k1 + t * (k2 - k1)
+            ix = int(round(kp[0] * div))
+            iy = int(round(kp[1] * div))
+            iz = int(round(kp[2] * div))
+
+            if (i == 0) or (i == npts and iseg == len(labels) - 2):
+                lbl = l1 if i == 0 else l2
+                erange = '-8.00 8.00' if (iseg == 0 and i == 0) else ''
+                f.write(f"{lbl:10s}{ix:5d}{iy:5d}{iz:5d}{div:5d}  2.0{erange}\n")
+            elif i == npts:
+                f.write(f"{l2:10s}{ix:5d}{iy:5d}{iz:5d}{div:5d}  2.0\n")
+            else:
+                f.write(f"{'':10s}{ix:5d}{iy:5d}{iz:5d}{div:5d}  2.0\n")
+    f.write("END\n")
+
+total = sum(1 for _ in open(f"{case}.klist_band") if _.strip() and _.strip() != 'END')
+print(f"  wrote {case}.klist_band: {total} k-points, {npts} per segment")
+KBEOF
+fi
+
+# ============================================================
 #  Step 2: Generate initial .win file
 # ============================================================
 info "Step 2: Generating initial .win"
@@ -261,6 +335,7 @@ winfile=$file.win
 # Uses dummy num_wann = num_bands (PDWF will patch the real value)
 python3 - "$file" "$bmin" "$bmax" <<'PYEOF'
 import sys, os, re, math
+import numpy as np
 
 case = sys.argv[1]
 bmin, bmax = int(sys.argv[2]), int(sys.argv[3])
@@ -411,6 +486,21 @@ with open(f"{case}.win", 'w') as f:
         f.write(f"  {iat:4d}  {cx:14.8f}  {cy:14.8f}  {cz:14.8f}\n")
     f.write(f"end atoms_cart\n\n")
 
+    # Wien2k conventional → primitive k-point transform
+    # Used for both kpoint_path and k-mesh
+    if lattype == 'F':
+        conv_rec = np.array([[0, 0.5, 0.5], [0.5, 0, 0.5], [0.5, 0.5, 0]])
+    elif lattype == 'B':
+        conv_rec = np.array([[-0.5, 0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, -0.5]])
+    elif lattype == 'H':
+        conv_rec = np.eye(3)
+    elif lattype == 'R':
+        conv_rec = np.eye(3)  # placeholder
+    elif lattype == 'C':
+        conv_rec = np.array([[0.5, 0.5, 0], [-0.5, 0.5, 0], [0, 0, 1]])
+    else:  # P
+        conv_rec = np.eye(3)
+
     # Band path (optional, from klist_band)
     # Wien2k klist_band uses conventional cell fractional coordinates.
     # Wannier90 needs primitive cell fractional coordinates.
@@ -456,29 +546,7 @@ with open(f"{case}.win", 'w') as f:
     f.write(f"end projections\n\n")
 
     # K-mesh: transform from Wien2k conventional to primitive fractional
-    # Wien2k klist k-points are in conventional cell fractional coords.
-    # Wannier90 needs primitive cell fractional coords.
-    # The transformation is k_prim = conv_rec @ k_conv where conv_rec
-    # is the inverse transpose of stru2frac (real-to-fractional matrix).
-    import numpy as np
-    if lattype == 'F':
-        # FCC: stru2frac = [[-1,1,1],[1,-1,1],[1,1,-1]]
-        conv_rec = np.array([[0, 0.5, 0.5], [0.5, 0, 0.5], [0.5, 0.5, 0]])
-    elif lattype == 'B':
-        # BCC: stru2frac = [[0,1,1],[1,0,1],[1,1,0]]
-        conv_rec = np.array([[-0.5, 0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, -0.5]])
-    elif lattype == 'H':
-        # Hexagonal: stru2frac = [[1,0,0],[0,1,0],[0,0,1]] (no change)
-        conv_rec = np.eye(3)
-    elif lattype == 'R':
-        # Rhombohedral: need specific transform
-        conv_rec = np.eye(3)  # placeholder — depends on setting
-    elif lattype == 'C':
-        # Base-centered: stru2frac = [[1,-1,0],[1,1,0],[0,0,1]] (CXY)
-        conv_rec = np.array([[0.5, 0.5, 0], [-0.5, 0.5, 0], [0, 0, 1]])
-    else:  # P
-        conv_rec = np.eye(3)
-
+    # using conv_rec defined above.
     f.write(f"mp_grid : {mp_grid[0]} {mp_grid[1]} {mp_grid[2]}\n")
     f.write(f"begin kpoints\n")
     for kx, ky, kz in kpoints:
