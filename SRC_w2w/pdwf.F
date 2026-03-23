@@ -247,11 +247,13 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
   real(R8) :: p_min_frozen, p_max_excluded, gap_quality, tmp
   real(R8), allocatable :: r_sorted(:)
 
+  real(R8) :: sigma
   ! Minimum gap (eV) to identify core/semicore boundary
   real(R8), parameter :: GAP_THRESH = 5.0d0
-  ! Energy scale for Gaussian weighting (eV)
-  ! Bands within ~SIGMA of E_F get full weight; distant bands suppressed
-  real(R8), parameter :: SIGMA_EV = 8.0d0
+  ! Skewed Gaussian weighting: occupied states (E<0) are more important
+  ! than unoccupied (E>0). Use wider sigma below E_F to protect valence.
+  real(R8), parameter :: SIGMA_BELOW = 12.0d0  ! eV, occupied side
+  real(R8), parameter :: SIGMA_ABOVE =  6.0d0  ! eV, unoccupied side
   ! Absolute margin on relevance score for gap-bridging
   real(R8), parameter :: BRIDGE_MARGIN = 0.02d0
   ! Energy range around E_F for fallback freezing (eV)
@@ -283,16 +285,24 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
 
   ! ---- Phase 2: Relevance-weighted percentile classification ----
   ! Compute relevance = projectability × energy_weight
-  ! energy_weight = exp(-E²/2σ²) — Gaussian centered on E_F (=0)
-  ! This ensures bands near E_F with good projectability are
-  ! preferentially frozen, while distant bands need much higher p.
+  ! energy_weight uses a split Gaussian: wider below E_F (occupied
+  ! states matter more) and narrower above (conduction bands are
+  ! less critical for ground-state properties).
+  !   weight(E) = exp(-E²/2σ²)
+  !   σ = σ_below (12 eV) for E < 0  → gentle decay for valence
+  !   σ = σ_above ( 6 eV) for E > 0  → steeper decay for conduction
   p_max = 0.0d0
   n_valence = Nb - semicore_top
   do ib = 1, Nb
      if (ib <= semicore_top) then
         relevance(ib) = 0.0d0
      else
-        energy_weight = exp(-0.5d0 * (e_band_avg(ib)/SIGMA_EV)**2)
+        if (e_band_avg(ib) < 0.0d0) then
+           sigma = SIGMA_BELOW
+        else
+           sigma = SIGMA_ABOVE
+        end if
+        energy_weight = exp(-0.5d0 * (e_band_avg(ib)/sigma)**2)
         relevance(ib) = proj_avg(ib) * energy_weight
         if (proj_avg(ib) > p_max) p_max = proj_avg(ib)
      end if
@@ -326,8 +336,9 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
   deallocate(r_sorted)
 
   write(unit_out, '(A,F8.4)') ' PDWF: max projectability     = ', p_max
-  write(unit_out, '(A,F6.1,A)') &
-       ' PDWF: energy weight sigma    = ', SIGMA_EV, ' eV'
+  write(unit_out, '(A,F5.1,A,F5.1,A)') &
+       ' PDWF: energy weight sigma    = ', SIGMA_BELOW, &
+       '/-', SIGMA_ABOVE, ' eV (below/above E_F)'
   write(unit_out, '(A,F8.4,A,F5.1,A)') &
        ' PDWF: frozen relevance (eff) = ', r_high_eff, &
        ' (', pctl_high*100.0d0, 'th pctl)'
@@ -342,7 +353,12 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
   write(unit_out, '(A)') &
        '  ----  --------  ---------  --------  ---------'
   do ib = semicore_top + 1, Nb
-     energy_weight = exp(-0.5d0 * (e_band_avg(ib)/SIGMA_EV)**2)
+     if (e_band_avg(ib) < 0.0d0) then
+        sigma = SIGMA_BELOW
+     else
+        sigma = SIGMA_ABOVE
+     end if
+     energy_weight = exp(-0.5d0 * (e_band_avg(ib)/sigma)**2)
      write(unit_out, '(I5, F10.4, F11.3, F10.4, F11.4)') &
           ib, proj_avg(ib), e_band_avg(ib), energy_weight, relevance(ib)
   end do
@@ -412,7 +428,36 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
      end if
   end if
 
-  ! ---- Phase 5: Gap quality scoring ----
+  ! ---- Phase 5: Gauge freedom cap ----
+  ! Ensure n_frozen <= 80% of active bands. If too many bands are
+  ! frozen, demote the lowest-relevance frozen bands to disentangle.
+  ! This guarantees Wannier90 has gauge freedom for optimization.
+  if (n_frozen > 0 .and. n_disent == 0 .and. n_frozen > 1) then
+     ! All active bands are frozen — must demote some
+     ! Demote bands with lowest relevance until n_frozen <= 80% active
+     demote: do while (n_frozen > nint(0.8d0 * (n_frozen + n_disent)) &
+          &            .and. n_frozen > 1)
+        ! Find frozen band with lowest relevance
+        tmp = 1.0d30
+        jtmp = 0
+        do ib = 1, Nb
+           if (band_class(ib) == BAND_FROZEN .and. &
+                relevance(ib) < tmp) then
+              tmp = relevance(ib)
+              jtmp = ib
+           end if
+        end do
+        if (jtmp == 0) exit demote
+        band_class(jtmp) = BAND_DISENTANGLE
+        n_frozen = n_frozen - 1
+        n_disent = n_disent + 1
+        write(unit_out, '(A,I3,A,F7.4,A)') &
+             ' PDWF: gauge cap: demoting band ', jtmp, &
+             ' (rel=', relevance(jtmp), ') -> DISENTANGLE'
+     end do demote
+  end if
+
+  ! ---- Phase 6: Gap quality scoring ----
   ! Q = min(relevance among frozen) / max(relevance among non-semicore excluded)
   p_min_frozen  =  1.0d30
   p_max_excluded = 0.0d0
@@ -1076,12 +1121,12 @@ contains
     end if
     ! Convergence tolerances
     if (Nb > targets%Ntarget) then
-       write(u, '(A)') 'dis_num_iter    = 5000'
+       write(u, '(A)') 'dis_num_iter    = 10000'
        write(u, '(A)') 'dis_conv_tol    = 1.0e-10'
        write(u, '(A)') 'dis_conv_window = 5'
     end if
-    write(u, '(A)') 'num_iter        = 5000'
-    write(u, '(A)') 'conv_tol        = 1.0e-10'
+    write(u, '(A)') 'num_iter        = 10000'
+    write(u, '(A)') 'conv_tol        = 1.0e-8'
     write(u, '(A)') 'conv_window     = 5'
   end subroutine write_pdwf_keys
 
