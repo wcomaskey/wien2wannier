@@ -147,7 +147,8 @@ def main():
 
     # --- Read data ---
     with open(os.path.join(d, f'{case}.fermi')) as f:
-        ef_ev = float(f.read().strip()) * 13.605693
+        ef_ry = float(f.read().strip())
+    ef_ev_file = ef_ry * 13.605693
 
     kaxis_w90, bands_w90 = read_w90_bands(os.path.join(d, f'{case}_band.dat'))
     w90_labels, w90_kpos = read_w90_labels(
@@ -156,6 +157,20 @@ def main():
     dft_bands = read_spaghetti(os.path.join(d, f'{case}.spaghetti_ene'))
     dft_labels, dft_hsym_idx = read_klist_band_labels(
         os.path.join(d, f'{case}.klist_band'))
+
+    # Detect Fermi level in the band data reference frame.
+    # W90 eigenvalues may be Fermi-shifted (E_F=0) or absolute.
+    # Check: if bands straddle 0, E_F is at 0; otherwise at ef_ev_file.
+    w90_emin = np.min(bands_w90)
+    w90_emax = np.max(bands_w90)
+    if w90_emin < 0 < w90_emax:
+        # Bands straddle 0 → already Fermi-shifted
+        ef_ev = 0.0
+    elif w90_emin < ef_ev_file < w90_emax:
+        # Bands straddle ef_ev_file → absolute energies
+        ef_ev = ef_ev_file
+    else:
+        ef_ev = 0.0  # fallback
 
     # --- Validate path consistency ---
     if len(dft_labels) != len(w90_labels):
