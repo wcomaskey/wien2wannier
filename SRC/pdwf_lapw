@@ -85,8 +85,8 @@ unset v q updn so norun nommn
 bmin=""
 bmax=""
 ljmax=5
-phigh=0.90
-plow=0.05
+phigh=0.60
+plow=0.15
 margin=0.50
 w2wdir=""
 w90exe=""
@@ -412,6 +412,32 @@ with open(f"{case}.win", 'w') as f:
     f.write(f"end atoms_cart\n\n")
 
     # Band path (optional, from klist_band)
+    # Wien2k klist_band may use non-standard divisors for some points
+    # (e.g. L at (4,0,4)/24 instead of (1,0,1)/2). Use label names to
+    # look up standard high-symmetry coordinates for each lattice type.
+    std_hsym = {}
+    if lattype == 'F':  # FCC
+        std_hsym = {
+            'GAMMA': (0,0,0), 'G': (0,0,0),
+            'X': (0.5,0,0.5), 'L': (0.5,0.5,0.5),
+            'W': (0.5,0.25,0.75), 'U': (0.625,0.25,0.625),
+            'K': (0.375,0.375,0.75),
+        }
+    elif lattype == 'B':  # BCC
+        std_hsym = {
+            'GAMMA': (0,0,0), 'G': (0,0,0),
+            'H': (0.5,-0.5,0.5), 'P': (0.25,0.25,0.25),
+            'N': (0,0,0.5),
+        }
+    elif lattype == 'H':  # Hexagonal
+        std_hsym = {
+            'GAMMA': (0,0,0), 'G': (0,0,0),
+            'M': (0.5,0,0), 'K': (1/3,1/3,0),
+            'A': (0,0,0.5), 'L': (0.5,0,0.5),
+            'H': (1/3,1/3,0.5),
+        }
+    # For other lattice types, fall back to klist_band coordinates
+
     bandfile = f"{case}.klist_band"
     if os.path.exists(bandfile):
         f.write(f"bands_plot = T\n")
@@ -423,12 +449,20 @@ with open(f"{case}.win", 'w') as f:
                 if not label or label == 'END':
                     continue
                 try:
-                    ix  = int(line[10:15])
-                    iy  = int(line[15:20])
-                    iz  = int(line[20:25])
-                    idv = int(line[25:30])
+                    body = line[10:].split()
+                    if len(body) < 4:
+                        continue
+                    ix, iy, iz = int(body[0]), int(body[1]), int(body[2])
+                    idv = int(body[3])
                     if label and not label.replace('-','').replace('.','').isdigit():
-                        kpath.append((label, ix/idv, iy/idv, iz/idv))
+                        # Strip trailing numbers/dots from label (e.g. "K.4" -> "K")
+                        clean = re.sub(r'[.\d]+$', '', label)
+                        if clean.upper() in std_hsym:
+                            coords = std_hsym[clean.upper()]
+                        else:
+                            # Fallback: use klist_band coordinates
+                            coords = (ix/idv, iy/idv, iz/idv)
+                        kpath.append((label, *coords))
                 except (ValueError, IndexError):
                     continue
         for j in range(len(kpath) - 1):

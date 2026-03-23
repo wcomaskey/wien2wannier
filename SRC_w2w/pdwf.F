@@ -195,61 +195,224 @@ end subroutine build_targets
 
 
 !-----------------------------------------------------------------------
-! Classify bands into frozen/disentangle/excluded using
-! Fermi-proximity-weighted relevance scores (PDWF method).
+! Classify bands into frozen/disentangle/excluded.
+!
+! Adapted PDWF for the LAPW basis where projectabilities are
+! systematically lower than in LCAO (muffin-tin only, no interstitial
+! contribution). Uses percentile-based adaptive thresholds.
 !
 ! Strategy:
-!   1. Compute relevance = avg(p) * exp(-|E_avg - E_F| / sigma)
-!   2. EXCLUDED:     avg(p) < p_low
-!   3. FROZEN:       relevance >= p_high (high projectability near E_F)
-!   4. DISENTANGLE:  everything else with avg(p) >= p_low
+!   Phase 1 — Semicore exclusion:
+!     Detect energy gaps > GAP_THRESH between consecutive bands.
+!     All bands below the largest sub-E_F gap are EXCLUDED.
 !
-! The Fermi weighting ensures bands near E_F are preferentially frozen,
-! protecting the Fermi surface in the Wannier interpolation.
+!   Phase 2 — Percentile-based classification:
+!     Sort non-semicore projectabilities, compute percentiles.
+!     p_high_eff = value at P_HIGH_PCTL percentile (e.g. 60th)
+!     p_low_eff  = max(p_low, value at P_LOW_PCTL percentile)
+!     Bands with avg(p) >= p_high_eff  ->  FROZEN
+!     Bands with avg(p) >= p_low_eff   ->  DISENTANGLE
+!     Bands below p_low_eff            ->  EXCLUDED
+!
+!   Phase 3 — Gap bridging:
+!     Disentangle bands sandwiched between frozen bands in
+!     band-index space with avg(p) >= p_high_eff - BRIDGE_MARGIN
+!     are promoted to FROZEN.
+!
+!   Phase 4 — Fermi-level fallback:
+!     If no frozen bands, promote bands near E_F to FROZEN.
+!
+!   Phase 5 — Gap quality scoring:
+!     Q = min(p_frozen) / max(p_excluded)
+!     Reports classification reliability.
+!
 ! eigvals are in eV relative to E_F (E_F = 0).
 !-----------------------------------------------------------------------
-subroutine classify_bands(eigvals, proj_avg, Nb, Nk, p_low, &
+subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
+     &                    pctl_high, pctl_low, &
      &                    band_class, n_frozen, n_disent, n_excluded)
   real(R8), intent(in)  :: eigvals(Nb, Nk)
   real(R8), intent(in)  :: proj_avg(Nb)
   integer,  intent(in)  :: Nb, Nk
-  real(R8), intent(in)  :: p_low
+  real(R8), intent(in)  :: pctl_high  ! frozen percentile (0-1), e.g. 0.60
+  real(R8), intent(in)  :: pctl_low   ! exclusion percentile (0-1), e.g. 0.15
   integer,  intent(out) :: band_class(Nb)
   integer,  intent(out) :: n_frozen, n_disent, n_excluded
 
-  integer  :: ib, ik
-  real(R8) :: e_avg, fermi_weight, relevance
-  ! Fermi-weighting sigma: bands within ~sigma eV of E_F get full weight
-  real(R8), parameter :: SIGMA_EV = 5.0d0
-  ! Relevance threshold for freezing: projectability × fermi_weight
-  real(R8), parameter :: P_FROZEN = 0.05d0
+  integer  :: ib, semicore_top, n_valence, ipctl, jtmp
+  integer  :: ifirst_frozen, ilast_frozen
+  real(R8) :: e_band_avg(Nb), gap, max_gap
+  real(R8) :: p_max, p_high_eff, p_low_eff
+  real(R8) :: p_min_frozen, p_max_excluded, gap_quality, tmp
+  real(R8), allocatable :: p_sorted(:)
 
-  n_frozen = 0; n_disent = 0; n_excluded = 0
+  ! Minimum gap (eV) to identify core/semicore boundary
+  real(R8), parameter :: GAP_THRESH = 5.0d0
+  ! Absolute margin below p_high_eff for gap-bridging
+  real(R8), parameter :: BRIDGE_MARGIN = 0.05d0
+  ! Energy range around E_F for fallback freezing (eV)
+  real(R8), parameter :: FALLBACK_EV = 3.0d0
+
+  ! Compute k-averaged band energies
   do ib = 1, Nb
-     if (proj_avg(ib) < p_low) then
-        band_class(ib) = BAND_EXCLUDED
-        n_excluded = n_excluded + 1
-     else
-        ! Compute k-averaged energy (relative to E_F = 0)
-        e_avg = sum(eigvals(ib,:)) / dble(Nk)
-        ! Fermi-proximity weight: exp(-|E|/sigma)
-        fermi_weight = exp(-abs(e_avg) / SIGMA_EV)
-        relevance = proj_avg(ib) * fermi_weight
+     e_band_avg(ib) = sum(eigvals(ib,:)) / dble(Nk)
+  end do
 
-        if (relevance >= P_FROZEN) then
-           band_class(ib) = BAND_FROZEN
-           n_frozen = n_frozen + 1
-        else
-           band_class(ib) = BAND_DISENTANGLE
-           n_disent = n_disent + 1
+  ! ---- Phase 1: Semicore exclusion via energy gaps ----
+  semicore_top = 0
+  max_gap = 0.0d0
+  do ib = 1, Nb - 1
+     gap = e_band_avg(ib + 1) - e_band_avg(ib)
+     if (e_band_avg(ib) < 0.0d0 .and. gap > GAP_THRESH) then
+        if (gap > max_gap) then
+           max_gap = gap
+           semicore_top = ib
         end if
      end if
   end do
+
+  if (semicore_top > 0) then
+     write(unit_out, '(A,I3,A,F8.2,A)') &
+          ' PDWF: excluding bands 1-', semicore_top, &
+          ' as core/semicore (gap = ', max_gap, ' eV)'
+  end if
+
+  ! ---- Phase 2: Percentile-based classification ----
+  n_valence = Nb - semicore_top
+  allocate(p_sorted(n_valence))
+  do ib = 1, n_valence
+     p_sorted(ib) = proj_avg(semicore_top + ib)
+  end do
+  ! Insertion sort (n_valence is small)
+  do ib = 2, n_valence
+     tmp = p_sorted(ib)
+     jtmp = ib - 1
+     do while (jtmp >= 1 .and. p_sorted(jtmp) > tmp)
+        p_sorted(jtmp + 1) = p_sorted(jtmp)
+        jtmp = jtmp - 1
+     end do
+     p_sorted(jtmp + 1) = tmp
+  end do
+
+  ! Compute effective thresholds from percentiles
+  ! p_sorted is ascending: index 1 = lowest, n_valence = highest
+  ipctl = max(1, min(n_valence, &
+       nint(pctl_high * dble(n_valence))))
+  p_high_eff = p_sorted(ipctl)
+
+  ipctl = max(1, min(n_valence, &
+       nint(pctl_low * dble(n_valence))))
+  p_low_eff = p_sorted(ipctl)
+
+  p_max = p_sorted(n_valence)
+  deallocate(p_sorted)
+
+  write(unit_out, '(A,F8.4)') ' PDWF: max projectability     = ', p_max
+  write(unit_out, '(A,F8.4,A,F5.1,A)') &
+       ' PDWF: frozen threshold (eff) = ', p_high_eff, &
+       ' (', pctl_high*100.0d0, 'th pctl)'
+  write(unit_out, '(A,F8.4,A,F5.1,A)') &
+       ' PDWF: exclude threshold(eff) = ', p_low_eff, &
+       ' (', pctl_low*100.0d0, 'th pctl)'
+
+  ! Classify
+  n_frozen = 0; n_disent = 0; n_excluded = 0
+  do ib = 1, Nb
+     if (ib <= semicore_top) then
+        band_class(ib) = BAND_EXCLUDED
+        n_excluded = n_excluded + 1
+     else if (proj_avg(ib) < p_low_eff) then
+        band_class(ib) = BAND_EXCLUDED
+        n_excluded = n_excluded + 1
+     else if (proj_avg(ib) >= p_high_eff) then
+        band_class(ib) = BAND_FROZEN
+        n_frozen = n_frozen + 1
+     else
+        band_class(ib) = BAND_DISENTANGLE
+        n_disent = n_disent + 1
+     end if
+  end do
+
+  ! ---- Phase 3: Gap bridging ----
+  ! Promote disentangle bands to frozen if sandwiched between
+  ! frozen bands in band-index space with p close to threshold.
+  if (n_frozen > 0) then
+     ifirst_frozen = 0
+     ilast_frozen = 0
+     do ib = 1, Nb
+        if (band_class(ib) == BAND_FROZEN) then
+           if (ifirst_frozen == 0) ifirst_frozen = ib
+           ilast_frozen = ib
+        end if
+     end do
+
+     do ib = ifirst_frozen, ilast_frozen
+        if (band_class(ib) == BAND_DISENTANGLE .and. &
+             proj_avg(ib) >= p_high_eff - BRIDGE_MARGIN) then
+           band_class(ib) = BAND_FROZEN
+           n_frozen = n_frozen + 1
+           n_disent = n_disent - 1
+           write(unit_out, '(A,I3,A,F7.4,A)') &
+                ' PDWF: gap-bridging band ', ib, &
+                ' (p=', proj_avg(ib), ') -> FROZEN'
+        end if
+     end do
+  end if
+
+  ! ---- Phase 4: Fermi-level fallback ----
+  if (n_frozen == 0) then
+     write(unit_out, '(A)') &
+          ' PDWF: no frozen bands, applying Fermi-level fallback'
+     do ib = 1, Nb
+        if (band_class(ib) == BAND_DISENTANGLE .and. &
+             abs(e_band_avg(ib)) <= FALLBACK_EV) then
+           band_class(ib) = BAND_FROZEN
+           n_frozen = n_frozen + 1
+           n_disent = n_disent - 1
+        end if
+     end do
+     if (n_frozen > 0) then
+        write(unit_out, '(A,I3,A,F5.1,A)') &
+             ' PDWF: froze ', n_frozen, ' bands within +/-', &
+             FALLBACK_EV, ' eV of E_F'
+     end if
+  end if
+
+  ! ---- Phase 5: Gap quality scoring ----
+  p_min_frozen  =  1.0d30
+  p_max_excluded = 0.0d0
+  do ib = semicore_top + 1, Nb
+     if (band_class(ib) == BAND_FROZEN) then
+        if (proj_avg(ib) < p_min_frozen) p_min_frozen = proj_avg(ib)
+     else if (band_class(ib) == BAND_EXCLUDED) then
+        if (proj_avg(ib) > p_max_excluded) p_max_excluded = proj_avg(ib)
+     end if
+  end do
+
+  if (p_min_frozen < 1.0d30 .and. p_max_excluded > 1.0d-10) then
+     gap_quality = p_min_frozen / p_max_excluded
+     write(unit_out, '(A,F6.2)', ADVANCE='no') &
+          ' PDWF: gap quality = ', gap_quality
+     if (gap_quality > 5.0d0) then
+        write(unit_out, '(A)') ' (CLEAN)'
+     else if (gap_quality > 2.0d0) then
+        write(unit_out, '(A)') ' (MODERATE)'
+     else
+        write(unit_out, '(A)') ' (POOR - review thresholds)'
+     end if
+  end if
 end subroutine classify_bands
 
 
 !-----------------------------------------------------------------------
-! Determine energy windows from eigenvalues and band classification
+! Determine energy windows from eigenvalues and band classification.
+!
+! The frozen window covers ONLY frozen bands (±0.5 eV padding).
+! The disentangle window covers ALL active bands, frozen + disentangle
+! (±2.0 eV padding). This guarantees:
+!   1. Frozen window is ALWAYS strictly narrower than disentangle
+!   2. Disentangle bands provide gauge freedom for optimization
+!   3. The Wannier90 num_wann constraint is satisfied
 !-----------------------------------------------------------------------
 subroutine determine_windows(eigvals, band_class, Nb, Nk, n_wann, &
      &                       margin, froz_min, froz_max, dis_min, &
@@ -262,13 +425,17 @@ subroutine determine_windows(eigvals, band_class, Nb, Nk, n_wann, &
   logical,  intent(inout) :: has_frozen, has_disent
 
   integer  :: ib, ik, n_in_froz, n_kf
-  real(R8) :: emin
+  ! Frozen window padding (eV) — tight around frozen bands
+  real(R8), parameter :: PAD_FROZEN = 0.5d0
+  ! Outer window padding (eV) — wide for gauge freedom
+  real(R8), parameter :: PAD_OUTER  = 2.0d0
 
   has_frozen = .false.
   has_disent = .false.
   froz_min =  1.0d30; froz_max = -1.0d30
   dis_min  =  1.0d30; dis_max  = -1.0d30
 
+  ! Frozen window: spans ONLY frozen bands
   do ib = 1, Nb
      if (band_class(ib) == BAND_FROZEN) then
         has_frozen = .true.
@@ -277,6 +444,10 @@ subroutine determine_windows(eigvals, band_class, Nb, Nk, n_wann, &
            if (eigvals(ib,ik) > froz_max) froz_max = eigvals(ib,ik)
         end do
      end if
+  end do
+
+  ! Outer window: spans ALL non-excluded bands (frozen + disentangle)
+  do ib = 1, Nb
      if (band_class(ib) /= BAND_EXCLUDED) then
         has_disent = .true.
         do ik = 1, Nk
@@ -286,26 +457,21 @@ subroutine determine_windows(eigvals, band_class, Nb, Nk, n_wann, &
      end if
   end do
 
-  ! Apply margins
-  ! Frozen window: pad around frozen bands to ensure Fermi surface
-  ! is fully captured. Use proportional padding (10% of bandwidth,
-  ! minimum 0.5 eV).
+  ! Apply padding: frozen ±0.5 eV, outer ±2.0 eV
+  ! This guarantees outer is STRICTLY wider than frozen
   if (has_frozen) then
-     emin = froz_max - froz_min  ! frozen bandwidth
-     emin = max(0.5d0, 0.1d0 * emin)  ! padding
-     froz_min = froz_min - emin
-     froz_max = froz_max + emin
+     froz_min = froz_min - PAD_FROZEN
+     froz_max = froz_max + PAD_FROZEN
   end if
-  ! Disentanglement window: wider to capture full manifold
   if (has_disent) then
-     dis_min = dis_min - margin
-     dis_max = dis_max + margin
+     dis_min = dis_min - PAD_OUTER
+     dis_max = dis_max + PAD_OUTER
   end if
 
-  ! Enforce Wannier90 constraint: frozen window inside disentangle window
+  ! Enforce: frozen must be inside outer window
   if (has_frozen .and. has_disent) then
-     if (froz_min < dis_min) froz_min = dis_min
-     if (froz_max > dis_max) froz_max = dis_max
+     if (froz_min < dis_min) froz_min = dis_min + 0.1d0
+     if (froz_max > dis_max) froz_max = dis_max - 0.1d0
   end if
 
   ! Critical Wannier90 constraint: at every k-point, the number of
@@ -690,7 +856,8 @@ subroutine pdwf_compute(stru, inwf, targets, Nb, Nk, &
      proj_avg(ib) = sum(proj_k(ib,:)) / dble(Nk)
   end do
 
-  call classify_bands(eigvals, proj_avg, Nb, Nk, inwf%pdwf_p_low, &
+  call classify_bands(eigvals, proj_avg, Nb, Nk, &
+       &              inwf%pdwf_p_high, inwf%pdwf_p_low, &
        &              band_class, n_frozen, n_disent, n_excluded)
 
   write(unit_out, '(A,I4,A)') ' PDWF: ', n_frozen,   ' frozen bands'

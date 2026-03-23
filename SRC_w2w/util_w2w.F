@@ -1496,8 +1496,8 @@ module inwfmod
      integer                 :: bmin, bmax, Nproj, LJmax
      type(proj), allocatable :: projections(:)
      !! PDWF parameters (only used when PDWF=.true.)
-     real(DPk)               :: pdwf_p_high  = 0.90_DPk ! frozen threshold
-     real(DPk)               :: pdwf_p_low   = 0.05_DPk ! exclusion threshold
+     real(DPk)               :: pdwf_p_high  = 0.60_DPk ! frozen percentile (0-1)
+     real(DPk)               :: pdwf_p_low   = 0.15_DPk ! exclusion percentile (0-1)
      real(DPk)               :: pdwf_margin  = 0.50_DPk ! energy window margin (eV)
   end type inwf_t
 
