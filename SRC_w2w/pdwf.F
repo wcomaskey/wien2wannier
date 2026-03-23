@@ -247,13 +247,13 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
   real(R8) :: p_min_frozen, p_max_excluded, gap_quality, tmp
   real(R8), allocatable :: r_sorted(:)
 
-  real(R8) :: sigma
+  real(R8) :: sigma, sigma_below, sigma_above, e_deepest
   ! Minimum gap (eV) to identify core/semicore boundary
   real(R8), parameter :: GAP_THRESH = 5.0d0
-  ! Skewed Gaussian weighting: occupied states (E<0) are more important
-  ! than unoccupied (E>0). Use wider sigma below E_F to protect valence.
-  real(R8), parameter :: SIGMA_BELOW = 12.0d0  ! eV, occupied side
-  real(R8), parameter :: SIGMA_ABOVE =  6.0d0  ! eV, unoccupied side
+  ! Minimum sigma (eV) to prevent over-aggressive weighting
+  real(R8), parameter :: SIGMA_MIN = 3.0d0
+  ! Ratio: sigma_above = SIGMA_RATIO * sigma_below
+  real(R8), parameter :: SIGMA_RATIO = 0.5d0
   ! Absolute margin on relevance score for gap-bridging
   real(R8), parameter :: BRIDGE_MARGIN = 0.02d0
   ! Energy range around E_F for fallback freezing (eV)
@@ -283,14 +283,26 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
           ' as core/semicore (gap = ', max_gap, ' eV)'
   end if
 
+  ! ---- Compute adaptive sigma from eigenvalue distribution ----
+  ! sigma_below = |E_deepest_non_semicore|  (valence bandwidth)
+  ! sigma_above = SIGMA_RATIO * sigma_below (conduction decays faster)
+  ! Both have a minimum of SIGMA_MIN to prevent over-aggressive weighting.
+  e_deepest = 0.0d0
+  do ib = semicore_top + 1, Nb
+     if (e_band_avg(ib) < e_deepest) e_deepest = e_band_avg(ib)
+  end do
+  sigma_below = max(SIGMA_MIN, abs(e_deepest))
+  sigma_above = max(SIGMA_MIN, SIGMA_RATIO * sigma_below)
+
   ! ---- Phase 2: Relevance-weighted percentile classification ----
-  ! Compute relevance = projectability × energy_weight
-  ! energy_weight uses a split Gaussian: wider below E_F (occupied
-  ! states matter more) and narrower above (conduction bands are
-  ! less critical for ground-state properties).
-  !   weight(E) = exp(-E²/2σ²)
-  !   σ = σ_below (12 eV) for E < 0  → gentle decay for valence
-  !   σ = σ_above ( 6 eV) for E > 0  → steeper decay for conduction
+  ! Compute relevance = projectability x energy_weight
+  ! energy_weight uses a split Gaussian derived from the material's
+  ! eigenvalue distribution:
+  !   weight(E) = exp(-E^2 / 2*sigma^2)
+  !   sigma = sigma_below for E < E_F  (= valence bandwidth)
+  !   sigma = sigma_above for E > E_F  (= 0.5 * valence bandwidth)
+  ! This ensures ALL valence bands get substantial weight (>0.6) while
+  ! conduction bands decay faster, adapting to each material automatically.
   p_max = 0.0d0
   n_valence = Nb - semicore_top
   do ib = 1, Nb
@@ -298,9 +310,9 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
         relevance(ib) = 0.0d0
      else
         if (e_band_avg(ib) < 0.0d0) then
-           sigma = SIGMA_BELOW
+           sigma = sigma_below
         else
-           sigma = SIGMA_ABOVE
+           sigma = sigma_above
         end if
         energy_weight = exp(-0.5d0 * (e_band_avg(ib)/sigma)**2)
         relevance(ib) = proj_avg(ib) * energy_weight
@@ -337,8 +349,10 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
 
   write(unit_out, '(A,F8.4)') ' PDWF: max projectability     = ', p_max
   write(unit_out, '(A,F5.1,A,F5.1,A)') &
-       ' PDWF: energy weight sigma    = ', SIGMA_BELOW, &
-       '/-', SIGMA_ABOVE, ' eV (below/above E_F)'
+       ' PDWF: energy weight sigma    = ', sigma_below, &
+       '/', sigma_above, ' eV (below/above E_F)'
+  write(unit_out, '(A,F8.2,A)') &
+       ' PDWF: deepest valence band   = ', e_deepest, ' eV'
   write(unit_out, '(A,F8.4,A,F5.1,A)') &
        ' PDWF: frozen relevance (eff) = ', r_high_eff, &
        ' (', pctl_high*100.0d0, 'th pctl)'
@@ -354,9 +368,9 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
        '  ----  --------  ---------  --------  ---------'
   do ib = semicore_top + 1, Nb
      if (e_band_avg(ib) < 0.0d0) then
-        sigma = SIGMA_BELOW
+        sigma = sigma_below
      else
-        sigma = SIGMA_ABOVE
+        sigma = sigma_above
      end if
      energy_weight = exp(-0.5d0 * (e_band_avg(ib)/sigma)**2)
      write(unit_out, '(I5, F10.4, F11.3, F10.4, F11.4)') &
