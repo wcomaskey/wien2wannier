@@ -285,14 +285,29 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
 
   ! ---- Compute adaptive sigma from eigenvalue distribution ----
   ! sigma_below = |E_deepest_non_semicore|  (valence bandwidth)
-  ! sigma_above = SIGMA_RATIO * sigma_below (conduction decays faster)
-  ! Both have a minimum of SIGMA_MIN to prevent over-aggressive weighting.
+  ! sigma_above = max of:
+  !   (a) SIGMA_RATIO * sigma_below  (default: half of valence BW)
+  !   (b) max extent above E_F of any band that CROSSES E_F
+  ! This ensures metallic bands that straddle E_F get full weight
+  ! on both sides, while purely conduction bands still decay faster.
+  ! Both sigmas have a minimum of SIGMA_MIN.
   e_deepest = 0.0d0
   do ib = semicore_top + 1, Nb
      if (e_band_avg(ib) < e_deepest) e_deepest = e_band_avg(ib)
   end do
   sigma_below = max(SIGMA_MIN, abs(e_deepest))
-  sigma_above = max(SIGMA_MIN, SIGMA_RATIO * sigma_below)
+
+  ! Find max extent above E_F of bands crossing E_F
+  ! A band "crosses" if it has eigenvalues both < 0 and > 0 at diff k-points
+  sigma_above = SIGMA_RATIO * sigma_below
+  do ib = semicore_top + 1, Nb
+     if (minval(eigvals(ib,:)) < 0.0d0 .and. &
+          maxval(eigvals(ib,:)) > 0.0d0) then
+        ! This band crosses E_F — its max extent above matters
+        sigma_above = max(sigma_above, maxval(eigvals(ib,:)))
+     end if
+  end do
+  sigma_above = max(SIGMA_MIN, sigma_above)
 
   ! ---- Phase 2: Relevance-weighted percentile classification ----
   ! Compute relevance = projectability x energy_weight
@@ -300,9 +315,10 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
   ! eigenvalue distribution:
   !   weight(E) = exp(-E^2 / 2*sigma^2)
   !   sigma = sigma_below for E < E_F  (= valence bandwidth)
-  !   sigma = sigma_above for E > E_F  (= 0.5 * valence bandwidth)
-  ! This ensures ALL valence bands get substantial weight (>0.6) while
-  ! conduction bands decay faster, adapting to each material automatically.
+  !   sigma = sigma_above for E > E_F  (= max of 0.5*BW and crossing extent)
+  ! This ensures ALL valence bands get substantial weight (>0.6),
+  ! metallic bands crossing E_F are fully protected on both sides,
+  ! and purely conduction bands decay faster.
   p_max = 0.0d0
   n_valence = Nb - semicore_top
   do ib = 1, Nb
