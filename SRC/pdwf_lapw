@@ -251,20 +251,29 @@ with open('$enefile') as f:
 # Convert to eV relative to E_F
 eigs_ev = [(e - ef_ry) * 13.605693 for e in eigs]
 
-# Find the LARGEST gap below E_F to identify core/semicore boundary.
-# The largest gap is always between core and valence manifolds.
-# Smaller gaps (e.g. between s and p valence) are handled by the
-# PDWF classifier inside w2w via the semicore detector.
+# Auto-detect bmin: skip core/semicore states.
+# Strategy: find LAST gap > 15 eV below E_F (clear core boundary).
+# For smaller gaps (5-15 eV), only skip if the bands below are
+# deep (< -20 eV). This ensures valence bands like Mg 2s at
+# -12 eV or Ga 3d at -15 eV are included.
+# The PDWF classifier in w2w handles any remaining semicore
+# exclusion via the projectability-based detector.
 best_gap, best_idx = 0, 0
 for i in range(len(eigs_ev) - 1):
     if eigs_ev[i] < 0:
         gap = eigs_ev[i+1] - eigs_ev[i]
-        if gap > best_gap and gap > 5.0:
-            best_gap = gap
-            best_idx = i + 1  # band above the gap (0-indexed)
+        if gap > 15.0:
+            # Large gap: always skip (core/semicore)
+            if (i + 1) > best_idx:
+                best_gap = gap
+                best_idx = i + 1
+        elif gap > 5.0 and eigs_ev[i] < -20.0:
+            # Medium gap deep below E_F: also skip
+            if (i + 1) > best_idx:
+                best_gap = gap
+                best_idx = i + 1
 
-# bmin = band above the largest gap (1-indexed)
-bmin = best_idx + 1 if best_gap > 5.0 else 1
+bmin = best_idx + 1 if best_idx > 0 else 1
 bmax = len(eigs)
 
 print(f'{bmin} {bmax} {best_gap:.1f}')
