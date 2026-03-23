@@ -242,14 +242,18 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
   integer  :: ib, semicore_top, n_valence, ipctl, jtmp
   integer  :: ifirst_frozen, ilast_frozen
   real(R8) :: e_band_avg(Nb), gap, max_gap
-  real(R8) :: p_max, p_high_eff, p_low_eff
+  real(R8) :: p_max, r_high_eff, r_low_eff
+  real(R8) :: relevance(Nb), energy_weight
   real(R8) :: p_min_frozen, p_max_excluded, gap_quality, tmp
-  real(R8), allocatable :: p_sorted(:)
+  real(R8), allocatable :: r_sorted(:)
 
   ! Minimum gap (eV) to identify core/semicore boundary
   real(R8), parameter :: GAP_THRESH = 5.0d0
-  ! Absolute margin below p_high_eff for gap-bridging
-  real(R8), parameter :: BRIDGE_MARGIN = 0.05d0
+  ! Energy scale for Gaussian weighting (eV)
+  ! Bands within ~SIGMA of E_F get full weight; distant bands suppressed
+  real(R8), parameter :: SIGMA_EV = 8.0d0
+  ! Absolute margin on relevance score for gap-bridging
+  real(R8), parameter :: BRIDGE_MARGIN = 0.02d0
   ! Energy range around E_F for fallback freezing (eV)
   real(R8), parameter :: FALLBACK_EV = 3.0d0
 
@@ -277,54 +281,83 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
           ' as core/semicore (gap = ', max_gap, ' eV)'
   end if
 
-  ! ---- Phase 2: Percentile-based classification ----
+  ! ---- Phase 2: Relevance-weighted percentile classification ----
+  ! Compute relevance = projectability × energy_weight
+  ! energy_weight = exp(-E²/2σ²) — Gaussian centered on E_F (=0)
+  ! This ensures bands near E_F with good projectability are
+  ! preferentially frozen, while distant bands need much higher p.
+  p_max = 0.0d0
   n_valence = Nb - semicore_top
-  allocate(p_sorted(n_valence))
-  do ib = 1, n_valence
-     p_sorted(ib) = proj_avg(semicore_top + ib)
-  end do
-  ! Insertion sort (n_valence is small)
-  do ib = 2, n_valence
-     tmp = p_sorted(ib)
-     jtmp = ib - 1
-     do while (jtmp >= 1 .and. p_sorted(jtmp) > tmp)
-        p_sorted(jtmp + 1) = p_sorted(jtmp)
-        jtmp = jtmp - 1
-     end do
-     p_sorted(jtmp + 1) = tmp
+  do ib = 1, Nb
+     if (ib <= semicore_top) then
+        relevance(ib) = 0.0d0
+     else
+        energy_weight = exp(-0.5d0 * (e_band_avg(ib)/SIGMA_EV)**2)
+        relevance(ib) = proj_avg(ib) * energy_weight
+        if (proj_avg(ib) > p_max) p_max = proj_avg(ib)
+     end if
   end do
 
-  ! Compute effective thresholds from percentiles
-  ! p_sorted is ascending: index 1 = lowest, n_valence = highest
+  ! Sort relevance scores of non-semicore bands to find percentiles
+  allocate(r_sorted(n_valence))
+  do ib = 1, n_valence
+     r_sorted(ib) = relevance(semicore_top + ib)
+  end do
+  ! Insertion sort
+  do ib = 2, n_valence
+     tmp = r_sorted(ib)
+     jtmp = ib - 1
+     do while (jtmp >= 1 .and. r_sorted(jtmp) > tmp)
+        r_sorted(jtmp + 1) = r_sorted(jtmp)
+        jtmp = jtmp - 1
+     end do
+     r_sorted(jtmp + 1) = tmp
+  end do
+
+  ! Compute effective thresholds from percentiles of relevance
   ipctl = max(1, min(n_valence, &
        nint(pctl_high * dble(n_valence))))
-  p_high_eff = p_sorted(ipctl)
+  r_high_eff = r_sorted(ipctl)
 
   ipctl = max(1, min(n_valence, &
        nint(pctl_low * dble(n_valence))))
-  p_low_eff = p_sorted(ipctl)
+  r_low_eff = r_sorted(ipctl)
 
-  p_max = p_sorted(n_valence)
-  deallocate(p_sorted)
+  deallocate(r_sorted)
 
   write(unit_out, '(A,F8.4)') ' PDWF: max projectability     = ', p_max
+  write(unit_out, '(A,F6.1,A)') &
+       ' PDWF: energy weight sigma    = ', SIGMA_EV, ' eV'
   write(unit_out, '(A,F8.4,A,F5.1,A)') &
-       ' PDWF: frozen threshold (eff) = ', p_high_eff, &
+       ' PDWF: frozen relevance (eff) = ', r_high_eff, &
        ' (', pctl_high*100.0d0, 'th pctl)'
   write(unit_out, '(A,F8.4,A,F5.1,A)') &
-       ' PDWF: exclude threshold(eff) = ', p_low_eff, &
+       ' PDWF: exclude relevance(eff) = ', r_low_eff, &
        ' (', pctl_low*100.0d0, 'th pctl)'
 
-  ! Classify
+  ! Print per-band relevance scores
+  write(unit_out, *)
+  write(unit_out, '(A)') &
+       '  Band   avg(p)   E_avg(eV)  E_weight  relevance'
+  write(unit_out, '(A)') &
+       '  ----  --------  ---------  --------  ---------'
+  do ib = semicore_top + 1, Nb
+     energy_weight = exp(-0.5d0 * (e_band_avg(ib)/SIGMA_EV)**2)
+     write(unit_out, '(I5, F10.4, F11.3, F10.4, F11.4)') &
+          ib, proj_avg(ib), e_band_avg(ib), energy_weight, relevance(ib)
+  end do
+  write(unit_out, *)
+
+  ! Classify using relevance thresholds
   n_frozen = 0; n_disent = 0; n_excluded = 0
   do ib = 1, Nb
      if (ib <= semicore_top) then
         band_class(ib) = BAND_EXCLUDED
         n_excluded = n_excluded + 1
-     else if (proj_avg(ib) < p_low_eff) then
+     else if (relevance(ib) < r_low_eff) then
         band_class(ib) = BAND_EXCLUDED
         n_excluded = n_excluded + 1
-     else if (proj_avg(ib) >= p_high_eff) then
+     else if (relevance(ib) >= r_high_eff) then
         band_class(ib) = BAND_FROZEN
         n_frozen = n_frozen + 1
      else
@@ -335,7 +368,7 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
 
   ! ---- Phase 3: Gap bridging ----
   ! Promote disentangle bands to frozen if sandwiched between
-  ! frozen bands in band-index space with p close to threshold.
+  ! frozen bands in band-index space with relevance close to threshold.
   if (n_frozen > 0) then
      ifirst_frozen = 0
      ilast_frozen = 0
@@ -348,13 +381,14 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
 
      do ib = ifirst_frozen, ilast_frozen
         if (band_class(ib) == BAND_DISENTANGLE .and. &
-             proj_avg(ib) >= p_high_eff - BRIDGE_MARGIN) then
+             relevance(ib) >= r_high_eff - BRIDGE_MARGIN) then
            band_class(ib) = BAND_FROZEN
            n_frozen = n_frozen + 1
            n_disent = n_disent - 1
-           write(unit_out, '(A,I3,A,F7.4,A)') &
+           write(unit_out, '(A,I3,A,F7.4,A,F7.4,A)') &
                 ' PDWF: gap-bridging band ', ib, &
-                ' (p=', proj_avg(ib), ') -> FROZEN'
+                ' (p=', proj_avg(ib), &
+                ', rel=', relevance(ib), ') -> FROZEN'
         end if
      end do
   end if
@@ -379,13 +413,14 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
   end if
 
   ! ---- Phase 5: Gap quality scoring ----
+  ! Q = min(relevance among frozen) / max(relevance among non-semicore excluded)
   p_min_frozen  =  1.0d30
   p_max_excluded = 0.0d0
   do ib = semicore_top + 1, Nb
      if (band_class(ib) == BAND_FROZEN) then
-        if (proj_avg(ib) < p_min_frozen) p_min_frozen = proj_avg(ib)
+        if (relevance(ib) < p_min_frozen) p_min_frozen = relevance(ib)
      else if (band_class(ib) == BAND_EXCLUDED) then
-        if (proj_avg(ib) > p_max_excluded) p_max_excluded = proj_avg(ib)
+        if (relevance(ib) > p_max_excluded) p_max_excluded = relevance(ib)
      end if
   end do
 
