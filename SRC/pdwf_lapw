@@ -5,84 +5,95 @@
 ###    Automated PDWF (Projectability-Disentangled Wannier Functions)
 ###    workflow for wien2wannier.
 ###
-###    Self-contained pipeline — does NOT depend on Wien2k's x_lapw.
+###    One-command pipeline from a completed Wien2k SCF calculation
+###    to maximally-localized Wannier functions. No user intervention
+###    required — all parameters are determined automatically.
+###
+###    Self-contained: does NOT depend on Wien2k's x_lapw.
 ###    Calls w2w/w2wc and wannier90.x directly, so they can be built
-###    with independent toolchains (important on HPC where Wien2k and
-###    Wannier90 may have competing MPI/BLAS dependencies).
+###    with independent toolchains (HPC-safe).
 ###
 ###    Pipeline:
-###      1. Generate PDWF .inwf
-###      2. Generate initial .win (real k-points, dummy num_wann)
-###      3. Run wannier90.x -pp  →  .nnkp
-###      4. Run w2wc PDWF mode   →  .amn, .mmn, .eig + patches .win
-###      5. Run wannier90.x      →  Wannierization
+###      1a. Generate PDWF .inwf
+###      1b. Densify klist_band (if present)
+###      2.  Generate initial .win from Wien2k files
+###      3.  Run wannier90.x -pp  →  .nnkp
+###      4.  Run w2wc PDWF mode   →  .amn, .mmn, .eig + patches .win
+###      5.  Run wannier90.x      →  Wannierization + band interpolation
+###      6.  Generate band comparison plot (if spaghetti available)
 ###
-### Copyright 2024 William Comaskey
+### Copyright 2024-2026 William Comaskey
+
+set -euo pipefail
 
 bin=$(cd "$(dirname "$0")" && pwd)
 name=$(basename "$0")
 file=$(basename "$PWD")
 
+# ============================================================
+#  Usage
+# ============================================================
 usage() {
     cat <<EOF
 PROGRAM:    $name
 
-PURPOSE:    Automated PDWF workflow for wien2wannier.
-            Generates projections, energy windows, and Wannier functions
-            automatically from a completed Wien2k calculation.
-
-            Does NOT require Wien2k's x_lapw — calls executables directly.
+PURPOSE:    One-command PDWF Wannierization from a Wien2k calculation.
+            Automatically determines projections, energy windows, and
+            all Wannier90 parameters. No user intervention required.
 
 USAGE:      $name [FLAGS] [OPTIONS]
 
 FLAGS:
-  -h,-H       this message
+  -h          this message
   -v          verbose output
   -q          quiet mode
   -up/-dn     spin-polarized
   -so         spin-orbit coupling
-  -norun      stop after generating .inwf and .win (dry run)
-  -nommn      skip MMN computation (AMN only, for testing)
+  -norun      generate input files only (dry run)
 
 OPTIONS:
   -f CASE       override case name (default: directory name)
-  -bmin N       minimum band index (default: auto from energy file)
-  -bmax N       maximum band index (default: auto from energy file)
+  -bmin N       minimum band index (default: auto)
+  -bmax N       maximum band index (default: auto)
   -ljmax N      max L for exp(ibr) expansion (default: 5)
-  -phigh X      projectability threshold for frozen bands (default: 0.90)
-  -plow X       projectability threshold for exclusion (default: 0.05)
-  -margin X     energy margin for windows in eV (default: 0.50)
-  -nkband N     k-points per band path segment (default: 100)
-  -w2wdir DIR   directory containing w2w/w2wc executables
-  -w90exe EXE   path to wannier90.x executable
+  -phigh X      frozen percentile 0-1 (default: 0.60)
+  -plow X       exclusion percentile 0-1 (default: 0.15)
+  -nkband N     k-points per band segment (default: 100)
+  -w2wdir DIR   directory containing w2w/w2wc
+  -w90exe EXE   path to wannier90.x
 
 PREREQUISITES:
-  A completed Wien2k SCF calculation providing:
+  A completed Wien2k SCF calculation with:
     case.struct   case.klist     case.energy
-    case.vector   case.vsp       case.fermi
+    case.vector   case.vsp       case.fermi (or case.scf)
 
-EXECUTABLE SEARCH ORDER:
-  w2w/w2wc:     -w2wdir  >  \$bin/../SRC_w2w  >  \$bin  >  \$PATH
-  wannier90.x:  -w90exe  >  \$PATH (wannier90.x, then wannier90)
+  Optional: case.klist_band (for band structure comparison)
 
 EXAMPLES:
-  $name                                             # fully automatic
-  $name -bmin 5 -bmax 22                            # explicit band window
-  $name -so                                         # spin-orbit
-  $name -w2wdir ./SRC_w2w -w90exe ./wannier90.x     # explicit paths
-  $name -norun                                      # generate files only
-  $name -phigh 0.80 -plow 0.1                       # custom thresholds
+  $name                             # fully automatic
+  $name -so                         # spin-orbit coupling
+  $name -bmin 5 -bmax 22            # explicit band window
+  $name -w90exe /opt/wannier90.x    # explicit wannier90 path
+  $name -norun                      # just generate input files
 EOF
 }
 
-croak() { echo >&2 "$name: $*"; exit 1; }
-warn()  { [[ $q ]] && return; echo >&2 "$name: $*"; }
-info()  { [[ $q ]] && return; echo "  $*"; }
+# ============================================================
+#  Utility functions
+# ============================================================
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+
+croak() { echo -e >&2 "${RED}ERROR:${NC} $*"; exit 1; }
+warn()  { [[ ${q:-} ]] && return; echo -e >&2 "${YELLOW}WARNING:${NC} $*"; }
+info()  { [[ ${q:-} ]] && return; echo -e "  ${CYAN}>>>${NC} $*"; }
+step()  { [[ ${q:-} ]] && return; echo -e "\n${BOLD}Step $1:${NC} $2"; }
+done_msg() { echo -e "  ${GREEN}done${NC} $*"; }
 
 # ============================================================
 #  Parse options
 # ============================================================
-unset v q updn so norun nommn
+unset v q updn so norun
 bmin=""
 bmax=""
 ljmax=5
@@ -103,7 +114,6 @@ while [[ $# -gt 0 ]]; do
         -so)    so=so;;
         -noso)  unset so;;
         -norun) norun=1;;
-        -nommn) nommn=1;;
         -f)      shift; file=$1;;
         -bmin)   shift; bmin=$1;;
         -bmax)   shift; bmax=$1;;
@@ -120,29 +130,29 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+echo -e "${BOLD}PDWF Wannierization Pipeline${NC}"
+echo -e "case: ${CYAN}$file${NC}"
+
 # ============================================================
 #  Detect calculation type
 # ============================================================
-w2w_exec="w2wc"  # default to complex (safe choice)
+w2w_exec="w2wc"  # default to complex (safe)
 
-if [[ -s $file.in1c || -n $so ]]; then
+if [[ -s $file.in1c || -n ${so:-} ]]; then
     w2w_exec="w2wc"
 elif [[ -s $file.in1 && ! -s $file.in1c ]]; then
     w2w_exec="w2w"
 fi
 
-if [[ -s $file.inso ]]; then
-    so=so
-fi
+[[ -s $file.inso ]] && so=so
 
-[[ $v ]] && info "case=$file w2w=$w2w_exec sp=${updn:-none} so=${so:-no}"
+[[ ${v:-} ]] && info "w2w=$w2w_exec sp=${updn:-none} so=${so:-no}"
 
 # ============================================================
-#  Resolve executables (no x_lapw dependency)
+#  Resolve executables
 # ============================================================
 resolve_w2w() {
     local exe=$1
-    # Search order: -w2wdir > $bin/../SRC_w2w > $bin > $PATH
     for dir in "$w2wdir" "$bin/../SRC_w2w" "$bin"; do
         [[ -n $dir && -x "$dir/$exe" ]] && { echo "$dir/$exe"; return 0; }
     done
@@ -151,7 +161,6 @@ resolve_w2w() {
 }
 
 resolve_w90() {
-    # Search order: -w90exe > $PATH
     if [[ -n $w90exe && -x "$w90exe" ]]; then
         echo "$w90exe"; return 0
     fi
@@ -160,113 +169,153 @@ resolve_w90() {
     return 1
 }
 
-# Resolve now but only error later when actually needed
 W2W_BIN=$(resolve_w2w "$w2w_exec") || true
 W90_BIN=$(resolve_w90) || true
 
-[[ $v ]] && info "w2w executable:  ${W2W_BIN:-(not found)}"
-[[ $v ]] && info "w90 executable:  ${W90_BIN:-(not found)}"
+[[ ${v:-} ]] && info "w2w: ${W2W_BIN:-(not found)}"
+[[ ${v:-} ]] && info "w90: ${W90_BIN:-(not found)}"
 
 # ============================================================
 #  Validate prerequisites
 # ============================================================
 for f in $file.struct $file.klist; do
-    [[ -s $f ]] || croak "required file \`$f' not found (run Wien2k first)"
+    [[ -s $f ]] || croak "required file \`$f' not found — run Wien2k SCF first"
 done
 
-# Energy file: try suffixed variants, then plain
+# Energy file
 enefile=""
-for suffix in "${so}${updn}" "${updn}" ""; do
+for suffix in "${so:-}${updn:-}" "${updn:-}" ""; do
     [[ -s "$file.energy$suffix" ]] && { enefile="$file.energy$suffix"; break; }
 done
-[[ -n $enefile ]] || croak "energy file not found (need case.energy)"
+[[ -n $enefile ]] || croak "energy file not found"
 
 # Vector file
 vecfile=""
-for suffix in "${so}${updn}" "${updn}" ""; do
+for suffix in "${so:-}${updn:-}" "${updn:-}" ""; do
     [[ -s "$file.vector$suffix" ]] && { vecfile="$file.vector$suffix"; break; }
 done
 [[ -n $vecfile ]] || croak "vector file not found"
 
 # Potential file
 vspfile=""
-for suffix in "${updn}" ""; do
+for suffix in "${updn:-}" ""; do
     [[ -s "$file.vsp$suffix" ]] && { vspfile="$file.vsp$suffix"; break; }
 done
 [[ -n $vspfile ]] || croak "potential file not found"
 
-# Fermi energy
+# Fermi energy — extract from .scf if .fermi missing
 fermifile=$file.fermi
 if [[ ! -s $fermifile ]]; then
     if [[ -s $file.scf ]]; then
         grep ':FER' "$file.scf" | tail -1 | awk '{print $NF}' > "$fermifile"
         info "extracted Fermi energy from $file.scf"
     else
-        croak "Fermi energy file \`$fermifile' not found"
+        croak "Fermi energy not found (need $file.fermi or $file.scf)"
     fi
 fi
 
-[[ $v ]] && info "energy=$enefile vector=$vecfile vsp=$vspfile"
+info "files: energy=$enefile vector=$vecfile vsp=$vspfile"
 
 # ============================================================
-#  Step 0: Auto-detect band window if not specified
+#  Step 0: Auto-detect band window
 # ============================================================
 if [[ -z $bmin || -z $bmax ]]; then
-    info "auto-detecting band window from $enefile ..."
+    # Auto-detect band window from energy file.
+    # Reads eigenvalues at first k-point, finds semicore gap to set bmin,
+    # and uses total band count for bmax.
+    nneq=$(sed -n '2p' "$file.struct" | grep -o 'ATOMS[: ]*[0-9]*' | grep -o '[0-9]*$')
+    [[ -z $nneq ]] && nneq=1
 
-    # Parse energy file: skip 2*Nneq header lines, then read first k-point
-    read_bands=$(awk '
-    BEGIN { nneq=0; state=0 }
-    state==0 { nneq++; if(NR==2) state=1; next }
-    state==1 { nneq++; state=2; next }
-    state==2 {
-        n = substr($0, 74, 6) + 0
-        printf "%d\n", n
-        exit
-    }
-    ' "$enefile")
+    # Read Fermi energy
+    ef_ry=$(cat "$fermifile")
 
-    [[ -z $read_bands || $read_bands -eq 0 ]] && \
-        croak "could not determine number of bands from $enefile"
+    # Parse eigenvalues at first k-point and auto-detect bmin/bmax
+    read_result=$(python3 -c "
+import sys
 
-    [[ -z $bmin ]] && bmin=1
-    [[ -z $bmax ]] && bmax=$read_bands
+nneq = $nneq
+ef_ry = $ef_ry
 
-    info "detected $read_bands bands, using window [$bmin, $bmax]"
+# Read energy file: skip 2*nneq header lines, then first k-point
+with open('$enefile') as f:
+    for _ in range(2 * nneq):
+        f.readline()
+    # k-point header: columns 68-73 = N, 74-79 = NEN
+    header = f.readline()
+    nen = int(header[73:79])
+    eigs = []
+    for i in range(nen):
+        parts = f.readline().split()
+        eigs.append(float(parts[1]))  # eigenvalue in Ry
+
+# Convert to eV relative to E_F
+eigs_ev = [(e - ef_ry) * 13.605693 for e in eigs]
+
+# Find the LARGEST gap below E_F to identify core/semicore boundary.
+# The largest gap is always between core and valence manifolds.
+# Smaller gaps (e.g. between s and p valence) are handled by the
+# PDWF classifier inside w2w via the semicore detector.
+best_gap, best_idx = 0, 0
+for i in range(len(eigs_ev) - 1):
+    if eigs_ev[i] < 0:
+        gap = eigs_ev[i+1] - eigs_ev[i]
+        if gap > best_gap and gap > 5.0:
+            best_gap = gap
+            best_idx = i + 1  # band above the gap (0-indexed)
+
+# bmin = band above the largest gap (1-indexed)
+bmin = best_idx + 1 if best_gap > 5.0 else 1
+bmax = len(eigs)
+
+print(f'{bmin} {bmax} {best_gap:.1f}')
+" 2>&1)
+
+    bmin_auto=$(echo "$read_result" | awk '{print $1}')
+    bmax_auto=$(echo "$read_result" | awk '{print $2}')
+    gap_auto=$(echo "$read_result" | awk '{print $3}')
+
+    [[ -z $bmin_auto ]] && croak "could not auto-detect band window"
+
+    [[ -z $bmin ]] && bmin=$bmin_auto
+    [[ -z $bmax ]] && bmax=$bmax_auto
+
+    if [[ "$gap_auto" != "0.0" ]]; then
+        info "auto-detected: $bmax_auto bands, semicore gap = ${gap_auto} eV"
+        info "band window: [$bmin, $bmax] (skipping core/semicore)"
+    else
+        info "auto-detected: $bmax_auto bands, no semicore gap"
+        info "band window: [$bmin, $bmax]"
+    fi
 fi
 
 nb=$((bmax - bmin + 1))
 
 # ============================================================
-#  Step 1: Generate PDWF .inwf file
+#  Step 1a: Generate PDWF .inwf
 # ============================================================
-info "Step 1: Generating PDWF .inwf"
+step "1a" "Generating PDWF input (.inwf)"
 
-inwffile=$file.inwf${updn}
+inwffile=$file.inwf${updn:-}
 cat > "$inwffile" <<EOF
 PDWF
  $bmin  $bmax
  $ljmax
  $phigh  $plow  $margin
 EOF
-
-[[ $v ]] && cat "$inwffile"
-info "wrote $inwffile"
+done_msg "$inwffile"
 
 # ============================================================
-#  Step 1b: Generate dense klist_band (if klist_band exists)
+#  Step 1b: Densify klist_band (if present)
 # ============================================================
 klistband=$file.klist_band
 if [[ -s $klistband ]]; then
-    info "Step 1b: Generating dense klist_band ($nkband pts/segment)"
+    step "1b" "Densifying band k-path ($nkband pts/segment)"
     python3 - "$file" "$nkband" <<'KBEOF'
 import sys, re
 import numpy as np
 
-case = sys.argv[1]
-npts = int(sys.argv[2])
+case, npts = sys.argv[1], int(sys.argv[2])
 
-# Read existing klist_band — extract labeled high-symmetry points
 labels = []
 with open(f"{case}.klist_band") as f:
     for line in f:
@@ -283,32 +332,24 @@ with open(f"{case}.klist_band") as f:
         labels.append((label, np.array([ix/idv, iy/idv, iz/idv])))
 
 if len(labels) < 2:
-    print(f"  klist_band has {len(labels)} labels, skipping densification")
     sys.exit(0)
 
-# Find a common divisor that gives integer coords for all points
-# Use LCM of all original divisors, scaled to npts
-div = npts * 6  # 6 covers 1/2, 1/3, 1/4, 1/6 etc.
-
-# Write dense klist_band
-# Back up original
 import shutil
 shutil.copy(f"{case}.klist_band", f"{case}.klist_band.orig")
+div = npts * 6
 
 with open(f"{case}.klist_band", 'w') as f:
     for iseg in range(len(labels) - 1):
         l1, k1 = labels[iseg]
         l2, k2 = labels[iseg + 1]
-
         for i in range(npts + 1):
             if i == 0 and iseg > 0:
-                continue  # skip duplicate at boundary
+                continue
             t = i / npts
             kp = k1 + t * (k2 - k1)
             ix = int(round(kp[0] * div))
             iy = int(round(kp[1] * div))
             iz = int(round(kp[2] * div))
-
             if (i == 0) or (i == npts and iseg == len(labels) - 2):
                 lbl = l1 if i == 0 else l2
                 erange = '-8.00 8.00' if (iseg == 0 and i == 0) else ''
@@ -320,19 +361,17 @@ with open(f"{case}.klist_band", 'w') as f:
     f.write("END\n")
 
 total = sum(1 for _ in open(f"{case}.klist_band") if _.strip() and _.strip() != 'END')
-print(f"  wrote {case}.klist_band: {total} k-points, {npts} per segment")
+print(f"  {total} k-points ({npts}/segment)")
 KBEOF
 fi
 
 # ============================================================
-#  Step 2: Generate initial .win file
+#  Step 2: Generate initial .win
 # ============================================================
-info "Step 2: Generating initial .win"
+step "2" "Generating Wannier90 input (.win)"
 
 winfile=$file.win
 
-# Generate .win from Wien2k files (struct + klist + klist_band)
-# Uses dummy num_wann = num_bands (PDWF will patch the real value)
 python3 - "$file" "$bmin" "$bmax" <<'PYEOF'
 import sys, os, re, math
 import numpy as np
@@ -341,24 +380,16 @@ case = sys.argv[1]
 bmin, bmax = int(sys.argv[2]), int(sys.argv[3])
 nb = bmax - bmin + 1
 
-# ----- Parse struct file -----
+# ----- Parse struct -----
 with open(f"{case}.struct") as f:
     slines = f.readlines()
 
 lattype = slines[1][0:1].strip()
-# nneq: Wien2k uses "NONEQUIV.ATOMS:  2" or "NONEQUIV.ATOMS   2"
 nneq_match = re.search(r'ATOMS[:\s]+(\d+)', slines[1])
 nneq = int(nneq_match.group(1)) if nneq_match else int(slines[1].split()[3])
 latline = slines[3]
 a = [float(latline[i:i+10]) for i in range(0, 60, 10)]
 
-# Parse atoms (inequivalent only)
-# Wien2k struct format per inequivalent atom:
-#   ATOM line (position)        1 line
-#   MULT line                   1 line
-#   equiv atom positions        (mult-1) lines
-#   element/RMT line            1 line
-#   LOCAL ROT MATRIX            3 lines
 atoms = []
 i = 4
 for iat in range(nneq):
@@ -366,19 +397,14 @@ for iat in range(nneq):
     x = float(pos[12:22])
     y = float(pos[25:35])
     z = float(pos[38:48])
-    i += 1  # now on MULT line
+    i += 1
     mult = int(slines[i].split('=')[1].split()[0])
-    i += 1  # past MULT line
-    i += (mult - 1)  # skip equivalent atom position lines
-    i += 1  # element/RMT line
-    i += 3  # LOCAL ROT MATRIX (3 lines)
+    i += 1 + (mult - 1) + 1 + 3  # MULT + equiv + element + rot
     atoms.append((iat + 1, x, y, z, mult))
 
 # ----- Primitive lattice vectors (Bohr) -----
 a1, a2, a3 = a[0], a[1], a[2]
-alpha = a[3] * math.pi / 180
-beta  = a[4] * math.pi / 180
-gamma = a[5] * math.pi / 180
+alpha, beta, gamma = [a[i+3] * math.pi / 180 for i in range(3)]
 
 if lattype == 'F':
     prim = [[0, a2/2, a3/2], [a1/2, 0, a3/2], [a1/2, a2/2, 0]]
@@ -392,35 +418,38 @@ elif lattype == 'R':
     ty1 = a1 * math.sqrt((1 - math.cos(alpha)) / 6)
     prim = [[tx, -ty1, tz/3], [0, 2*ty1, tz/3], [-tx, -ty1, tz/3]]
 elif lattype == 'C':
-    # CXY, CXZ, CYZ — Wien2k uses different subtypes
     prim = [[a1/2, -a2/2, 0], [a1/2, a2/2, 0], [0, 0, a3]]
-else:  # P
-    sg = math.sin(gamma)
-    cg = math.cos(gamma)
-    cb = math.cos(beta)
-    ca = math.cos(alpha)
+else:
+    sg, cg = math.sin(gamma), math.cos(gamma)
+    cb, ca = math.cos(beta), math.cos(alpha)
     prim = [
-        [a1, 0, 0],
-        [a2*cg, a2*sg, 0],
+        [a1, 0, 0], [a2*cg, a2*sg, 0],
         [a3*cb, a3*(ca - cb*cg)/sg,
          a3*math.sqrt(1 - ca**2 - cb**2 - cg**2 + 2*ca*cb*cg)/sg]
     ]
 
-# ----- Parse klist for k-mesh -----
-# Wien2k klist format varies: 5-char or 10-char integer fields.
-# Robust approach: split on whitespace after the 10-char label.
-kpoints = []
-mp_grid = [1, 1, 1]
+# ----- conv_rec for k-point transformation -----
+if lattype == 'F':
+    conv_rec = np.array([[0, 0.5, 0.5], [0.5, 0, 0.5], [0.5, 0.5, 0]])
+elif lattype == 'B':
+    conv_rec = np.array([[-0.5, 0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, -0.5]])
+elif lattype in ('H', 'R', 'P', 'S'):
+    conv_rec = np.eye(3)
+elif lattype == 'C':
+    conv_rec = np.array([[0.5, 0.5, 0], [-0.5, 0.5, 0], [0, 0, 1]])
+else:
+    conv_rec = np.eye(3)
+
+# ----- Parse klist -----
+kpoints, mp_grid = [], [1, 1, 1]
 with open(f"{case}.klist") as f:
     for line in f:
         s = line.strip()
-        if s.startswith('END') or len(s) == 0:
+        if s.startswith('END') or not s:
             break
-        # First line may contain "k, div: ( nx ny nz )"
         div_match = re.search(r'div:\s*\(\s*(\d+)\s+(\d+)\s+(\d+)\s*\)', line)
         if div_match:
             mp_grid = [int(div_match.group(i)) for i in (1, 2, 3)]
-        # Parse k-point: label(10) then integers
         body = line[10:].split()
         if len(body) < 4:
             continue
@@ -430,9 +459,6 @@ with open(f"{case}.klist") as f:
         except ValueError:
             continue
 
-nk = len(kpoints)
-
-# Fallback: try outputkgen for mp_grid if not found in klist
 if mp_grid == [1, 1, 1]:
     kgenfile = f"{case}.outputkgen"
     if os.path.exists(kgenfile):
@@ -441,44 +467,31 @@ if mp_grid == [1, 1, 1]:
                 if 'DIVISION' in line.upper():
                     nums = re.findall(r'\d+', line)
                     if len(nums) >= 3:
-                        mp_grid = [int(nums[0]), int(nums[1]), int(nums[2])]
+                        mp_grid = [int(n) for n in nums[:3]]
                         break
 
-# ----- Write .win file -----
+# ----- Write .win -----
+nat = sum(m for _, _, _, _, m in atoms)
 with open(f"{case}.win", 'w') as f:
-    # num_wann placeholder — set to num_atoms for simplicity.
-    # wannier90 -pp only needs k-mesh for .nnkp; PDWF patches the
-    # real num_wann, num_bands, projections, and windows afterward.
-    nat = sum(mult for _, _, _, _, mult in atoms)
     f.write(f"num_bands       = {nb}\n")
     f.write(f"num_wann        = {nat}\n\n")
-
-    f.write(f"!!! Iteration parameters !!!\n")
     f.write(f"iprint                = 1\n")
     f.write(f"num_iter              = 10000\n")
     f.write(f"num_print_cycles      =   100\n")
     f.write(f"conv_window           = 3\n")
     f.write(f"dis_num_iter          = 10000\n\n")
-
-    f.write(f"!!! Post-processing !!!\n")
     f.write(f"write_proj             = .true.\n")
     f.write(f"write_xyz              = .true.\n")
     f.write(f"translate_home_cell    = .true.\n")
     f.write(f"write_hr               = .true.\n\n")
-
-    f.write(f"!!! Band structure !!!\n")
     f.write(f"bands_num_points       = 50\n\n")
 
-    # Unit cell (Bohr)
-    f.write(f"begin unit_cell_cart\n")
-    f.write(f"Bohr\n")
+    f.write(f"begin unit_cell_cart\nBohr\n")
     for v in prim:
         f.write(f"  {v[0]:14.8f} {v[1]:14.8f} {v[2]:14.8f}\n")
     f.write(f"end unit_cell_cart\n\n")
 
-    # Atoms in Cartesian (Bohr)
-    f.write(f"begin atoms_cart\n")
-    f.write(f"Bohr\n")
+    f.write(f"begin atoms_cart\nBohr\n")
     for iat, x, y, z, mult in atoms:
         cx = x*prim[0][0] + y*prim[1][0] + z*prim[2][0]
         cy = x*prim[0][1] + y*prim[1][1] + z*prim[2][1]
@@ -486,104 +499,79 @@ with open(f"{case}.win", 'w') as f:
         f.write(f"  {iat:4d}  {cx:14.8f}  {cy:14.8f}  {cz:14.8f}\n")
     f.write(f"end atoms_cart\n\n")
 
-    # Wien2k conventional → primitive k-point transform
-    # Used for both kpoint_path and k-mesh
-    if lattype == 'F':
-        conv_rec = np.array([[0, 0.5, 0.5], [0.5, 0, 0.5], [0.5, 0.5, 0]])
-    elif lattype == 'B':
-        conv_rec = np.array([[-0.5, 0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, -0.5]])
-    elif lattype == 'H':
-        conv_rec = np.eye(3)
-    elif lattype == 'R':
-        conv_rec = np.eye(3)  # placeholder
-    elif lattype == 'C':
-        conv_rec = np.array([[0.5, 0.5, 0], [-0.5, 0.5, 0], [0, 0, 1]])
-    else:  # P
-        conv_rec = np.eye(3)
-
-    # Band path (optional, from klist_band)
-    # Wien2k klist_band uses conventional cell fractional coordinates.
-    # Wannier90 needs primitive cell fractional coordinates.
-    # Transform using conv_rec (same matrix used for k-mesh below).
+    # Band path (conv_rec transform from Wien2k conventional to primitive)
     bandfile = f"{case}.klist_band"
     if os.path.exists(bandfile):
-        f.write(f"bands_plot = T\n")
-        f.write(f"begin kpoint_path\n")
         kpath = []
         with open(bandfile) as bf:
             for line in bf:
                 label = line[0:10].strip()
                 if not label or label == 'END':
                     continue
+                body = line[10:].split()
+                if len(body) < 4:
+                    continue
                 try:
-                    body = line[10:].split()
-                    if len(body) < 4:
-                        continue
                     ix, iy, iz = int(body[0]), int(body[1]), int(body[2])
                     idv = int(body[3])
                     if label and not label.replace('-','').replace('.','').isdigit():
-                        k_conv = np.array([ix/idv, iy/idv, iz/idv])
-                        k_prim = conv_rec @ k_conv
+                        k_prim = conv_rec @ np.array([ix/idv, iy/idv, iz/idv])
                         kpath.append((label, *k_prim))
                 except (ValueError, IndexError):
                     continue
-        for j in range(len(kpath) - 1):
-            l1, x1, y1, z1 = kpath[j]
-            l2, x2, y2, z2 = kpath[j + 1]
-            f.write(f"  {l1:6s} {x1:9.5f} {y1:9.5f} {z1:9.5f}"
-                    f"    {l2:6s} {x2:9.5f} {y2:9.5f} {z2:9.5f}\n")
-        f.write(f"end kpoint_path\n\n")
+        if len(kpath) >= 2:
+            f.write(f"bands_plot = T\nbegin kpoint_path\n")
+            for j in range(len(kpath) - 1):
+                l1, x1, y1, z1 = kpath[j]
+                l2, x2, y2, z2 = kpath[j + 1]
+                f.write(f"  {l1:6s} {x1:9.5f} {y1:9.5f} {z1:9.5f}"
+                        f"    {l2:6s} {x2:9.5f} {y2:9.5f} {z2:9.5f}\n")
+            f.write(f"end kpoint_path\n\n")
 
-    # Dummy projections — one s orbital per atom (= num_wann = nat).
-    # Only needed for wannier90 -pp to generate .nnkp.
-    # PDWF replaces with real projections and num_wann afterward.
-    # Must emit one projection per TOTAL atom (including equivalents).
-    f.write(f"guiding_centres = T\n")
-    f.write(f"begin projections\n")
+    # Dummy projections (PDWF patches later)
+    f.write(f"guiding_centres = T\nbegin projections\n")
     for iat, x, y, z, mult in atoms:
         for mu in range(mult):
             f.write(f"  f={x:.8f},{y:.8f},{z:.8f}:s\n")
     f.write(f"end projections\n\n")
 
-    # K-mesh: transform from Wien2k conventional to primitive fractional
-    # using conv_rec defined above.
+    # K-mesh (transformed)
     f.write(f"mp_grid : {mp_grid[0]} {mp_grid[1]} {mp_grid[2]}\n")
     f.write(f"begin kpoints\n")
     for kx, ky, kz in kpoints:
-        kc = np.array([kx, ky, kz])
-        kp = conv_rec @ kc
+        kp = conv_rec @ np.array([kx, ky, kz])
         f.write(f"  {kp[0]:18.15f}  {kp[1]:18.15f}  {kp[2]:18.15f}\n")
     f.write(f"end kpoints\n")
 
-print(f"  wrote {case}.win ({nk} k-points, mp_grid={mp_grid}, "
-      f"num_bands={nb})")
+nk = len(kpoints)
+print(f"  {nk} k-points, mp_grid={mp_grid}, {nb} bands")
 PYEOF
 
 [[ -s $winfile ]] || croak "failed to generate $winfile"
+done_msg "$winfile"
 
-[[ $norun ]] && { info "stopping (-norun)"; exit 0; }
+[[ ${norun:-} ]] && { info "stopping (-norun)"; exit 0; }
 
 # ============================================================
-#  Step 3: Run wannier90 -pp  →  .nnkp
+#  Step 3: Run wannier90 -pp → .nnkp
 # ============================================================
-info "Step 3: Running wannier90 -pp"
+step "3" "Running wannier90 -pp"
 
-[[ -n $W90_BIN ]] || croak "cannot find wannier90.x (use -w90exe /path/to/wannier90.x)"
+[[ -n $W90_BIN ]] || croak "cannot find wannier90.x (use -w90exe)"
 "$W90_BIN" -pp "$file" 2>&1
 [[ $? -eq 0 && -s $file.nnkp ]] || croak "wannier90 -pp failed (check $file.wout)"
-info "created $file.nnkp"
+done_msg "$file.nnkp"
 
 # ============================================================
 #  Step 4: Run w2w/w2wc in PDWF mode
 # ============================================================
-[[ -n $W2W_BIN ]] || croak "cannot find $w2w_exec (use -w2wdir /path/to/SRC_w2w)"
-info "Step 4: Running $w2w_exec (PDWF mode)"
+step "4" "Running $w2w_exec (PDWF mode)"
 
-# Create def file for w2w
-deffile=w2w.def
-cat > "$deffile" <<DEFEOF
-  5,'$file.inwf${updn}',       'old',    'formatted',  0
-  6,'$file.outputwf${updn}',   'unknown','formatted',  0
+[[ -n $W2W_BIN ]] || croak "cannot find $w2w_exec (use -w2wdir)"
+
+cat > w2w.def <<DEFEOF
+  5,'$file.inwf${updn:-}',       'old',    'formatted',  0
+  6,'$file.outputwf${updn:-}',   'unknown','formatted',  0
   7,'$file.amn',               'unknown','formatted',  0
   8,'$file.mmn',               'unknown','formatted',  0
  10,'$vecfile',                'old','unformatted',     0
@@ -595,36 +583,31 @@ cat > "$deffile" <<DEFEOF
  51,'$file.fermi',             'old',    'formatted',  0
 DEFEOF
 
-"$W2W_BIN" "$deffile" 2>&1
-rc=$?
+"$W2W_BIN" w2w.def 2>&1
+[[ $? -eq 0 ]] || croak "$w2w_exec failed (check $file.outputwf${updn:-})"
 
-if [[ $rc -ne 0 ]]; then
-    croak "$w2w_exec failed (check $file.outputwf${updn})"
-fi
-
-# Show PDWF results
-outfile=$file.outputwf${updn}
+# Show summary
+outfile=$file.outputwf${updn:-}
 if grep -q "PDWF" "$outfile" 2>/dev/null; then
-    info "$w2w_exec completed in PDWF mode"
     echo
-    grep -A20 "PDWF Band Classification" "$outfile" 2>/dev/null | head -25
+    grep "PDWF:" "$outfile" | while read -r line; do echo "  $line"; done
     echo
-    grep -A10 "Wannier90 Window" "$outfile" 2>/dev/null | head -12
-else
-    warn "PDWF output not found in $outfile"
+    grep -A20 "PDWF Band Classification" "$outfile" | head -25
+    echo
+    grep -A8 "Wannier90 Window" "$outfile" | head -10
 fi
 
-# Verify .win was patched
+# Verify .win patched
 if grep -q "PDWF auto-generated" "$winfile" 2>/dev/null; then
-    info ".win patched with PDWF parameters"
+    done_msg ".win patched with PDWF parameters"
 else
-    warn ".win was NOT patched — check $file.pdwf_windows"
+    warn ".win NOT patched — check $file.pdwf_windows"
 fi
 
 # ============================================================
-#  Step 5: Run wannier90 for Wannierization
+#  Step 5: Run wannier90
 # ============================================================
-info "Step 5: Running wannier90"
+step "5" "Running wannier90 (Wannierization + band interpolation)"
 
 "$W90_BIN" "$file" 2>&1
 [[ $? -eq 0 ]] || croak "wannier90 failed (check $file.wout)"
@@ -633,23 +616,41 @@ info "Step 5: Running wannier90"
 woutfile=$file.wout
 if grep -q "Final Spread" "$woutfile" 2>/dev/null; then
     echo
-    info "=== Wannier90 Results ==="
+    echo -e "  ${BOLD}=== Wannier90 Results ===${NC}"
     grep "Omega" "$woutfile" | tail -4 | while read -r line; do
-        info "$line"
+        echo "  $line"
     done
     echo
-    info "PDWF workflow completed successfully"
-    info "Output files:"
-    info "  $file.amn           projection matrix"
-    info "  $file.mmn           overlap matrix"
-    info "  $file.eig           eigenvalues"
-    info "  $file.win           Wannier90 input (PDWF-patched)"
-    info "  ${file}_hr.dat      Hamiltonian in WF basis"
-    [[ -s ${file}_band.dat ]] && \
-        info "  ${file}_band.dat    interpolated band structure"
-    info "  $file.pdwf_windows  standalone window parameters"
-else
-    warn "wannier90 completed but Final Spread not found in $woutfile"
 fi
+
+# ============================================================
+#  Step 6: Band comparison (if spaghetti available)
+# ============================================================
+if [[ -s $file.spaghetti_ene && -s ${file}_band.dat ]]; then
+    step "6" "Generating band comparison plot"
+    if [[ -x "$bin/compare_bands.py" ]]; then
+        python3 "$bin/compare_bands.py" "$file" -dir . 2>&1
+    elif command -v python3 &>/dev/null; then
+        info "compare_bands.py not found at $bin — skipping plot"
+    fi
+fi
+
+# ============================================================
+#  Summary
+# ============================================================
+echo
+echo -e "${BOLD}PDWF workflow completed successfully${NC}"
+echo
+echo "  Output files:"
+echo "    $file.amn             projection matrix"
+echo "    $file.mmn             overlap matrix"
+echo "    $file.eig             eigenvalues"
+echo "    $file.win             Wannier90 input (PDWF-patched)"
+echo "    ${file}_hr.dat        Hamiltonian in WF basis"
+[[ -s ${file}_band.dat ]] && \
+echo "    ${file}_band.dat      interpolated band structure"
+echo "    $file.pdwf_windows    standalone window parameters"
+echo "    $file.outputwf        PDWF diagnostics"
+echo
 
 exit 0
