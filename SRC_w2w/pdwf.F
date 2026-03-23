@@ -485,14 +485,131 @@ end subroutine classify_bands
 
 
 !-----------------------------------------------------------------------
+! Detect band manifolds from energy gaps.
+!
+! Groups bands into connected manifolds separated by energy gaps
+! above a threshold. Uses the 75th percentile of inter-band gaps
+! as the threshold (adapted from LCAO-to-Wannier methodology).
+!
+! Output: manifold_id(Nb) — integer label 1..Nmanifold for each band.
+! Also prints diagnostic table to unit_out.
+!-----------------------------------------------------------------------
+subroutine detect_manifolds(eigvals, band_class, Nb, Nk, &
+     &                      manifold_id, n_manifolds)
+  real(R8), intent(in)  :: eigvals(Nb, Nk)
+  integer,  intent(in)  :: band_class(Nb)
+  integer,  intent(in)  :: Nb, Nk
+  integer,  intent(out) :: manifold_id(Nb)
+  integer,  intent(out) :: n_manifolds
+
+  real(R8) :: e_avg(Nb), gaps(Nb-1), gap_thresh, tmp
+  integer  :: ib, ig, n_active, jtmp, imf
+  integer  :: mf_start, mf_end, mf_nfrozen, mf_ndisent
+  real(R8), allocatable :: gaps_sorted(:)
+
+  ! Compute k-averaged energies
+  do ib = 1, Nb
+     e_avg(ib) = sum(eigvals(ib,:)) / dble(Nk)
+  end do
+
+  ! Compute gaps between consecutive bands (all bands, not just active)
+  n_active = 0
+  do ib = 1, Nb - 1
+     gaps(ib) = e_avg(ib + 1) - e_avg(ib)
+     if (band_class(ib) /= BAND_EXCLUDED) n_active = n_active + 1
+  end do
+
+  ! Compute 75th percentile of gaps among non-excluded consecutive pairs
+  ig = 0
+  allocate(gaps_sorted(Nb - 1))
+  do ib = 1, Nb - 1
+     if (band_class(ib) /= BAND_EXCLUDED .or. &
+          band_class(ib+1) /= BAND_EXCLUDED) then
+        ig = ig + 1
+        gaps_sorted(ig) = gaps(ib)
+     end if
+  end do
+
+  ! Sort
+  do ib = 2, ig
+     tmp = gaps_sorted(ib)
+     jtmp = ib - 1
+     do while (jtmp >= 1 .and. gaps_sorted(jtmp) > tmp)
+        gaps_sorted(jtmp + 1) = gaps_sorted(jtmp)
+        jtmp = jtmp - 1
+     end do
+     gaps_sorted(jtmp + 1) = tmp
+  end do
+
+  ! 75th percentile
+  if (ig > 0) then
+     jtmp = max(1, min(ig, nint(0.75d0 * dble(ig))))
+     gap_thresh = gaps_sorted(jtmp)
+  else
+     gap_thresh = 1.0d30
+  end if
+  deallocate(gaps_sorted)
+
+  ! Assign manifold IDs: new manifold when gap > threshold
+  manifold_id(1) = 1
+  n_manifolds = 1
+  do ib = 2, Nb
+     if (gaps(ib-1) > gap_thresh) then
+        n_manifolds = n_manifolds + 1
+     end if
+     manifold_id(ib) = n_manifolds
+  end do
+
+  ! Print manifold structure
+  write(unit_out, *)
+  write(unit_out, '(A,F8.4,A)') &
+       ' PDWF: manifold gap threshold = ', gap_thresh, ' eV (75th pctl)'
+  write(unit_out, '(A,I3,A)') &
+       ' PDWF: detected ', n_manifolds, ' band manifolds'
+  write(unit_out, *)
+  write(unit_out, '(A)') &
+       '  Manifold  Bands      E_range (eV)     Frozen  Disent  Excl'
+  write(unit_out, '(A)') &
+       '  --------  ---------  ---------------  ------  ------  ----'
+
+  imf = 1
+  mf_start = 1
+  do ib = 2, Nb + 1
+     if (ib > Nb .or. manifold_id(ib) /= imf) then
+        mf_end = ib - 1
+        ! Count classifications in this manifold
+        mf_nfrozen = 0; mf_ndisent = 0; ig = 0
+        do jtmp = mf_start, mf_end
+           if (band_class(jtmp) == BAND_FROZEN) mf_nfrozen = mf_nfrozen + 1
+           if (band_class(jtmp) == BAND_DISENTANGLE) mf_ndisent = mf_ndisent + 1
+           if (band_class(jtmp) == BAND_EXCLUDED) ig = ig + 1
+        end do
+        write(unit_out, '(I6, 4X, I3, A, I3, 4X, F7.2, A, F7.2, 2X, I4, 4X, I4, 4X, I3)') &
+             imf, mf_start, '-', mf_end, &
+             e_avg(mf_start), ' to', e_avg(mf_end), &
+             mf_nfrozen, mf_ndisent, ig
+        if (ib <= Nb) then
+           imf = manifold_id(ib)
+           mf_start = ib
+        end if
+     end if
+  end do
+  write(unit_out, *)
+end subroutine detect_manifolds
+
+
+!-----------------------------------------------------------------------
 ! Determine energy windows from eigenvalues and band classification.
 !
-! The frozen window covers ONLY frozen bands (±0.5 eV padding).
+! The frozen window covers ONLY frozen bands (+-0.5 eV padding).
 ! The disentangle window covers ALL active bands, frozen + disentangle
-! (±2.0 eV padding). This guarantees:
+! (+-2.0 eV padding). This guarantees:
 !   1. Frozen window is ALWAYS strictly narrower than disentangle
 !   2. Disentangle bands provide gauge freedom for optimization
 !   3. The Wannier90 num_wann constraint is satisfied
+!
+! If manifold_id is provided, the frozen window is adjusted to avoid
+! splitting a manifold: it snaps to manifold boundaries.
 !-----------------------------------------------------------------------
 subroutine determine_windows(eigvals, band_class, Nb, Nk, n_wann, &
      &                       margin, froz_min, froz_max, dis_min, &
@@ -730,6 +847,8 @@ subroutine pdwf_compute(stru, inwf, targets, Nb, Nk, &
   real(R8) :: froz_min, froz_max, dis_min, dis_max
   logical  :: has_frozen, has_disent
   integer  :: n_frozen, n_disent, n_excluded
+  integer,  allocatable :: manifold_id(:)
+  integer  :: n_manifolds
 
   integer :: i, ii, i3, l, m, m1, mu_eq, n, idx, ibb, iscf
   integer :: jatom, jlo, jneq, irf, lda, ldb, ldc
@@ -741,6 +860,7 @@ subroutine pdwf_compute(stru, inwf, targets, Nb, Nk, &
   allocate(proj_k(Nb, Nk))
   allocate(proj_avg(Nb))
   allocate(band_class(Nb))
+  allocate(manifold_id(Nb))
 
   A_full  = (0.0d0, 0.0d0)
   proj_k  = 0.0d0
@@ -944,6 +1064,11 @@ subroutine pdwf_compute(stru, inwf, targets, Nb, Nk, &
   write(unit_out, '(A,I4,A)') ' PDWF: ', n_disent,   ' disentangle bands'
   write(unit_out, '(A,I4,A)') ' PDWF: ', n_excluded,  ' excluded bands'
 
+  ! ------ Phase 3b: Manifold detection ------
+
+  call detect_manifolds(eigvals, band_class, Nb, Nk, &
+       &                manifold_id, n_manifolds)
+
   ! ------ Phase 4: Determine energy windows ------
 
   call determine_windows(eigvals, band_class, Nb, Nk, &
@@ -978,7 +1103,7 @@ subroutine pdwf_compute(stru, inwf, targets, Nb, Nk, &
   band_class_out  = band_class
 
   ! Cleanup
-  deallocate(A_full, proj_k, proj_avg, band_class)
+  deallocate(A_full, proj_k, proj_avg, band_class, manifold_id)
 end subroutine pdwf_compute
 
 
