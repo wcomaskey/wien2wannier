@@ -219,82 +219,139 @@ info "files: energy=$enefile vector=$vecfile vsp=$vspfile"
 # ============================================================
 #  Step 0: Auto-detect band window
 # ============================================================
+# Strategy:
+#   1. Read .in1 STOP LO energies to identify semicore boundary
+#   2. Read eigenvalues at Gamma from .energy file
+#   3. Set bmin = first band ABOVE the semicore boundary
+#   4. Set bmax = total number of bands
+#
+# The .in1 semicore energies are authoritative (set by Wien2k's
+# init_lapw). Eigenvalue gaps are used as fallback if no .in1.
+
+nneq=$(sed -n '2p' "$file.struct" | grep -o 'ATOMS[: ]*[0-9]*' | grep -o '[0-9]*$')
+[[ -z $nneq ]] && nneq=1
+ef_ry=$(cat "$fermifile")
+
+# Find .in1 file (try in1c, in1, with spin suffixes)
+in1file=""
+for suffix in "c" ""; do
+    for sp in "${updn:-}" ""; do
+        candidate="$file.in1${suffix}${sp}"
+        [[ -s "$candidate" ]] && { in1file="$candidate"; break 2; }
+    done
+done
+
+# Extract semicore LO energies from .in1
+semicore_cutoff_ev=""
+if [[ -n $in1file && -s $in1file ]]; then
+    semicore_cutoff_ev=$(python3 -c "
+ef_ry = $ef_ry
+shallowest = None
+with open('$in1file') as f:
+    for line in f:
+        if 'STOP' in line:
+            parts = line.split()
+            e_ry = float(parts[1])
+            e_rel = (e_ry - ef_ry) * 13.605693
+            if shallowest is None or e_rel > shallowest:
+                shallowest = e_rel
+if shallowest is not None:
+    print(f'{shallowest:.4f}')
+else:
+    print('')
+" 2>/dev/null)
+    [[ -n $semicore_cutoff_ev ]] && \
+        info "semicore boundary from .in1: ${semicore_cutoff_ev} eV (rel to E_F)"
+fi
+
 if [[ -z $bmin || -z $bmax ]]; then
-    # Auto-detect band window from energy file.
-    # Reads eigenvalues at first k-point, finds semicore gap to set bmin,
-    # and uses total band count for bmax.
-    nneq=$(sed -n '2p' "$file.struct" | grep -o 'ATOMS[: ]*[0-9]*' | grep -o '[0-9]*$')
-    [[ -z $nneq ]] && nneq=1
-
-    # Read Fermi energy
-    ef_ry=$(cat "$fermifile")
-
-    # Parse eigenvalues at first k-point and auto-detect bmin/bmax
     read_result=$(python3 -c "
-import sys
-
 nneq = $nneq
 ef_ry = $ef_ry
+semicore_cutoff = '${semicore_cutoff_ev}'
 
-# Read energy file: skip 2*nneq header lines, then first k-point
 with open('$enefile') as f:
     for _ in range(2 * nneq):
         f.readline()
-    # k-point header: columns 68-73 = N, 74-79 = NEN
     header = f.readline()
     nen = int(header[73:79])
-    eigs = []
+    eigs_ry = []
     for i in range(nen):
         parts = f.readline().split()
-        eigs.append(float(parts[1]))  # eigenvalue in Ry
+        eigs_ry.append(float(parts[1]))
 
-# Convert to eV relative to E_F
-eigs_ev = [(e - ef_ry) * 13.605693 for e in eigs]
+eigs_ev = [(e - ef_ry) * 13.605693 for e in eigs_ry]
 
-# Auto-detect bmin: skip core/semicore states.
-# Strategy: find LAST gap > 15 eV below E_F (clear core boundary).
-# For smaller gaps (5-15 eV), only skip if the bands below are
-# deep (< -20 eV). This ensures valence bands like Mg 2s at
-# -12 eV or Ga 3d at -15 eV are included.
-# The PDWF classifier in w2w handles any remaining semicore
-# exclusion via the projectability-based detector.
-best_gap, best_idx = 0, 0
-for i in range(len(eigs_ev) - 1):
-    if eigs_ev[i] < 0:
-        gap = eigs_ev[i+1] - eigs_ev[i]
-        if gap > 15.0:
-            # Large gap: always skip (core/semicore)
-            if (i + 1) > best_idx:
-                best_gap = gap
-                best_idx = i + 1
-        elif gap > 5.0 and eigs_ev[i] < -20.0:
-            # Medium gap deep below E_F: also skip
-            if (i + 1) > best_idx:
-                best_gap = gap
-                best_idx = i + 1
+# Determine bmin: skip core and semicore bands.
+#
+# Strategy: combine .in1 STOP LO info with eigenvalue gaps.
+# The .in1 tells us semicore states EXIST; the eigenvalue gaps
+# tell us WHERE the boundary actually is in the band structure.
+#
+# 1. If .in1 has STOP LOs: find the energy gap that separates
+#    semicore-like bands (near the STOP LO energy) from valence.
+#    'Near' means within 15 eV above the STOP LO energy, since
+#    crystal-field effects can shift eigenvalues significantly.
+#
+# 2. If no .in1: use largest gap > 5 eV below E_F.
 
-bmin = best_idx + 1 if best_idx > 0 else 1
-bmax = len(eigs)
+bmin = 1
+method = 'none'
 
-print(f'{bmin} {bmax} {best_gap:.1f}')
+if semicore_cutoff:
+    sc_ev = float(semicore_cutoff)
+    # Find the last band that could be semicore:
+    # any band with E < sc_ev + 15 eV (generous crystal-field margin)
+    last_semicore = 0
+    for i in range(len(eigs_ev)):
+        if eigs_ev[i] < sc_ev + 15.0:
+            last_semicore = i
+
+    # Now find the gap ABOVE the last semicore band
+    if last_semicore > 0 and last_semicore < len(eigs_ev) - 1:
+        gap = eigs_ev[last_semicore + 1] - eigs_ev[last_semicore]
+        bmin = last_semicore + 2  # 1-indexed, first band after gap
+        method = f'in1+gap (semicore bands 1-{last_semicore+1}, gap={gap:.1f} eV)'
+    else:
+        bmin = 1
+        method = 'in1 (no clear boundary found)'
+else:
+    # Fallback: gap-based detection
+    best_gap, best_idx = 0, 0
+    for i in range(len(eigs_ev) - 1):
+        if eigs_ev[i] < 0:
+            gap = eigs_ev[i+1] - eigs_ev[i]
+            if gap > 5.0 and (gap > 15.0 or eigs_ev[i] < -20.0):
+                if (i + 1) > best_idx:
+                    best_gap = gap
+                    best_idx = i + 1
+    if best_idx > 0:
+        bmin = best_idx + 1
+        method = f'gap ({best_gap:.1f} eV)'
+
+bmax = len(eigs_ry)
+
+print(f'{bmin} {bmax} {method}')
+if bmin > 1:
+    print(f'  band {bmin-1}: E={eigs_ev[bmin-2]:.2f} eV (excluded)')
+    print(f'  band {bmin}: E={eigs_ev[bmin-1]:.2f} eV (first included)')
 " 2>&1)
 
-    bmin_auto=$(echo "$read_result" | awk '{print $1}')
-    bmax_auto=$(echo "$read_result" | awk '{print $2}')
-    gap_auto=$(echo "$read_result" | awk '{print $3}')
+    bmin_auto=$(echo "$read_result" | head -1 | awk '{print $1}')
+    bmax_auto=$(echo "$read_result" | head -1 | awk '{print $2}')
+    method_auto=$(echo "$read_result" | head -1 | cut -d' ' -f3-)
 
-    [[ -z $bmin_auto ]] && croak "could not auto-detect band window"
+    [[ -z $bmin_auto || -z $bmax_auto ]] && croak "could not auto-detect band window"
 
     [[ -z $bmin ]] && bmin=$bmin_auto
     [[ -z $bmax ]] && bmax=$bmax_auto
 
-    if [[ "$gap_auto" != "0.0" ]]; then
-        info "auto-detected: $bmax_auto bands, semicore gap = ${gap_auto} eV"
-        info "band window: [$bmin, $bmax] (skipping core/semicore)"
-    else
-        info "auto-detected: $bmax_auto bands, no semicore gap"
-        info "band window: [$bmin, $bmax]"
-    fi
+    info "band window: [$bmin, $bmax] ($bmax_auto total bands)"
+    info "bmin method: $method_auto"
+    # Print boundary info
+    echo "$read_result" | tail -n +2 | while read -r line; do
+        [[ -n "$line" ]] && info "$line"
+    done
 fi
 
 nb=$((bmax - bmin + 1))

@@ -234,8 +234,8 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
   real(R8), intent(in)  :: eigvals(Nb, Nk)
   real(R8), intent(in)  :: proj_avg(Nb)
   integer,  intent(in)  :: Nb, Nk
-  real(R8), intent(in)  :: pctl_high  ! frozen percentile (0-1), e.g. 0.60
-  real(R8), intent(in)  :: pctl_low   ! exclusion percentile (0-1), e.g. 0.15
+  real(R8), intent(in)  :: pctl_high  ! frozen percentile (0-1)
+  real(R8), intent(in)  :: pctl_low   ! exclusion percentile (0-1)
   integer,  intent(out) :: band_class(Nb)
   integer,  intent(out) :: n_frozen, n_disent, n_excluded
 
@@ -248,7 +248,7 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
   real(R8), allocatable :: r_sorted(:)
 
   real(R8) :: sigma, sigma_below, sigma_above, e_deepest
-  ! Minimum gap (eV) to identify core/semicore boundary
+  ! Minimum gap (eV) for fallback semicore detection
   real(R8), parameter :: GAP_THRESH = 5.0d0
   ! Minimum sigma (eV) to prevent over-aggressive weighting
   real(R8), parameter :: SIGMA_MIN = 3.0d0
@@ -264,7 +264,11 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
      e_band_avg(ib) = sum(eigvals(ib,:)) / dble(Nk)
   end do
 
-  ! ---- Phase 1: Semicore exclusion via energy gaps ----
+  ! ---- Phase 1: Semicore safety net ----
+  ! Primary semicore exclusion is handled by bmin in pdwf_lapw
+  ! (using .in1 STOP LO energies). This is a fallback for cases
+  ! where bmin wasn't set optimally — detect large energy gaps
+  ! below E_F and exclude bands below them.
   semicore_top = 0
   max_gap = 0.0d0
   do ib = 1, Nb - 1
@@ -276,7 +280,6 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
         end if
      end if
   end do
-
   if (semicore_top > 0) then
      write(unit_out, '(A,I3,A,F8.2,A)') &
           ' PDWF: excluding bands 1-', semicore_top, &

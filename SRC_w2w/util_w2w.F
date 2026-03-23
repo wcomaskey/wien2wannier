@@ -1499,6 +1499,7 @@ module inwfmod
      real(DPk)               :: pdwf_p_high  = 0.60_DPk ! frozen percentile (0-1)
      real(DPk)               :: pdwf_p_low   = 0.15_DPk ! exclusion percentile (0-1)
      real(DPk)               :: pdwf_margin  = 0.50_DPk ! energy window margin (eV)
+     real(DPk)               :: pdwf_semicore_ev = 0.0_DPk ! semicore cutoff (eV rel to E_F, 0=auto)
   end type inwf_t
 
 contains
@@ -1510,7 +1511,7 @@ contains
     integer,      intent(in)  :: lun
     type(inwf_t), intent(out) :: inwf
 
-    integer             :: w, y, NY
+    integer             :: w, y, NY, ios
     real(DPk)           :: re, im
 
     inwf%PDWF = .false.
