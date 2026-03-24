@@ -292,7 +292,7 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
   !   (a) SIGMA_RATIO * sigma_below  (default: half of valence BW)
   !   (b) max extent above E_F of any band that CROSSES E_F
   ! This ensures metallic bands that straddle E_F get full weight
-  ! on both sides, while purely conduction bands still decay faster.
+  ! on both sides, while purely conduction bands decay faster.
   ! Both sigmas have a minimum of SIGMA_MIN.
   e_deepest = 0.0d0
   do ib = semicore_top + 1, Nb
@@ -301,12 +301,10 @@ subroutine classify_bands(eigvals, proj_avg, Nb, Nk, &
   sigma_below = max(SIGMA_MIN, abs(e_deepest))
 
   ! Find max extent above E_F of bands crossing E_F
-  ! A band "crosses" if it has eigenvalues both < 0 and > 0 at diff k-points
   sigma_above = SIGMA_RATIO * sigma_below
   do ib = semicore_top + 1, Nb
      if (minval(eigvals(ib,:)) < 0.0d0 .and. &
           maxval(eigvals(ib,:)) > 0.0d0) then
-        ! This band crosses E_F — its max extent above matters
         sigma_above = max(sigma_above, maxval(eigvals(ib,:)))
      end if
   end do

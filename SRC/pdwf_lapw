@@ -282,52 +282,31 @@ with open('$enefile') as f:
 
 eigs_ev = [(e - ef_ry) * 13.605693 for e in eigs_ry]
 
-# Determine bmin: skip core and semicore bands.
+# Determine bmin: skip only DEEP CORE bands.
 #
-# Strategy: combine .in1 STOP LO info with eigenvalue gaps.
-# The .in1 tells us semicore states EXIST; the eigenvalue gaps
-# tell us WHERE the boundary actually is in the band structure.
+# Strategy: only exclude bands that are clearly deep core —
+# i.e. separated from the rest by a very large gap (> 20 eV).
+# Semicore bands (like Mg 2p) are kept in the window and handled
+# by classify_bands in w2w via its gap-based detector. This is
+# important because the classify_bands gap detector also sets the
+# sigma for the split Gaussian weighting, which needs to see the
+# full valence+semicore spectrum to produce good results.
 #
-# 1. If .in1 has STOP LOs: find the energy gap that separates
-#    semicore-like bands (near the STOP LO energy) from valence.
-#    'Near' means within 15 eV above the STOP LO energy, since
-#    crystal-field effects can shift eigenvalues significantly.
-#
-# 2. If no .in1: use largest gap > 5 eV below E_F.
+# The .in1 STOP LO info is logged for diagnostics but does NOT
+# drive the bmin decision — it's used by classify_bands instead.
 
 bmin = 1
 method = 'none'
-
-if semicore_cutoff:
-    sc_ev = float(semicore_cutoff)
-    # Find the last band that could be semicore:
-    # any band with E < sc_ev + 15 eV (generous crystal-field margin)
-    last_semicore = 0
-    for i in range(len(eigs_ev)):
-        if eigs_ev[i] < sc_ev + 15.0:
-            last_semicore = i
-
-    # Now find the gap ABOVE the last semicore band
-    if last_semicore > 0 and last_semicore < len(eigs_ev) - 1:
-        gap = eigs_ev[last_semicore + 1] - eigs_ev[last_semicore]
-        bmin = last_semicore + 2  # 1-indexed, first band after gap
-        method = f'in1+gap (semicore bands 1-{last_semicore+1}, gap={gap:.1f} eV)'
-    else:
-        bmin = 1
-        method = 'in1 (no clear boundary found)'
-else:
-    # Fallback: gap-based detection
-    best_gap, best_idx = 0, 0
-    for i in range(len(eigs_ev) - 1):
-        if eigs_ev[i] < 0:
-            gap = eigs_ev[i+1] - eigs_ev[i]
-            if gap > 5.0 and (gap > 15.0 or eigs_ev[i] < -20.0):
-                if (i + 1) > best_idx:
-                    best_gap = gap
-                    best_idx = i + 1
-    if best_idx > 0:
-        bmin = best_idx + 1
-        method = f'gap ({best_gap:.1f} eV)'
+# Find the FIRST gap > 20 eV below E_F (deep core boundary).
+# Only skip bands below this gap; semicore bands above it are
+# passed to classify_bands which handles them properly.
+for i in range(len(eigs_ev) - 1):
+    if eigs_ev[i] < 0:
+        gap = eigs_ev[i+1] - eigs_ev[i]
+        if gap > 20.0:
+            bmin = i + 2  # 1-indexed, first band after gap
+            method = f'core gap ({gap:.1f} eV at band {i+1})'
+            break  # take the FIRST large gap only
 
 bmax = len(eigs_ry)
 
