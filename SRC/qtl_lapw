@@ -1,0 +1,900 @@
+#!/bin/bash
+
+### wien2wannier/SRC/qtl_lapw
+###
+###    QTL-guided Wannier90 pipeline for wien2wannier.
+###
+###    Uses Wien2k's orbital-resolved partial charges (case.qtl from
+###    'x lapw2 -qtl') to determine optimal band windows, projections,
+###    and frozen/disentangle classification. Then runs w2w in standard
+###    BOTH mode for AMN/MMN computation.
+###
+###    Compared to PDWF mode (pdwf_lapw), QTL-guided mode:
+###    - Uses properly normalized orbital character (incl. interstitial)
+###    - Correctly identifies semicore bands (>90% single-l character)
+###    - Needs no adaptive sigma or percentile tricks
+###    - Requires 'x lapw2 -qtl' as a prerequisite (run on cluster)
+###
+###    Pipeline:
+###      0.  Parse case.qtl → classify bands → determine windows
+###      1a. Generate .inwf (QTL/BOTH mode with manual projections)
+###      1b. Densify klist_band (if present)
+###      2.  Generate initial .win from Wien2k files
+###      3.  Run wannier90.x -pp → .nnkp
+###      4.  Run w2w BOTH mode → .amn, .mmn, .eig
+###      5.  Run wannier90.x → Wannierization + band interpolation
+###      6.  Generate band comparison plot (if spaghetti available)
+###
+### Copyright 2024-2026 William Comaskey
+
+set -euo pipefail
+
+bin=$(cd "$(dirname "$0")" && pwd)
+name=$(basename "$0")
+file=$(basename "$PWD")
+
+# ============================================================
+#  Usage
+# ============================================================
+usage() {
+    cat <<EOF
+PROGRAM:    $name
+
+PURPOSE:    QTL-guided Wannier90 pipeline for wien2wannier.
+            Uses Wien2k orbital character (case.qtl) for optimal
+            band selection. More accurate than PDWF for systems
+            with significant interstitial charge.
+
+USAGE:      $name [FLAGS] [OPTIONS]
+
+FLAGS:
+  -h          this message
+  -v          verbose output
+  -q          quiet mode
+  -up/-dn     spin-polarized
+  -so         spin-orbit coupling
+  -norun      generate input files only (dry run)
+
+OPTIONS:
+  -f CASE         override case name (default: directory name)
+  -ljmax N        max L for exp(ibr) expansion (default: 5)
+  -frozthresh X   frozen threshold on target character (default: 0.20)
+  -qtlthresh X    inclusion threshold on target character (default: 0.05)
+  -semicore X     semicore detection threshold (default: 0.90)
+  -nkband N       k-points per band segment (default: 100)
+  -w2wdir DIR     directory containing w2w/w2wc
+  -w90exe EXE     path to wannier90.x
+
+PREREQUISITES:
+  A completed Wien2k SCF calculation with:
+    case.struct   case.klist     case.energy
+    case.vector   case.vsp       case.fermi (or case.scf)
+    case.qtl      (from 'x lapw2 -qtl')
+
+EXAMPLES:
+  $name                             # fully automatic
+  $name -so                         # spin-orbit coupling
+  $name -frozthresh 0.15            # lower frozen threshold
+  $name -w90exe /opt/wannier90.x    # explicit wannier90 path
+  $name -norun                      # just generate input files
+EOF
+}
+
+# ============================================================
+#  Utility functions
+# ============================================================
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+
+croak() { echo -e >&2 "${RED}ERROR:${NC} $*"; exit 1; }
+warn()  { [[ ${q:-} ]] && return; echo -e >&2 "${YELLOW}WARNING:${NC} $*"; }
+info()  { [[ ${q:-} ]] && return; echo -e "  ${CYAN}>>>${NC} $*"; }
+step()  { [[ ${q:-} ]] && return; echo -e "\n${BOLD}Step $1:${NC} $2"; }
+done_msg() { echo -e "  ${GREEN}done${NC} $*"; }
+
+# ============================================================
+#  Parse options
+# ============================================================
+unset v q updn so norun
+ljmax=5
+frozthresh=0.20
+qtlthresh=0.05
+semicore_thresh=0.90
+nkband=100
+w2wdir=""
+w90exe=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -[hH]|-help|--help) usage; exit 0;;
+        -v|-verbose) v=1;;
+        -q|-quiet)   q=1;;
+        -up)    updn=up;;
+        -dn)    updn=dn;;
+        -so)    so=so;;
+        -noso)  unset so;;
+        -norun) norun=1;;
+        -f)          shift; file=$1;;
+        -ljmax)      shift; ljmax=$1;;
+        -frozthresh) shift; frozthresh=$1;;
+        -qtlthresh)  shift; qtlthresh=$1;;
+        -semicore)   shift; semicore_thresh=$1;;
+        -nkband)     shift; nkband=$1;;
+        -w2wdir)     shift; w2wdir=$1;;
+        -w90exe)     shift; w90exe=$1;;
+        -*) croak "unknown option \`$1' (try -h)";;
+        *)  croak "unexpected argument \`$1'";;
+    esac
+    shift
+done
+
+echo -e "${BOLD}QTL-Guided Wannierization Pipeline${NC}"
+echo -e "case: ${CYAN}$file${NC}"
+
+# ============================================================
+#  Detect calculation type
+# ============================================================
+w2w_exec="w2wc"
+if [[ -s $file.in1c || -n ${so:-} ]]; then
+    w2w_exec="w2wc"
+elif [[ -s $file.in1 && ! -s $file.in1c ]]; then
+    w2w_exec="w2w"
+fi
+[[ -s $file.inso ]] && so=so
+[[ ${v:-} ]] && info "w2w=$w2w_exec sp=${updn:-none} so=${so:-no}"
+
+# ============================================================
+#  Resolve executables
+# ============================================================
+resolve_w2w() {
+    local exe=$1
+    for dir in "$w2wdir" "$bin/../SRC_w2w" "$bin"; do
+        [[ -n $dir && -x "$dir/$exe" ]] && { echo "$dir/$exe"; return 0; }
+    done
+    command -v "$exe" 2>/dev/null && return 0
+    return 1
+}
+resolve_w90() {
+    if [[ -n $w90exe && -x "$w90exe" ]]; then echo "$w90exe"; return 0; fi
+    command -v wannier90.x 2>/dev/null && return 0
+    command -v wannier90   2>/dev/null && return 0
+    return 1
+}
+
+W2W_BIN=$(resolve_w2w "$w2w_exec") || true
+W90_BIN=$(resolve_w90) || true
+[[ ${v:-} ]] && info "w2w: ${W2W_BIN:-(not found)}"
+[[ ${v:-} ]] && info "w90: ${W90_BIN:-(not found)}"
+
+# ============================================================
+#  Validate prerequisites
+# ============================================================
+for f in $file.struct $file.klist; do
+    [[ -s $f ]] || croak "required file \`$f' not found"
+done
+
+# QTL file — the key input for this mode
+qtlfile=$file.qtl
+[[ -s $qtlfile ]] || croak "QTL file \`$qtlfile' not found — run 'x lapw2 -qtl' first"
+
+# Energy, vector, potential files
+enefile=""
+for suffix in "${so:-}${updn:-}" "${updn:-}" ""; do
+    [[ -s "$file.energy$suffix" ]] && { enefile="$file.energy$suffix"; break; }
+done
+[[ -n $enefile ]] || croak "energy file not found"
+
+vecfile=""
+for suffix in "${so:-}${updn:-}" "${updn:-}" ""; do
+    [[ -s "$file.vector$suffix" ]] && { vecfile="$file.vector$suffix"; break; }
+done
+[[ -n $vecfile ]] || croak "vector file not found"
+
+vspfile=""
+for suffix in "${updn:-}" ""; do
+    [[ -s "$file.vsp$suffix" ]] && { vspfile="$file.vsp$suffix"; break; }
+done
+[[ -n $vspfile ]] || croak "potential file not found"
+
+fermifile=$file.fermi
+if [[ ! -s $fermifile ]]; then
+    if [[ -s $file.scf ]]; then
+        grep ':FER' "$file.scf" | tail -1 | awk '{print $NF}' > "$fermifile"
+        info "extracted Fermi energy from $file.scf"
+    else
+        croak "Fermi energy not found"
+    fi
+fi
+
+info "files: qtl=$qtlfile energy=$enefile vector=$vecfile vsp=$vspfile"
+
+# ============================================================
+#  Step 0: Parse QTL and classify bands
+# ============================================================
+step "0" "Parsing QTL orbital character and classifying bands"
+
+qtl_result=$(python3 << QTLEOF
+import numpy as np
+import re, sys, json
+
+# ---- Configuration ----
+qtlfile = '$qtlfile'
+structfile = '$file.struct'
+fermifile = '$fermifile'
+frozthresh = $frozthresh
+qtlthresh = $qtlthresh
+semicore_thresh = $semicore_thresh
+
+ef_ry = float(open(fermifile).read().strip())
+
+# ---- Valence configuration (same as PDWF) ----
+def valence_config(Z):
+    """Returns list of target l-channels for element Z."""
+    if Z <= 2: return [0]           # H, He: s
+    elif Z <= 4: return [0]         # Li, Be: s
+    elif Z <= 10: return [0, 1]     # B-Ne: sp
+    elif Z <= 12: return [0, 1]     # Na, Mg: sp
+    elif Z <= 18: return [0, 1]     # Al-Ar: sp
+    elif Z <= 20: return [0, 1]     # K, Ca: sp
+    elif Z <= 30: return [0, 2]     # Sc-Zn: sd
+    elif Z <= 36: return [0, 1]     # Ga-Kr: sp
+    elif Z <= 38: return [0, 1]     # Rb, Sr: sp
+    elif Z <= 48: return [0, 2]     # Y-Cd: sd
+    elif Z <= 54: return [0, 1]     # In-Xe: sp
+    elif Z <= 56: return [0, 1]     # Cs, Ba: sp
+    elif Z == 57: return [0, 1, 2]  # La: spd
+    elif Z <= 71: return [0, 2, 3]  # Ce-Lu: sdf
+    elif Z <= 80: return [0, 2]     # Hf-Hg: sd
+    elif Z <= 86: return [0, 1]     # Tl-Rn: sp
+    else: return [0, 1]
+
+# ---- Parse struct for atomic numbers ----
+with open(structfile) as f:
+    slines = f.readlines()
+nneq_match = re.search(r'ATOMS[:\s]+(\d+)', slines[1])
+nneq = int(nneq_match.group(1)) if nneq_match else 1
+
+atom_Z = []
+atom_mult = []
+i = 4
+for iat in range(nneq):
+    # ATOM position line
+    i += 1
+    # MULT line
+    mult = int(slines[i].split('=')[1].split()[0])
+    atom_mult.append(mult)
+    i += 1
+    # Skip equivalent atom position lines (mult-1)
+    for _ in range(mult - 1):
+        i += 1
+    # Element/Z line
+    z_match = re.search(r'Z:\s*([\d.]+)', slines[i])
+    atom_Z.append(int(float(z_match.group(1))) if z_match else 1)
+    i += 1
+    # LOCAL ROT MATRIX (3 lines)
+    i += 3
+
+# ---- Parse QTL file ----
+with open(qtlfile) as f:
+    lines = f.readlines()
+
+# Header
+fermi_qtl = float(lines[2].split('FERMI ENERGY=')[1])
+nat_line = lines[3]
+nat = int(nat_line.split('NAT=')[1].split()[0])
+spin = int(nat_line.split('SPIN=')[1].split()[0])
+
+# Per-atom info
+qtl_mult = []
+qtl_isplit = []
+for ja in range(nat):
+    aline = lines[4 + ja]
+    qtl_mult.append(int(aline.split('MULT=')[1].split()[0]))
+    qtl_isplit.append(int(aline.split('ISPLIT=')[1].split()[0]))
+
+lines_per_k = nat + 1  # nat atom lines + 1 interstitial
+
+# Find band starts
+band_starts = [i for i, l in enumerate(lines) if l.strip().startswith('BAND')]
+nbands = len(band_starts)
+nk = (band_starts[1] - band_starts[0] - 1) // lines_per_k if nbands > 1 else 0
+
+# Parse orbital character: qtl_char[band, jatom, l]
+# ISPLIT=4 columns: tot, s, pz, px+py, dz2, dx2y2+dxy, dxz+dyz, f
+qtl_char = np.zeros((nbands, nat, 4))  # l = 0(s), 1(p), 2(d), 3(f)
+qtl_int = np.zeros(nbands)  # interstitial
+band_energy = np.zeros(nbands)  # k-averaged energy (Ry)
+
+for ib, bs in enumerate(band_starts):
+    e_sum = 0.0
+    for ik in range(nk):
+        offset = bs + 1 + ik * lines_per_k
+        for ja in range(nat):
+            parts = lines[offset + ja].split()
+            e_sum += float(parts[0])
+            # s
+            qtl_char[ib, ja, 0] += float(parts[3])
+            # p = pz + px+py
+            qtl_char[ib, ja, 1] += float(parts[4]) + float(parts[5])
+            # d = dz2 + dx2y2+dxy + dxz+dyz
+            qtl_char[ib, ja, 2] += float(parts[6]) + float(parts[7]) + float(parts[8])
+            # f
+            qtl_char[ib, ja, 3] += float(parts[9])
+        # Interstitial
+        int_parts = lines[offset + nat].split()
+        qtl_int[ib] += float(int_parts[2])
+
+    qtl_char[ib] /= nk
+    qtl_int[ib] /= nk
+    band_energy[ib] = e_sum / (nk * nat)  # avg over k and atoms
+
+# Convert energy to eV relative to E_F
+band_energy_ev = (band_energy - ef_ry) * 13.605693
+
+# ---- Determine target channels ----
+targets = []  # list of (jatom_0indexed, l)
+for ja in range(nat):
+    Z = atom_Z[ja]
+    for l in valence_config(Z):
+        targets.append((ja, l))
+
+# ---- Compute target character per band ----
+target_char = np.zeros(nbands)
+for ib in range(nbands):
+    for ja, l in targets:
+        target_char[ib] += qtl_char[ib, ja, l]
+
+# ---- Read eigenvalues at Gamma for energy reference ----
+nneq_struct = nneq
+with open('$enefile') as f:
+    for _ in range(2 * nneq_struct):
+        f.readline()
+    header = f.readline()
+    nen = int(header[73:79])
+    eigs_ry = [float(f.readline().split()[1]) for _ in range(nen)]
+eigs_ev = [(e - ef_ry) * 13.605693 for e in eigs_ry]
+
+# ---- Phase 1: Semicore exclusion (QTL-based, exact) ----
+FROZEN, DISENTANGLE, EXCLUDED = 1, 2, 3
+band_class = np.zeros(nbands, dtype=int)
+semicore_top = 0
+
+for ib in range(nbands):
+    is_semicore = False
+    for ja in range(nat):
+        for l in range(4):
+            if qtl_char[ib, ja, l] > semicore_thresh:
+                if (ja, l) not in targets:
+                    is_semicore = True
+                elif qtl_char[ib, ja, l] > 0.95:
+                    is_semicore = True
+    if is_semicore:
+        band_class[ib] = EXCLUDED
+        semicore_top = ib + 1
+
+if semicore_top > 0:
+    print(f"QTL: semicore bands 1-{semicore_top} excluded (>{semicore_thresh:.0%} single-l)")
+
+# ---- Phase 2: Split-Gaussian relevance on QTL target character ----
+# Same energy-weighting as PDWF but using QTL orbital character.
+# Uses k-AVERAGED energies from QTL (not Gamma-only eigenvalues)
+# to match PDWF's behavior. This is important for dispersive bands
+# like Mg 2s where E_gamma=-12.3 but E_avg=-9.5 eV.
+# sigma_below = |E_deepest_non_semicore|
+# sigma_above = max(0.5*sigma_below, max crossing extent above E_F)
+e_vals = band_energy_ev  # k-averaged from QTL data
+
+e_deepest = min(e_vals[semicore_top:])
+sigma_below = max(3.0, abs(e_deepest))
+sigma_above = 0.5 * sigma_below
+# Check for Fermi-crossing bands using k-averaged energies
+for ib in range(semicore_top, nbands):
+    # Approximate: if band_energy_ev near 0, it likely crosses
+    if band_energy_ev[ib] > 0 and band_energy_ev[ib] < sigma_above:
+        sigma_above = max(sigma_above, band_energy_ev[ib] * 1.5)
+sigma_above = max(3.0, sigma_above)
+
+print(f"QTL: energy weight sigma = {sigma_below:.1f}/{sigma_above:.1f} eV (below/above E_F)")
+
+# Compute relevance = target_char × energy_weight
+relevance = np.zeros(nbands)
+for ib in range(nbands):
+    if ib < semicore_top:
+        relevance[ib] = 0
+    else:
+        sig = sigma_below if e_vals[ib] < 0 else sigma_above
+        w = np.exp(-0.5 * (e_vals[ib] / sig) ** 2)
+        relevance[ib] = target_char[ib] * w
+
+# ---- Phase 3: Percentile-based classification on relevance ----
+n_valence = nbands - semicore_top
+r_sorted = np.sort(relevance[semicore_top:])
+r_high = r_sorted[int(frozthresh * n_valence)]  # frozthresh as percentile
+r_low = r_sorted[max(0, int(qtlthresh * n_valence))]
+
+print(f"QTL: frozen relevance threshold = {r_high:.4f} ({frozthresh*100:.0f}th pctl)")
+print(f"QTL: exclude relevance threshold = {r_low:.4f} ({qtlthresh*100:.0f}th pctl)")
+
+for ib in range(nbands):
+    if band_class[ib] == EXCLUDED:
+        continue  # already semicore
+    if relevance[ib] < r_low:
+        band_class[ib] = EXCLUDED
+    elif relevance[ib] >= r_high:
+        band_class[ib] = FROZEN
+    else:
+        band_class[ib] = DISENTANGLE
+
+# ---- Phase 4: Gap bridging ----
+frozen_idx = [ib for ib in range(nbands) if band_class[ib] == FROZEN]
+if frozen_idx:
+    ifirst, ilast = frozen_idx[0], frozen_idx[-1]
+    for ib in range(ifirst, ilast + 1):
+        if band_class[ib] == DISENTANGLE and relevance[ib] >= r_high - 0.02:
+            band_class[ib] = FROZEN
+            print(f"QTL: gap-bridging band {ib+1} (rel={relevance[ib]:.4f}) -> FROZEN")
+
+# ---- Determine bmin/bmax ----
+active = np.where(band_class != EXCLUDED)[0]
+if len(active) == 0:
+    print("ERROR: no active bands found", file=sys.stderr)
+    sys.exit(1)
+bmin = active[0] + 1  # 1-indexed Wien2k band number
+bmax = active[-1] + 1
+
+# ---- Compute num_wann ----
+num_wann = 0
+for ja, l in targets:
+    num_wann += (2 * l + 1) * qtl_mult[ja]
+
+# ---- Determine energy windows ----
+# Frozen window: spans eigenvalues of FROZEN bands ± 0.5 eV
+frozen_idx = [ib for ib in range(nbands) if band_class[ib] == FROZEN]
+if frozen_idx:
+    froz_min = min(eigs_ev[ib] for ib in frozen_idx) - 0.5
+    froz_max = max(eigs_ev[ib] for ib in frozen_idx) + 0.5
+else:
+    froz_min = froz_max = 0
+
+# Outer window: spans ALL non-excluded bands ± 2.0 eV
+active_idx = [ib for ib in range(nbands) if band_class[ib] != EXCLUDED]
+dis_min = min(eigs_ev[ib] for ib in active_idx) - 2.0
+dis_max = max(eigs_ev[ib] for ib in active_idx) + 2.0
+
+# Exclude bands list (1-indexed, relative to bmin)
+exclude_in_window = []
+for ib in range(bmin - 1, bmax):
+    if band_class[ib] == EXCLUDED:
+        exclude_in_window.append(ib - (bmin - 1) + 1)
+
+# ---- Print classification table ----
+class_names = {FROZEN: 'FROZEN', DISENTANGLE: 'DISENT', EXCLUDED: 'EXCL'}
+n_frozen = sum(1 for c in band_class if c == FROZEN)
+n_disent = sum(1 for c in band_class if c == DISENTANGLE)
+n_excl = sum(1 for c in band_class if c == EXCLUDED)
+
+print(f"QTL: {nbands} bands, {nk} k-points, {nat} atoms")
+print(f"QTL: targets = {[(atom_Z[ja], 'spdf'[l]) for ja, l in targets]}")
+print(f"QTL: num_wann = {num_wann}")
+print(f"QTL: {n_frozen} frozen, {n_disent} disentangle, {n_excl} excluded")
+print(f"QTL: band window = [{bmin}, {bmax}]")
+if frozen_idx:
+    print(f"QTL: frozen window = [{froz_min:.2f}, {froz_max:.2f}] eV")
+print(f"QTL: outer window = [{dis_min:.2f}, {dis_max:.2f}] eV")
+print()
+print(f"{'Band':>5s} {'E(eV)':>8s} {'Class':>7s} {'QTL_sp':>7s} {'E_wt':>6s} {'Relev':>7s} |", end='')
+for ja in range(nat):
+    for l in range(min(3, max(ll for _, ll in targets) + 1)):
+        print(f" {atom_Z[ja]}:{'spdf'[l]:1s}", end='')
+print(f" {'Int':>5s}")
+print('-' * 90)
+for ib in range(nbands):
+    cls = class_names[band_class[ib]]
+    sig = sigma_below if e_vals[ib] < 0 else sigma_above
+    ew = np.exp(-0.5 * (e_vals[ib] / sig) ** 2) if ib >= semicore_top else 0
+    print(f"{ib+1:5d} {e_vals[ib]:8.2f} {cls:>7s} {target_char[ib]:7.4f} {ew:6.3f} {relevance[ib]:7.4f} |", end='')
+    for ja in range(nat):
+        for l in range(min(3, max(ll for _, ll in targets) + 1)):
+            print(f" {qtl_char[ib, ja, l]:5.3f}", end='')
+    print(f" {qtl_int[ib]:5.3f}")
+
+# ---- Output as structured data for the bash script ----
+# Format: key=value pairs, one per line
+print()
+print(f"BMIN={bmin}")
+print(f"BMAX={bmax}")
+print(f"NUM_WANN={num_wann}")
+print(f"N_FROZEN={n_frozen}")
+print(f"N_DISENT={n_disent}")
+print(f"N_EXCL={n_excl}")
+print(f"FROZ_MIN={froz_min:.6f}")
+print(f"FROZ_MAX={froz_max:.6f}")
+print(f"DIS_MIN={dis_min:.6f}")
+print(f"DIS_MAX={dis_max:.6f}")
+excl_str = ','.join(str(x) for x in exclude_in_window) if exclude_in_window else ''
+print(f"EXCLUDE_BANDS={excl_str}")
+# Projection list: jatom l m (1-indexed jatom)
+proj_lines = []
+for ja, l in targets:
+    for mu in range(qtl_mult[ja]):
+        for m in range(-l, l + 1):
+            proj_lines.append(f"{ja+1} {l} {m}")
+print(f"NPROJ={len(proj_lines)}")
+for pl in proj_lines:
+    print(f"PROJ={pl}")
+QTLEOF
+)
+
+# Parse structured output — only lines matching KEY=VALUE exactly
+while IFS= read -r line; do
+    case "$line" in
+        BMIN=*|BMAX=*|NUM_WANN=*|N_FROZEN=*|N_DISENT=*|N_EXCL=*|FROZ_MIN=*|FROZ_MAX=*|DIS_MIN=*|DIS_MAX=*|EXCLUDE_BANDS=*|NPROJ=*)
+            eval "$line" ;;
+    esac
+done <<< "$qtl_result"
+
+# Display classification table
+echo "$qtl_result" | grep -v '^[A-Z_]*=' | grep -v '^PROJ=' | grep -v '^NPROJ='
+
+info "bmin=$BMIN bmax=$BMAX num_wann=$NUM_WANN"
+info "frozen=$N_FROZEN disentangle=$N_DISENT excluded=$N_EXCL"
+
+nb=$((BMAX - BMIN + 1))
+
+# ============================================================
+#  Step 1a: Generate .inwf (QTL/BOTH mode)
+# ============================================================
+step "1a" "Generating QTL input (.inwf)"
+
+inwffile=$file.inwf${updn:-}
+
+# Write .inwf header
+{
+    echo "QTL"
+    echo " $BMIN  $BMAX"
+    echo " $ljmax  $NUM_WANN"
+} > "$inwffile"
+
+# Write projection definitions
+echo "$qtl_result" | grep '^PROJ=' | while read -r line; do
+    proj="${line#PROJ=}"
+    jatom=$(echo "$proj" | awk '{print $1}')
+    l=$(echo "$proj" | awk '{print $2}')
+    m=$(echo "$proj" | awk '{print $3}')
+    echo "1"
+    echo " $jatom $l $m  1.00000000  0.00000000"
+done >> "$inwffile"
+
+done_msg "$inwffile"
+[[ ${v:-} ]] && cat "$inwffile"
+
+# ============================================================
+#  Step 1b: Densify klist_band (if present)
+# ============================================================
+klistband=$file.klist_band
+if [[ -s $klistband ]]; then
+    step "1b" "Densifying band k-path ($nkband pts/segment)"
+    python3 - "$file" "$nkband" <<'KBEOF'
+import sys, re
+import numpy as np
+
+case, npts = sys.argv[1], int(sys.argv[2])
+
+labels = []
+with open(f"{case}.klist_band") as f:
+    for line in f:
+        s = line.strip()
+        if s == 'END' or not s:
+            continue
+        label = line[0:10].strip()
+        if not label or label.replace('-','').replace('.','').isdigit():
+            continue
+        body = line[10:].split()
+        if len(body) < 4:
+            continue
+        ix, iy, iz, idv = int(body[0]), int(body[1]), int(body[2]), int(body[3])
+        labels.append((label, np.array([ix/idv, iy/idv, iz/idv])))
+
+if len(labels) < 2:
+    sys.exit(0)
+
+import shutil
+shutil.copy(f"{case}.klist_band", f"{case}.klist_band.orig")
+div = npts * 6
+
+with open(f"{case}.klist_band", 'w') as f:
+    for iseg in range(len(labels) - 1):
+        l1, k1 = labels[iseg]
+        l2, k2 = labels[iseg + 1]
+        for i in range(npts + 1):
+            if i == 0 and iseg > 0:
+                continue
+            t = i / npts
+            kp = k1 + t * (k2 - k1)
+            ix = int(round(kp[0] * div))
+            iy = int(round(kp[1] * div))
+            iz = int(round(kp[2] * div))
+            if (i == 0) or (i == npts and iseg == len(labels) - 2):
+                lbl = l1 if i == 0 else l2
+                erange = '-8.00 8.00' if (iseg == 0 and i == 0) else ''
+                f.write(f"{lbl:10s}{ix:5d}{iy:5d}{iz:5d}{div:5d}  2.0{erange}\n")
+            elif i == npts:
+                f.write(f"{l2:10s}{ix:5d}{iy:5d}{iz:5d}{div:5d}  2.0\n")
+            else:
+                f.write(f"{'':10s}{ix:5d}{iy:5d}{iz:5d}{div:5d}  2.0\n")
+    f.write("END\n")
+
+total = sum(1 for _ in open(f"{case}.klist_band") if _.strip() and _.strip() != 'END')
+print(f"  {total} k-points ({npts}/segment)")
+KBEOF
+fi
+
+# ============================================================
+#  Step 2: Generate initial .win
+# ============================================================
+step "2" "Generating Wannier90 input (.win)"
+
+# Reuse pdwf_lapw's .win generator (same Python block)
+# but with QTL-determined num_wann
+source /dev/stdin <<WINGEN
+$(sed -n '/^python3 - "\$file" "\$bmin" "\$bmax"/,/^PYEOF$/p' "$bin/pdwf_lapw" 2>/dev/null || true)
+WINGEN
+
+# If pdwf_lapw's generator isn't available, use inline version
+if [[ ! -s $file.win ]]; then
+python3 - "$file" "$BMIN" "$BMAX" <<'PYEOF'
+import sys, os, re, math
+import numpy as np
+
+case = sys.argv[1]
+bmin, bmax = int(sys.argv[2]), int(sys.argv[3])
+nb = bmax - bmin + 1
+
+with open(f"{case}.struct") as f:
+    slines = f.readlines()
+
+lattype = slines[1][0:1].strip()
+nneq_match = re.search(r'ATOMS[:\s]+(\d+)', slines[1])
+nneq = int(nneq_match.group(1)) if nneq_match else int(slines[1].split()[3])
+latline = slines[3]
+a = [float(latline[i:i+10]) for i in range(0, 60, 10)]
+
+atoms = []
+i = 4
+for iat in range(nneq):
+    pos = slines[i]
+    x = float(pos[12:22])
+    y = float(pos[25:35])
+    z = float(pos[38:48])
+    i += 1
+    mult = int(slines[i].split('=')[1].split()[0])
+    i += 1 + (mult - 1) + 1 + 3
+    atoms.append((iat + 1, x, y, z, mult))
+
+a1, a2, a3 = a[0], a[1], a[2]
+alpha, beta, gamma = [a[i+3] * math.pi / 180 for i in range(3)]
+
+if lattype == 'F':
+    prim = [[0, a2/2, a3/2], [a1/2, 0, a3/2], [a1/2, a2/2, 0]]
+    conv_rec = np.array([[0, 0.5, 0.5], [0.5, 0, 0.5], [0.5, 0.5, 0]])
+elif lattype == 'B':
+    prim = [[-a1/2, a2/2, a3/2], [a1/2, -a2/2, a3/2], [a1/2, a2/2, -a3/2]]
+    conv_rec = np.array([[-0.5, 0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, -0.5]])
+elif lattype == 'H':
+    prim = [[a1, 0, 0], [-a1/2, a2*math.sqrt(3)/2, 0], [0, 0, a3]]
+    conv_rec = np.eye(3)
+else:
+    sg, cg = math.sin(gamma), math.cos(gamma)
+    cb, ca = math.cos(beta), math.cos(alpha)
+    prim = [[a1, 0, 0], [a2*cg, a2*sg, 0],
+            [a3*cb, a3*(ca-cb*cg)/sg, a3*math.sqrt(1-ca**2-cb**2-cg**2+2*ca*cb*cg)/sg]]
+    conv_rec = np.eye(3)
+
+nat = sum(m for _, _, _, _, m in atoms)
+kpoints, mp_grid = [], [1, 1, 1]
+with open(f"{case}.klist") as f:
+    for line in f:
+        s = line.strip()
+        if s.startswith('END') or not s: break
+        div_match = re.search(r'div:\s*\(\s*(\d+)\s+(\d+)\s+(\d+)\s*\)', line)
+        if div_match:
+            mp_grid = [int(div_match.group(i)) for i in (1, 2, 3)]
+        body = line[10:].split()
+        if len(body) < 4: continue
+        try:
+            ix, iy, iz, idv = int(body[0]), int(body[1]), int(body[2]), int(body[3])
+            kpoints.append((ix/idv, iy/idv, iz/idv))
+        except ValueError: continue
+
+with open(f"{case}.win", 'w') as f:
+    f.write(f"num_bands       = {nb}\nnum_wann        = {nat}\n\n")
+    f.write(f"iprint                = 1\nnum_iter              = 10000\n")
+    f.write(f"num_print_cycles      =   100\nconv_window           = 3\n")
+    f.write(f"dis_num_iter          = 10000\n\n")
+    f.write(f"write_proj             = .true.\nwrite_xyz              = .true.\n")
+    f.write(f"translate_home_cell    = .true.\nwrite_hr               = .true.\n\n")
+    f.write(f"bands_num_points       = 50\n\n")
+
+    f.write(f"begin unit_cell_cart\nBohr\n")
+    for v in prim:
+        f.write(f"  {v[0]:14.8f} {v[1]:14.8f} {v[2]:14.8f}\n")
+    f.write(f"end unit_cell_cart\n\n")
+
+    f.write(f"begin atoms_cart\nBohr\n")
+    for iat, x, y, z, mult in atoms:
+        cx = x*prim[0][0] + y*prim[1][0] + z*prim[2][0]
+        cy = x*prim[0][1] + y*prim[1][1] + z*prim[2][1]
+        cz = x*prim[0][2] + y*prim[1][2] + z*prim[2][2]
+        f.write(f"  {iat:4d}  {cx:14.8f}  {cy:14.8f}  {cz:14.8f}\n")
+    f.write(f"end atoms_cart\n\n")
+
+    bandfile = f"{case}.klist_band"
+    if os.path.exists(bandfile):
+        kpath = []
+        with open(bandfile) as bf:
+            for line in bf:
+                label = line[0:10].strip()
+                if not label or label == 'END': continue
+                body = line[10:].split()
+                if len(body) < 4: continue
+                try:
+                    ix, iy, iz = int(body[0]), int(body[1]), int(body[2])
+                    idv = int(body[3])
+                    if label and not label.replace('-','').replace('.','').isdigit():
+                        k_prim = conv_rec @ np.array([ix/idv, iy/idv, iz/idv])
+                        kpath.append((label, *k_prim))
+                except (ValueError, IndexError): continue
+        if len(kpath) >= 2:
+            f.write(f"bands_plot = T\nbegin kpoint_path\n")
+            for j in range(len(kpath) - 1):
+                l1, x1, y1, z1 = kpath[j]
+                l2, x2, y2, z2 = kpath[j + 1]
+                f.write(f"  {l1:6s} {x1:9.5f} {y1:9.5f} {z1:9.5f}"
+                        f"    {l2:6s} {x2:9.5f} {y2:9.5f} {z2:9.5f}\n")
+            f.write(f"end kpoint_path\n\n")
+
+    f.write(f"guiding_centres = T\nbegin projections\n")
+    for iat, x, y, z, mult in atoms:
+        for mu in range(mult):
+            f.write(f"  f={x:.8f},{y:.8f},{z:.8f}:s\n")
+    f.write(f"end projections\n\n")
+
+    f.write(f"mp_grid : {mp_grid[0]} {mp_grid[1]} {mp_grid[2]}\n")
+    f.write(f"begin kpoints\n")
+    for kx, ky, kz in kpoints:
+        kp = conv_rec @ np.array([kx, ky, kz])
+        f.write(f"  {kp[0]:18.15f}  {kp[1]:18.15f}  {kp[2]:18.15f}\n")
+    f.write(f"end kpoints\n")
+
+nk = len(kpoints)
+print(f"  {nk} k-points, mp_grid={mp_grid}, {nb} bands")
+PYEOF
+fi
+
+# Patch .win with QTL-determined windows
+python3 -c "
+import re
+
+with open('$file.win') as f:
+    content = f.read()
+
+# Strip old parameter blocks
+content = re.sub(r'! === .*?parameters ===\s*', '', content, flags=re.DOTALL)
+for k in ['num_wann','num_bands','dis_froz_min','dis_froz_max',
+          'dis_win_min','dis_win_max','exclude_bands','dis_num_iter',
+          'dis_conv_tol','dis_conv_window','num_iter','conv_tol',
+          'conv_window','restart']:
+    content = re.sub(rf'^{k}\s*=.*\n', '', content, flags=re.MULTILINE)
+
+# Build QTL parameter block
+params = '''! === QTL-guided parameters ===
+num_wann        = $NUM_WANN
+num_bands       = $nb
+dis_froz_min    = $FROZ_MIN
+dis_froz_max    = $FROZ_MAX
+dis_win_min     = $DIS_MIN
+dis_win_max     = $DIS_MAX
+'''
+excl = '$EXCLUDE_BANDS'
+if excl:
+    params += f'exclude_bands   = {excl}\n'
+params += '''dis_num_iter    = 10000
+dis_conv_tol    = 1.0e-10
+dis_conv_window = 5
+num_iter        = 10000
+conv_tol        = 1.0e-8
+conv_window     = 5
+! === end QTL parameters ===
+'''
+
+# Replace projections with QTL-derived ones
+# (will be done by w2w from .inwf, but Wannier90 needs them for -pp)
+
+content = params + '\n' + content
+
+with open('$file.win', 'w') as f:
+    f.write(content)
+print('  patched .win with QTL windows')
+"
+
+[[ -s $file.win ]] || croak "failed to generate $file.win"
+done_msg "$file.win"
+
+[[ ${norun:-} ]] && { info "stopping (-norun)"; exit 0; }
+
+# ============================================================
+#  Step 3: Run wannier90 -pp → .nnkp
+# ============================================================
+step "3" "Running wannier90 -pp"
+[[ -n $W90_BIN ]] || croak "cannot find wannier90.x (use -w90exe)"
+"$W90_BIN" -pp "$file" 2>&1
+[[ $? -eq 0 && -s $file.nnkp ]] || croak "wannier90 -pp failed (check $file.wout)"
+done_msg "$file.nnkp"
+
+# ============================================================
+#  Step 4: Run w2w in QTL/BOTH mode
+# ============================================================
+step "4" "Running $w2w_exec (QTL mode → AMN + MMN)"
+[[ -n $W2W_BIN ]] || croak "cannot find $w2w_exec (use -w2wdir)"
+
+cat > w2w.def <<DEFEOF
+  5,'$file.inwf${updn:-}',       'old',    'formatted',  0
+  6,'$file.outputwf${updn:-}',   'unknown','formatted',  0
+  7,'$file.amn',               'unknown','formatted',  0
+  8,'$file.mmn',               'unknown','formatted',  0
+ 10,'$vecfile',                'old','unformatted',     0
+ 11,'$file.nnkp',              'old',    'formatted',  0
+ 12,'$file.eig',               'unknown','formatted',  0
+ 18,'$vspfile',                'old',    'formatted',  0
+ 20,'$file.struct',            'old',    'formatted',  0
+ 50,'$enefile',                'old',    'formatted',  0
+ 51,'$file.fermi',             'old',    'formatted',  0
+DEFEOF
+
+"$W2W_BIN" w2w.def 2>&1
+[[ $? -eq 0 ]] || croak "$w2w_exec failed (check $file.outputwf${updn:-})"
+done_msg "AMN + MMN + EIG"
+
+# ============================================================
+#  Step 5: Run wannier90
+# ============================================================
+step "5" "Running wannier90 (Wannierization + band interpolation)"
+"$W90_BIN" "$file" 2>&1
+[[ $? -eq 0 ]] || croak "wannier90 failed (check $file.wout)"
+
+woutfile=$file.wout
+if grep -q "Final Spread" "$woutfile" 2>/dev/null; then
+    echo
+    echo -e "  ${BOLD}=== Wannier90 Results ===${NC}"
+    grep "Omega" "$woutfile" | tail -4 | while read -r line; do echo "  $line"; done
+    echo
+fi
+
+# ============================================================
+#  Step 6: Band comparison (if spaghetti available)
+# ============================================================
+if [[ -s $file.spaghetti_ene && -s ${file}_band.dat ]]; then
+    step "6" "Generating band comparison plot"
+    if [[ -x "$bin/compare_bands.py" ]]; then
+        python3 "$bin/compare_bands.py" "$file" -dir . 2>&1
+    fi
+fi
+
+# ============================================================
+#  Summary
+# ============================================================
+echo
+echo -e "${BOLD}QTL-guided workflow completed successfully${NC}"
+echo
+echo "  Output files:"
+echo "    $file.amn             projection matrix"
+echo "    $file.mmn             overlap matrix"
+echo "    $file.eig             eigenvalues"
+echo "    $file.win             Wannier90 input (QTL-patched)"
+echo "    ${file}_hr.dat        Hamiltonian in WF basis"
+[[ -s ${file}_band.dat ]] && \
+echo "    ${file}_band.dat      interpolated band structure"
+echo "    $file.outputwf        w2w diagnostics"
+echo
+
+exit 0

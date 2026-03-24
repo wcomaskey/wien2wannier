@@ -163,8 +163,9 @@ program wf
 
   write(unit_out, "(' MODE=')", ADVANCE='no')
   if (inwf%PDWF) write(unit_out, '(" PDWF")', ADVANCE='no')
+  if (inwf%QTL)  write(unit_out, '(" QTL")', ADVANCE='no')
   if (inwf%Mmn)  write(unit_out, '(" Mmn")', ADVANCE='no')
-  if (inwf%Amn .and. .not. inwf%PDWF) &
+  if (inwf%Amn .and. .not. inwf%PDWF .and. .not. inwf%QTL) &
        write(unit_out, '(" Amn")', ADVANCE='no')
   write(unit_out,*)
   write(unit_out, '(" band window = [", I0, ", ", I0, "]")') &

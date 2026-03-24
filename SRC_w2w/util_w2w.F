@@ -1492,7 +1492,7 @@ module inwfmod
   type inwf_t
      !! Structure to represent a ‘inwf’ file
      character(len=4)        :: mode
-     logical                 :: Mmn, Amn, PDWF
+     logical                 :: Mmn, Amn, PDWF, QTL
      integer                 :: bmin, bmax, Nproj, LJmax
      type(proj), allocatable :: projections(:)
      !! PDWF parameters (only used when PDWF=.true.)
@@ -1515,6 +1515,7 @@ contains
     real(DPk)           :: re, im
 
     inwf%PDWF = .false.
+    inwf%QTL  = .false.
     inwf%Amn  = .false.
     inwf%Mmn  = .false.
 
@@ -1528,6 +1529,10 @@ contains
     case('BOTH')
        inwf%Amn = .true.
        inwf%Mmn = .true.
+    case('QTL')
+       inwf%QTL  = .true.
+       inwf%Amn  = .true.
+       inwf%Mmn  = .true.
     case('PDWF')
        inwf%PDWF = .true.
        inwf%Amn  = .true.
