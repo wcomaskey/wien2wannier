@@ -2,140 +2,184 @@
 
 ## Motivation
 
-The current QTL pipeline treats `num_wann` as a hard constraint on the frozen window: at every k-point, frozen bands ≤ num_wann. This limits the frozen window size and prevents us from finding the optimal subspace.
+The current QTL pipeline uses percentile-based thresholds to classify bands, then derives energy windows from the classification. This works but has limitations:
 
-The real optimization problem is: **find the energy windows and band selection that maximize band structure accuracy within the frozen region while maintaining well-localized Wannier functions.**
+1. The `num_wann` constraint on the frozen window forces aggressive shrinking, often producing tiny frozen windows (e.g. p80 for MgB2 gives [-0, +2] eV)
+2. Window selection is decoupled from the actual optimization target (band accuracy)
+3. The percentile approach doesn't naturally balance window coverage against projectability
+
+The real problem is an **optimization over the window parameters** that directly maximizes band structure accuracy within the region of interest.
 
 ## Problem Formulation
 
-### Variables
-- `dis_froz_min`, `dis_froz_max`: frozen window edges (continuous)
-- `dis_win_min`, `dis_win_max`: outer window edges (continuous)
+### Decision Variables
+- `dis_froz_min`, `dis_froz_max`: frozen window edges (continuous, eV)
+- `dis_win_min`, `dis_win_max`: outer window edges (continuous, eV)
 - `exclude_bands`: set of excluded band indices (discrete)
 
-### Objective
-Minimize a combined cost function:
+### Loss Function
 
 ```
-L = w_spread * Omega_Total + w_accuracy * E_rms_frozen + w_coverage * (1 / frozen_width)
+L = -w_p * P_score - w_c * C_score + w_v * V_penalty
 ```
 
-Where:
-- `Omega_Total`: Wannier spread (from Wannier90)
-- `E_rms_frozen`: RMS band deviation within frozen window (from band comparison)
-- `frozen_width`: width of frozen window in eV
-- `w_spread`, `w_accuracy`, `w_coverage`: tunable weights
+**Minimize L** (equivalently, maximize projectability and coverage while satisfying constraints).
 
-### Constraints
-- `num_wann` = number of target Wannier functions (from valence config)
-- At each k-point: bands in frozen window ≤ bands in outer window
-- Frozen window ⊂ outer window
-- Minimum frozen floor: guaranteed minimum coverage around E_F
+**P_score (Projectability)**: Average QTL target character of bands within the frozen window, weighted by k-point sampling:
+
+```python
+P_score = mean over k-points of:
+    sum(qtl_target[b,k] for b in frozen_bands_at_k) / n_frozen_at_k
+```
+
+Higher P_score means the frozen bands have stronger target orbital character — the Wannier functions will be better localized on the intended atoms/orbitals.
+
+**C_score (Coverage)**: Frozen window width normalized by total bandwidth of interest. Uses an asymmetric weighting that values coverage below E_F more than above (occupied states matter more):
+
+```python
+C_score = (|fmin| + 0.5 * fmax) / (|E_deepest_valence| + 0.5 * E_highest_conduction)
+```
+
+This prevents the optimizer from choosing tiny windows with perfect projectability but no physical coverage.
+
+**V_penalty (Constraint violations)**: Soft penalties for violating Wannier90 requirements:
+
+```python
+V_penalty = 0
+# Hard floor: frozen window must be at least [-W_min_below, +W_min_above]
+if fmin > -W_min_below: V_penalty += alpha * (fmin + W_min_below)**2
+if fmax < W_min_above:  V_penalty += alpha * (W_min_above - fmax)**2
+
+# num_wann constraint: at every k, bands in frozen ≤ num_wann
+for each k-point:
+    n_in = count(active bands in [fmin, fmax] at k)
+    if n_in > num_wann:
+        V_penalty += beta * (n_in - num_wann)**2
+
+# Must have disentanglement: num_bands_in_outer > num_wann
+for each k-point:
+    n_outer = count(active bands in [dmin, dmax] at k)
+    if n_outer <= num_wann:
+        V_penalty += gamma * (num_wann + 1 - n_outer)**2
+
+# Outer must strictly contain frozen
+if fmin <= dmin: V_penalty += delta * (dmin - fmin + 1)**2
+if fmax >= dmax: V_penalty += delta * (fmax - dmax + 1)**2
+```
+
+### Hard Constraints (non-negotiable)
+1. **Minimum frozen floor**: `fmin ≤ -W_min_below` and `fmax ≥ +W_min_above` (user-configurable, default: 4 eV below, 2 eV above E_F)
+2. **Disentanglement required**: At every k-point, the number of active bands in the outer window must be **strictly greater than** `num_wann`. No exceptions — this ensures gauge freedom exists.
+3. **Frozen ⊂ Outer**: The frozen window must be strictly inside the outer window with margin ≥ 0.5 eV on each side.
+
+### Soft Constraints (penalized)
+1. **num_wann in frozen**: At every k-point, active bands in frozen ≤ `num_wann`. Violated configurations are heavily penalized but not immediately rejected — the optimizer can explore whether `exclude_bands` modifications resolve the violation.
 
 ## Optimization Strategy
 
-### Approach: Grid Search + Local Refinement
+### Phase 1: Predicted Score Grid (no Wannier90, seconds)
 
-Full SGD is impractical because each evaluation requires running Wannier90 (~minutes to hours). Instead:
-
-**Phase 1: Coarse grid (no Wannier90 runs)**
-- Enumerate frozen window candidates using QTL data
-- For each candidate, compute:
-  - QTL projectability score within frozen window
-  - Band manifold completeness (shell completeness)
-  - num_wann constraint satisfaction
-  - Estimated Omega_I from disentanglement theory
-- Rank candidates by predicted quality
-- Select top 5-10 candidates
-
-**Phase 2: Wannier90 evaluation (parallel)**
-- Run Wannier90 for each candidate (can be parallelized on cluster)
-- Compute actual Omega and band accuracy
-- Identify the Pareto frontier (spread vs accuracy tradeoff)
-
-**Phase 3: Local refinement**
-- Take the best candidate from Phase 2
-- Perturb frozen window edges by ±0.5 eV
-- Re-run Wannier90 for the perturbed configs
-- Select the configuration that minimizes the cost function
-
-### Predicted Quality Score (Phase 1)
-
-Without running Wannier90, estimate quality from:
+Sweep `fmin` and `fmax` on a grid (0.5 eV steps) within the eigenvalue range. For each (fmin, fmax):
 
 ```python
-def predicted_score(fmin, fmax, eigvals, qtl_char, num_wann):
-    # 1. Average QTL target character of bands in frozen window
-    frozen_bands = bands_fully_in_window(fmin, fmax)
-    avg_qtl = mean(qtl_target[frozen_bands])
+def evaluate_config(fmin, fmax, dmin, dmax, excl, eigvals, qtl, num_wann):
+    # Compute P_score from QTL data
+    P = projectability_score(fmin, fmax, eigvals, qtl, excl)
 
-    # 2. Manifold completeness: do frozen bands form complete shells?
-    shell_score = count_complete_shells(frozen_bands) / count_partial_shells(frozen_bands)
+    # Compute C_score from window geometry
+    C = coverage_score(fmin, fmax, E_deepest, E_highest)
 
-    # 3. Window width relative to total bandwidth
-    coverage = (fmax - fmin) / total_bandwidth
+    # Compute V_penalty from constraint checks
+    V = constraint_penalty(fmin, fmax, dmin, dmax, excl, eigvals, num_wann)
 
-    # 4. Constraint margin: how close to violating num_wann?
-    max_bands = max_bands_in_window(fmin, fmax)
-    margin = (num_wann - max_bands) / num_wann  # negative = violation
-
-    # 5. Disentangle band count: more = more gauge freedom
-    n_disent = count_bands_in_outer_not_frozen()
-    freedom = n_disent / num_wann
-
-    # Combined score (higher = better)
-    if margin < 0:
-        return -inf  # hard constraint violation
-    return avg_qtl * shell_score * coverage * (1 + freedom)
+    # Loss
+    L = -w_p * P - w_c * C + w_v * V
+    return L, P, C, V
 ```
 
-### Relaxing the num_wann Constraint
+This produces a 2D landscape of L(fmin, fmax). Find the global minimum and top-N local minima.
 
-Instead of treating `max_bands_in_frozen ≤ num_wann` as a hard wall, treat it as a soft penalty:
+### Phase 2: Exclude-Band Exploration (no Wannier90, seconds)
 
-```python
-if max_bands > num_wann:
-    # Shrink frozen window from conduction side until satisfied
-    # BUT: record the "ideal" window before shrinking
-    # The optimization can explore whether excluding specific
-    # high-energy bands (via exclude_bands) allows a wider
-    # frozen window that would otherwise violate the constraint
-    penalty = (max_bands - num_wann) * penalty_weight
-```
+For each top candidate from Phase 1 that has num_wann violations:
+- Try excluding high-energy bands one at a time
+- Check if the violation is resolved
+- If yes, record the modified config with its score
 
-This allows the optimizer to discover that excluding a few high-energy bands can enable a much wider frozen window — a tradeoff the current hard constraint prevents.
+This discovers configs where excluding 1-2 high-energy bands enables a much wider frozen window.
 
-## Implementation Plan
+### Phase 3: Wannier90 Evaluation (parallel, minutes-hours)
+
+Generate `.win` files for the top 5-10 configs from Phases 1-2. Run Wannier90 in parallel on the cluster. After completion:
+- Read Omega_Total from each `.wout`
+- Compute band accuracy from `_band.dat` vs `spaghetti_ene` within the frozen window
+- Select the config that minimizes the actual (not predicted) cost function
+
+### Phase 4: Local Refinement (optional)
+
+Take the best Phase 3 result. Perturb fmin and fmax by ±0.25, ±0.5, ±1.0 eV. Run Wannier90 for each perturbation. Select the best.
+
+## Default Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `w_p` | 1.0 | Projectability weight |
+| `w_c` | 1.0 | Coverage weight |
+| `w_v` | 100.0 | Violation penalty weight |
+| `W_min_below` | 4.0 eV | Minimum frozen window below E_F |
+| `W_min_above` | 2.0 eV | Minimum frozen window above E_F |
+| `alpha` | 10.0 | Floor violation penalty |
+| `beta` | 50.0 | num_wann violation penalty |
+| `gamma` | 50.0 | Disentanglement violation penalty |
+| `delta` | 20.0 | Outer containment penalty |
+| `fmin_step` | 0.5 eV | Grid step for Phase 1 |
+| `fmax_step` | 0.5 eV | Grid step for Phase 1 |
+
+## Implementation
 
 ### File: `SRC/qtl_opt.py`
 
-Standalone Python script (not part of the pipeline — called separately):
-
 ```bash
-# After running qtl_lapw -norun to generate base files:
-python3 qtl_opt.py CASE --qtl case.qtl --eig case.eig --num-wann 12
+python3 qtl_opt.py CASE [options]
 
-# Outputs:
-#   case.opt_configs/config_001/WANN.win
-#   case.opt_configs/config_002/WANN.win
-#   ...
-#   case.opt_configs/run_all.sh  (SLURM script)
-#   case.opt_configs/summary.json
+Options:
+  --qtl FILE        QTL file (default: CASE.qtl)
+  --eig FILE        EIG file (default: CASE.eig)
+  --num-wann N      number of Wannier functions (default: auto from struct)
+  --excl BANDS      semicore bands to exclude (default: auto from QTL)
+  --min-below E     minimum frozen below E_F in eV (default: 4.0)
+  --min-above E     minimum frozen above E_F in eV (default: 2.0)
+  --top-n N         number of configs for Phase 3 (default: 8)
+  --slurm           generate SLURM submission script
 ```
 
-### Inputs
-- `case.qtl`: orbital character
-- `case.eig`: eigenvalues
-- `case.amn`, `case.mmn`, `case.nnkp`: shared across all configs
-- `num_wann`: from valence config or user override
-
 ### Outputs
-- Directory of Wannier90 configs ready for parallel cluster execution
-- Summary JSON with predicted scores for each config
-- After cluster run: comparison script to analyze results and select optimal
+```
+CASE_opt/
+├── phase1_landscape.png       # 2D loss landscape plot
+├── phase1_scores.json         # All grid scores
+├── config_001/CASE.win        # Top Wannier90 configs
+├── config_002/CASE.win
+├── ...
+├── run_all.sh                 # SLURM script for Phase 3
+└── summary.json               # Config details + predicted scores
+```
 
-## Future Extensions
+### Post-Phase 3 Analysis
+```bash
+python3 qtl_opt.py CASE --analyze
+# Reads .wout files from each config, computes actual scores,
+# generates comparison plots, recommends optimal config
+```
 
-- **Bayesian optimization**: Replace grid search with GP-based acquisition function to minimize Wannier90 evaluations
-- **Transfer learning**: Use results from one material to warm-start optimization for similar materials
-- **Active learning**: Iteratively select the most informative config to evaluate next
+## Design Principles
+
+1. **Projectability and coverage are both essential** — a tiny window with perfect projectability is useless; a huge window with poor projectability gives bad Wannier functions.
+
+2. **Shell completeness is NOT part of the scoring** — it fails for metals/semimetals where bands cross E_F and orbital character is mixed. The QTL projectability score already captures orbital quality without assuming complete shells.
+
+3. **Disentanglement is always required** — `num_bands_in_outer > num_wann` at every k-point. This ensures Wannier90 always has gauge freedom. Configurations without disentanglement are excluded even if they have perfect frozen windows.
+
+4. **The minimum window floor is non-negotiable** — the optimizer cannot choose windows smaller than the floor. This guarantees the Fermi surface is always protected regardless of the projectability landscape.
+
+5. **Phase 1 is cheap** — evaluating the predicted score for thousands of (fmin, fmax) pairs takes seconds. Only Phase 3 (Wannier90 runs) is expensive, and we limit it to the top candidates.
