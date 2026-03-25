@@ -148,8 +148,13 @@ def loss_function(fmin, fmax, dmin, dmax, eigvals, target_char,
         return 1e6, {}
     if fmin < dmin or fmax > dmax:
         return 1e6, {}
-    if fmin > -min_fwin[0] or fmax < min_fwin[1]:
-        return 1e6, {}
+    # Minimum frozen window: soft constraint (penalty, not rejection)
+    # Configs with smaller frozen windows are penalized but not excluded
+    floor_penalty = 0
+    if fmin > -min_fwin[0]:
+        floor_penalty += 0.1 * (fmin + min_fwin[0])  # how far above floor
+    if fmax < min_fwin[1]:
+        floor_penalty += 0.1 * (min_fwin[1] - fmax)  # how far below floor
 
     # Band counts at each k
     min_outer = nb
@@ -221,12 +226,14 @@ def loss_function(fmin, fmax, dmin, dmax, eigvals, target_char,
             asym = 0.05 * (1.5 - ratio)
 
     # Combine with weights
+    # Balance: wide frozen window for band fidelity + enough gauge freedom
     score = (1.0 * avg_proj      # quality of frozen bands
-             + 0.2 * coverage    # window width (small weight)
-             + 0.8 * gauge       # gauge freedom (dominant!)
-             + 0.2 * eff         # frozen efficiency (small)
+             + 0.5 * coverage    # window width (important for band fidelity!)
+             + 0.4 * gauge       # gauge freedom (moderate)
+             + 0.3 * eff         # frozen efficiency
              - weak_penalty      # penalize weak frozen bands
-             - asym)             # prefer valence-heavy windows
+             - asym              # prefer valence-heavy windows
+             - floor_penalty)    # penalize narrow frozen windows
 
     return -score, {
         'frozen': [ib + 1 for ib in frozen],
@@ -274,6 +281,8 @@ def main():
     ap.add_argument('-efmax', type=float, default=2.0)
     ap.add_argument('-step', type=float, default=0.5)
     ap.add_argument('-top', type=int, default=15)
+    ap.add_argument('-bmin', type=int, default=None,
+                    help='bmin used in w2w run (for QTL-EIG alignment)')
     ap.add_argument('-write', action='store_true')
     args = ap.parse_args()
 
@@ -284,35 +293,79 @@ def main():
     eigvals = parse_eig(f'{d}/{case}.eig')
     target_char, targets, nw_auto = compute_targets(qtl_char, f'{d}/{case}.struct')
     num_wann = args.nwann or nw_auto
-    nb, nk = eigvals.shape
+    nb_eig, nk = eigvals.shape
+    nb_qtl = qtl_char.shape[0]
 
-    print(f"System: {nb} bands, {nk} k-pts, num_wann={num_wann}")
-    print(f"Targets: {targets}")
+    # Determine bmin offset: QTL always starts from Wien2k band 1,
+    # EIG starts from Wien2k band bmin.
+    # QTL band Q -> EIG band (Q - bmin + 1), valid when Q >= bmin
+    if args.bmin is not None:
+        bmin = args.bmin
+    else:
+        # Auto-detect by matching eigenvalue at band 1
+        eig_e1 = eigvals[0, 0]  # EIG band 1 energy at k=1
+        # Find matching QTL band
+        qtl_e = []
+        with open(args.qtl or f'{d}/{case}.qtl') as f:
+            for line in f.readlines():
+                if line.strip().startswith('BAND'):
+                    continue
+            # Re-parse to get first eigenvalue per band
+        # Simpler: count how many QTL bands are missing from EIG
+        bmin = nb_qtl - nb_eig + 1
+        if bmin < 1:
+            bmin = 1
+
+    print(f"System: EIG={nb_eig} bands, QTL={nb_qtl} bands, {nk} k-pts")
+    print(f"bmin={bmin} (EIG band 1 = Wien2k band {bmin})")
+    print(f"num_wann={num_wann}, Targets: {targets}")
     print(f"Min frozen: [-{args.efmin}, +{args.efmax}] eV\n")
+
+    # Align QTL to EIG: only use QTL bands that are in the EIG window
+    # QTL band q (0-indexed) -> EIG band (q - bmin + 1) (0-indexed)
+    # We need target_char and exclude indexed by EIG band number
+    nb = nb_eig
+    tc_aligned = np.zeros(nb)
+    qtl_aligned = np.zeros((nb, meta['nat'], 4))
+    for eig_ib in range(nb):
+        qtl_ib = eig_ib + bmin - 1  # 0-indexed QTL band
+        if 0 <= qtl_ib < nb_qtl:
+            tc_aligned[eig_ib] = target_char[qtl_ib]
+            qtl_aligned[eig_ib] = qtl_char[qtl_ib]
+    target_char = tc_aligned
+    qtl_char_aligned = qtl_aligned
 
     # Exclude core/semicore via energy gaps + orbital character
     e_avg = eigvals.mean(axis=1)
     exclude = set()
-    
+
     # 1. Energy gap detection: exclude bands below gaps > 5 eV
     for ib in range(nb - 1):
         gap = e_avg[ib + 1] - e_avg[ib]
         if e_avg[ib] < 0 and gap > 5.0:
             for jb in range(ib + 1):
                 exclude.add(jb)
-    
+
     # 2. Pure d/f semicore (> 90% single-orbital character)
     for ib in range(nb):
         for ja in range(meta['nat']):
-            if qtl_char[ib, ja, 2] > 0.90 or qtl_char[ib, ja, 3] > 0.90:
+            if qtl_char_aligned[ib, ja, 2] > 0.90 or qtl_char_aligned[ib, ja, 3] > 0.90:
                 exclude.add(ib)
 
-    print(f"{'Band':>4s} {'E_avg':>7s} {'target':>7s} {'int':>5s} {'Status':>8s}")
-    print('-' * 35)
+    # Align qtl_int too
+    qtl_int_aligned = np.zeros(nb)
+    for eig_ib in range(nb):
+        qtl_ib = eig_ib + bmin - 1
+        if 0 <= qtl_ib < nb_qtl:
+            qtl_int_aligned[eig_ib] = qtl_int[qtl_ib]
+
+    print(f"{'Band':>4s} {'W2k':>4s} {'E_avg':>7s} {'target':>7s} {'int':>5s} {'Status':>8s}")
+    print('-' * 42)
     for ib in range(nb):
         st = 'EXCL' if ib in exclude else ''
-        print(f"{ib+1:4d} {e_avg[ib]:7.1f} {target_char[ib]:7.4f} "
-              f"{qtl_int[ib]:5.3f} {st:>8s}")
+        w2k = ib + bmin
+        print(f"{ib+1:4d} {w2k:4d} {e_avg[ib]:7.1f} {target_char[ib]:7.4f} "
+              f"{qtl_int_aligned[ib]:5.3f} {st:>8s}")
 
     print(f"\nExcluded: {sorted(ib+1 for ib in exclude)}")
     print(f"\nGrid sweep (step={args.step} eV)...")
