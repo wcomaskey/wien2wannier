@@ -474,6 +474,42 @@ def main():
                 base_win = re.sub(rf'^{k}\s*=.*\n', '', base_win, flags=re.MULTILINE)
             base_win = re.sub(r'! ===.*?! === end.*?===\s*\n?', '', base_win, flags=re.DOTALL)
 
+            # Replace projections block with correct target orbitals
+            struct_path = f'{d}/{case}.struct'
+            if os.path.exists(struct_path):
+                with open(struct_path) as sf:
+                    slines = sf.readlines()
+                # Parse atom positions (fractional)
+                nneq_s = int(re.search(r'ATOMS[:\s]+(\d+)', slines[1]).group(1))
+                atom_pos = []
+                ii = 4
+                for iat in range(nneq_s):
+                    pos = slines[ii]
+                    x = float(pos[12:22])
+                    y = float(pos[25:35])
+                    z = float(pos[38:48])
+                    ii += 1
+                    mult = int(slines[ii].split('=')[1].split()[0])
+                    ii += 1
+                    for _ in range(mult - 1):
+                        ii += 1
+                    z_val = int(float(re.search(r'Z:\s*([\d.]+)', slines[ii]).group(1)))
+                    ii += 1 + 3
+                    atom_pos.append((x, y, z, mult, z_val))
+
+                # Generate projections matching num_wann
+                l_names = {0: 's', 1: 'p', 2: 'd', 3: 'f'}
+                proj_lines = ['begin projections']
+                for x, y, z, mult, Z in atom_pos:
+                    for l in valence_config(Z):
+                        for mu in range(mult):
+                            proj_lines.append(f'  f={x:.8f},{y:.8f},{z:.8f}:{l_names[l]}')
+                proj_lines.append('end projections')
+                proj_block = '\n'.join(proj_lines)
+
+                base_win = re.sub(r'begin projections.*?end projections',
+                                  proj_block, base_win, flags=re.DOTALL)
+
         config_names = []
         for i, (loss, fmin, fmax, dmin, dmax, det) in enumerate(results[:n]):
             dirname = f'opt_{i+1:02d}'
