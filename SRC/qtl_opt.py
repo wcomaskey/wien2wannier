@@ -204,21 +204,25 @@ def loss_function(fmin, fmax, dmin, dmax, eigvals, target_char,
     #    than 10→11.
     gauge = np.log1p(n_dis) / np.log1p(num_wann)
 
-    # 4. Frozen efficiency: frozen_count / num_wann, but penalize
-    #    if frozen > 0.8 * num_wann (too little gauge freedom).
-    eff = nf / num_wann
-    if nf > 0.8 * num_wann:
-        eff *= 0.8  # penalty for over-freezing
+    # 4. Frozen cap: freeze at most ~60% of num_wann.
+    #    Empirically, freezing >60% leaves insufficient gauge freedom
+    #    and causes Omega to jump (e.g. MgB2: 8/12=67% → Omega=25.9,
+    #    7/12=58% → Omega=17.9). Hard reject above 65%.
+    max_frozen_frac = 0.65
+    if nf > max_frozen_frac * num_wann:
+        return 1e6, {}
 
-    # 5. Projectability floor: penalize if any frozen band has
+    # 5. Frozen efficiency: prefer more frozen bands (up to the cap)
+    eff = nf / (max_frozen_frac * num_wann)
+    eff = min(1.0, eff)
+
+    # 6. Projectability floor: penalize if any frozen band has
     #    target character below the median of all active bands.
     active_median = np.median([target_char[ib] for ib in active])
     weak_frozen = sum(1 for ib in frozen if target_char[ib] < active_median)
     weak_penalty = 0.1 * weak_frozen / max(1, nf)
 
-    # 6. Asymmetry: prefer frozen window wider below E_F than above.
-    #    Valence states below E_F are more important for ground-state
-    #    properties; conduction states above benefit from gauge freedom.
+    # 7. Asymmetry: prefer frozen window wider below E_F than above.
     asym = 0
     if fmax > 0 and fmin < 0:
         ratio = abs(fmin) / max(0.1, fmax)
@@ -226,11 +230,10 @@ def loss_function(fmin, fmax, dmin, dmax, eigvals, target_char,
             asym = 0.05 * (1.5 - ratio)
 
     # Combine with weights
-    # Balance: wide frozen window for band fidelity + enough gauge freedom
     score = (1.0 * avg_proj      # quality of frozen bands
-             + 0.5 * coverage    # window width (important for band fidelity!)
-             + 0.4 * gauge       # gauge freedom (moderate)
-             + 0.3 * eff         # frozen efficiency
+             + 0.5 * coverage    # window width (band fidelity)
+             + 0.4 * gauge       # gauge freedom
+             + 0.4 * eff         # frozen efficiency (up to cap)
              - weak_penalty      # penalize weak frozen bands
              - asym              # prefer valence-heavy windows
              - floor_penalty)    # penalize narrow frozen windows
@@ -339,12 +342,16 @@ def main():
     e_avg = eigvals.mean(axis=1)
     exclude = set()
 
-    # 1. Energy gap detection: exclude bands below gaps > 5 eV
+    # 1. Energy gap detection: exclude bands below gaps > 5 eV,
+    #    BUT only if the band has low target character (< 0.10).
+    #    This prevents excluding valence bands like As 4s that sit
+    #    below a gap but have strong target orbital character.
     for ib in range(nb - 1):
         gap = e_avg[ib + 1] - e_avg[ib]
         if e_avg[ib] < 0 and gap > 5.0:
             for jb in range(ib + 1):
-                exclude.add(jb)
+                if target_char[jb] < 0.10:
+                    exclude.add(jb)
 
     # 2. Pure d/f semicore (> 90% single-orbital character)
     for ib in range(nb):
