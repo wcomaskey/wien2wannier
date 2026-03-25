@@ -180,70 +180,78 @@ def loss_function(fmin, fmax, dmin, dmax, eigvals, target_char,
 
     nf = len(frozen)
     n_dis = min_outer - nf
-
-    # 1. Projectability: energy-weighted average target character.
-    #    Bands near E_F (=0) contribute more than distant bands.
-    #    weight(E) = exp(-|E|/sigma) with sigma = 8 eV
     e_avg_band = eigvals.mean(axis=1)
-    sigma_prox = 8.0
+
+    # 1. Projectability: Fermi-proximity-weighted average.
+    #    Split Gaussian: sigma_below = |E_deepest_active|,
+    #    sigma_above = 0.5 * sigma_below (valence > conduction).
+    e_deepest = min(e_avg_band[ib] for ib in active if e_avg_band[ib] < 0)
+    sigma_below = max(3.0, abs(e_deepest))
+    sigma_above = max(3.0, 0.5 * sigma_below)
     if nf > 0:
-        weighted_proj = sum(target_char[ib] * np.exp(-abs(e_avg_band[ib]) / sigma_prox)
-                           for ib in frozen)
-        weight_sum = sum(np.exp(-abs(e_avg_band[ib]) / sigma_prox) for ib in frozen)
-        avg_proj = weighted_proj / weight_sum
+        wsum, wpsum = 0.0, 0.0
+        for ib in frozen:
+            sig = sigma_below if e_avg_band[ib] < 0 else sigma_above
+            w = np.exp(-0.5 * (e_avg_band[ib] / sig) ** 2)
+            wsum += w
+            wpsum += target_char[ib] * w
+        avg_proj = wpsum / wsum
     else:
         avg_proj = 0
 
-    # 2. Coverage: frozen window width, but only count the useful part.
-    #    Cap at 30 eV reference — beyond that, diminishing returns.
-    coverage = min(1.0, (fmax - fmin) / 30.0)
+    # 2. Coverage: reward frozen window width with diminishing returns.
+    #    Use asymmetric valence/conduction weighting: extending below
+    #    E_F (valence) is cheaper than extending above (conduction).
+    #    The conduction penalty increases quadratically with fmax.
+    valence_width = max(0, -fmin)  # how far below E_F
+    conduction_width = max(0, fmax)  # how far above E_F
+    # Valence coverage: linear, up to 20 eV
+    val_cov = min(1.0, valence_width / 20.0)
+    # Conduction coverage: diminishing returns, penalize >8 eV
+    cond_cov = min(1.0, conduction_width / 10.0)
+    cond_penalty = max(0, conduction_width - 8.0) ** 2 / 100.0  # quadratic penalty above 8 eV
+    coverage = 0.6 * val_cov + 0.4 * cond_cov
+    overextend = cond_penalty
 
-    # 3. Gauge freedom: ratio of disentangle to total active bands.
-    #    More disentangle = more freedom for Wannier90 to optimize.
-    #    Use log scaling: going from 1→2 disentangle bands matters more
-    #    than 10→11.
+    # 3. Gauge freedom
     gauge = np.log1p(n_dis) / np.log1p(num_wann)
 
-    # 4. Frozen cap: freeze at most ~60% of num_wann.
-    #    Empirically, freezing >60% leaves insufficient gauge freedom
-    #    and causes Omega to jump (e.g. MgB2: 8/12=67% → Omega=25.9,
-    #    7/12=58% → Omega=17.9). Hard reject above 65%.
+    # 4. Frozen cap: freeze at most ~60% of num_wann
     max_frozen_frac = 0.65
     if nf > max_frozen_frac * num_wann:
         return 1e6, {}
 
-    # 5. Frozen efficiency: prefer more frozen bands (up to the cap)
-    eff = nf / (max_frozen_frac * num_wann)
-    eff = min(1.0, eff)
+    # 5. Frozen efficiency
+    eff = min(1.0, nf / (max_frozen_frac * num_wann))
 
-    # 6. Projectability floor: penalize if any frozen band has
-    #    target character below the median of all active bands.
+    # 6. Weak band penalty
     active_median = np.median([target_char[ib] for ib in active])
     weak_frozen = sum(1 for ib in frozen if target_char[ib] < active_median)
     weak_penalty = 0.1 * weak_frozen / max(1, nf)
 
-    # 7. Asymmetry: prefer frozen window wider below E_F than above.
+    # 7. Asymmetry: valence side should be wider
     asym = 0
     if fmax > 0 and fmin < 0:
         ratio = abs(fmin) / max(0.1, fmax)
         if ratio < 1.5:
             asym = 0.05 * (1.5 - ratio)
 
-    # Combine with weights
+    # Combine
     score = (1.0 * avg_proj      # quality of frozen bands
-             + 0.5 * coverage    # window width (band fidelity)
-             + 0.4 * gauge       # gauge freedom
-             + 0.4 * eff         # frozen efficiency (up to cap)
+             + 0.3 * coverage    # useful window width
+             + 0.5 * gauge       # gauge freedom
+             + 0.3 * eff         # frozen efficiency
              - weak_penalty      # penalize weak frozen bands
              - asym              # prefer valence-heavy windows
-             - floor_penalty)    # penalize narrow frozen windows
+             - floor_penalty     # penalize narrow windows
+             - overextend)       # penalize extending past natural gap
 
     return -score, {
         'frozen': [ib + 1 for ib in frozen],
         'nf': nf, 'nd': n_dis,
         'min_outer': min_outer, 'max_frozen': max_frozen,
         'avg_proj': avg_proj, 'coverage': coverage,
-        'gauge': gauge, 'eff': eff,
+        'gauge': gauge, 'eff': eff, 'overextend': overextend,
         'weak_penalty': weak_penalty, 'asym': asym,
         'score': score,
     }
@@ -299,25 +307,60 @@ def main():
     nb_eig, nk = eigvals.shape
     nb_qtl = qtl_char.shape[0]
 
-    # Determine bmin offset: QTL always starts from Wien2k band 1,
-    # EIG starts from Wien2k band bmin.
-    # QTL band Q -> EIG band (Q - bmin + 1), valid when Q >= bmin
-    if args.bmin is not None:
-        bmin = args.bmin
-    else:
-        # Auto-detect by matching eigenvalue at band 1
-        eig_e1 = eigvals[0, 0]  # EIG band 1 energy at k=1
-        # Find matching QTL band
-        qtl_e = []
-        with open(args.qtl or f'{d}/{case}.qtl') as f:
-            for line in f.readlines():
-                if line.strip().startswith('BAND'):
-                    continue
-            # Re-parse to get first eigenvalue per band
-        # Simpler: count how many QTL bands are missing from EIG
-        bmin = nb_qtl - nb_eig + 1
-        if bmin < 1:
-            bmin = 1
+    # Determine bmin: which Wien2k band does EIG band 1 correspond to?
+    # QTL always starts from Wien2k band 1. EIG starts from Wien2k band bmin.
+    # Auto-detect by matching k-averaged eigenvalues between QTL and EIG.
+    # QTL energies are in Ry (absolute), EIG are in eV (Fermi-shifted by w2w).
+    # We Fermi-shift the QTL energies and convert to eV, then match.
+
+    # Determine bmin by matching band energy PATTERNS between QTL and EIG.
+    # Both have k-averaged energies but may use different Fermi references.
+    # Strategy: compute energy GAPS between consecutive bands (reference-free),
+    # then slide the EIG pattern along the QTL pattern to find best alignment.
+
+    # QTL k-averaged energies (in Ry, then convert to eV — no Fermi shift needed
+    # since we only use gaps)
+    qtl_lines = open(args.qtl or f'{d}/{case}.qtl').readlines()
+    qtl_band_starts = [i for i, l in enumerate(qtl_lines) if l.strip().startswith('BAND')]
+    qtl_kavg = []
+    for bs in qtl_band_starts:
+        lpk = meta['nat'] + 1
+        nk_q = meta['nk_qtl']
+        esum = sum(float(qtl_lines[bs + 1 + ik * lpk].split()[0])
+                   for ik in range(nk_q))
+        qtl_kavg.append(esum / nk_q * 13.605693)  # Ry -> eV, absolute
+
+    # EIG k-averaged energies (in eV, Fermi-shifted)
+    eig_kavg = eigvals.mean(axis=1).tolist()
+
+    # Compute gap patterns (differences between consecutive bands)
+    qtl_gaps = [qtl_kavg[i+1] - qtl_kavg[i] for i in range(len(qtl_kavg)-1)]
+    eig_gaps = [eig_kavg[i+1] - eig_kavg[i] for i in range(len(eig_kavg)-1)]
+
+    # Slide EIG gap pattern along QTL gap pattern, find best alignment
+    best_score = 1e10
+    bmin = 1
+    n_match = min(len(eig_gaps), 5)  # match first 5 gaps
+    for offset in range(len(qtl_gaps) - n_match + 1):
+        score = sum(abs(qtl_gaps[offset + i] - eig_gaps[i]) for i in range(n_match))
+        if score < best_score:
+            best_score = score
+            bmin = offset + 1  # 1-indexed Wien2k band
+
+    # Verify with absolute energy matching (using Fermi-shifted QTL)
+    ef_ry = meta['ef_ry']
+    qtl_kavg_shifted = [(e - ef_ry * 13.605693) for e in qtl_kavg]
+    abs_diff = abs(qtl_kavg_shifted[bmin - 1] - eig_kavg[0])
+    if abs_diff > 1.0:
+        # Gap pattern might be ambiguous, try fermi file
+        fermi_file = f'{d}/{case}.fermi'
+        if os.path.exists(fermi_file):
+            ef_w2w = float(open(fermi_file).read().strip()) * 13.605693
+            qtl_kavg_w2w = [(e - ef_w2w) for e in qtl_kavg]
+            diffs = [abs(qtl_kavg_w2w[q] - eig_kavg[0]) for q in range(len(qtl_kavg_w2w))]
+            bmin_alt = np.argmin(diffs) + 1
+            if diffs[bmin_alt - 1] < abs_diff:
+                bmin = bmin_alt
 
     print(f"System: EIG={nb_eig} bands, QTL={nb_qtl} bands, {nk} k-pts")
     print(f"bmin={bmin} (EIG band 1 = Wien2k band {bmin})")
@@ -342,22 +385,32 @@ def main():
     e_avg = eigvals.mean(axis=1)
     exclude = set()
 
-    # 1. Energy gap detection: exclude bands below gaps > 5 eV,
-    #    BUT only if the band has low target character (< 0.10).
-    #    This prevents excluding valence bands like As 4s that sit
-    #    below a gap but have strong target orbital character.
+    # 1. Energy gap detection: exclude ALL bands below the largest
+    #    gap > 5 eV below E_F. These are core/semicore states
+    #    regardless of their orbital character (e.g. Mg 2p has
+    #    high sp character but is semicore).
+    largest_gap, largest_gap_idx = 0, -1
     for ib in range(nb - 1):
         gap = e_avg[ib + 1] - e_avg[ib]
-        if e_avg[ib] < 0 and gap > 5.0:
-            for jb in range(ib + 1):
-                if target_char[jb] < 0.10:
-                    exclude.add(jb)
+        if e_avg[ib] < 0 and gap > 5.0 and gap > largest_gap:
+            largest_gap = gap
+            largest_gap_idx = ib
+    if largest_gap_idx >= 0:
+        for jb in range(largest_gap_idx + 1):
+            exclude.add(jb)
 
     # 2. Pure d/f semicore (> 90% single-orbital character)
     for ib in range(nb):
         for ja in range(meta['nat']):
             if qtl_char_aligned[ib, ja, 2] > 0.90 or qtl_char_aligned[ib, ja, 3] > 0.90:
                 exclude.add(ib)
+
+    # 3. Bands with negligible target character (< 1% of max target)
+    #    These are free-electron-like or belong to non-target orbitals.
+    max_tc = max(target_char) if len(target_char) > 0 else 1.0
+    for ib in range(nb):
+        if ib not in exclude and target_char[ib] < 0.01 * max_tc:
+            exclude.add(ib)
 
     # Align qtl_int too
     qtl_int_aligned = np.zeros(nb)
@@ -389,45 +442,121 @@ def main():
     print(f"TOP {n} CONFIGURATIONS (of {len(results)} valid)")
     print(f"{'='*110}")
     print(f"{'#':>3s} {'Score':>7s} {'Frozen':>14s} {'Outer':>14s} "
-          f"{'Nf':>3s} {'Nd':>3s} {'MxF':>4s} {'AvgP':>6s} {'Gauge':>6s} "
-          f"{'Weak':>5s} {'Frozen bands':>30s}")
+          f"{'Nf':>3s} {'Nd':>3s} {'AvgP':>6s} {'Gauge':>5s} {'OvrEx':>5s} "
+          f"{'Frozen bands':>30s}")
     print('-' * 115)
     for i, (loss, fmin, fmax, dmin, dmax, det) in enumerate(results[:n]):
         print(f"{i+1:3d} {det['score']:7.4f} [{fmin:5.1f},{fmax:5.1f}] "
               f"[{dmin:5.1f},{dmax:5.1f}] "
-              f"{det['nf']:3d} {det['nd']:3d} {det['max_frozen']:4d} "
-              f"{det['avg_proj']:6.4f} {det['gauge']:6.3f} "
-              f"{det['weak_penalty']:5.3f} "
+              f"{det['nf']:3d} {det['nd']:3d} "
+              f"{det['avg_proj']:6.4f} {det['gauge']:5.3f} "
+              f"{det.get('overextend',0):5.3f} "
               f"{str(det['frozen']):>30s}")
 
     if args.write:
         import shutil
-        os.makedirs(f'{d}/runs_opt', exist_ok=True)
+
+        excl_1idx = sorted(ib + 1 for ib in exclude)
+        outdir = f'{d}/runs_opt'
+        os.makedirs(outdir, exist_ok=True)
+
+        # Read base .win for structural blocks
+        base_win = ''
+        win_path = f'{d}/{case}.win'
+        if os.path.exists(win_path):
+            with open(win_path) as f:
+                base_win = f.read()
+            # Strip all parameter lines (we'll write fresh ones)
+            for k in ['num_wann','num_bands','dis_froz_min','dis_froz_max',
+                       'dis_win_min','dis_win_max','exclude_bands',
+                       'dis_num_iter','dis_conv_tol','dis_conv_window',
+                       'num_iter','conv_tol','conv_window','restart']:
+                base_win = re.sub(rf'^{k}\s*=.*\n', '', base_win, flags=re.MULTILINE)
+            base_win = re.sub(r'! ===.*?! === end.*?===\s*\n?', '', base_win, flags=re.DOTALL)
+
+        config_names = []
         for i, (loss, fmin, fmax, dmin, dmax, det) in enumerate(results[:n]):
             dirname = f'opt_{i+1:02d}'
-            od = f'{d}/runs_opt/{dirname}'
+            config_names.append(dirname)
+            od = f'{outdir}/{dirname}'
             os.makedirs(od, exist_ok=True)
+
+            # Copy shared files
             for fn in [f'{case}.amn', f'{case}.mmn', f'{case}.eig',
                        f'{case}.nnkp', f'{case}.struct', f'{case}.fermi',
                        f'{case}.klist_band', f'{case}.spaghetti_ene']:
-                src = f'{d}/{fn}'
-                if os.path.exists(src):
-                    shutil.copy(src, od)
+                src_path = f'{d}/{fn}'
+                if os.path.exists(src_path):
+                    shutil.copy(src_path, od)
 
-            excl_1idx = sorted(ib + 1 for ib in exclude)
-            with open(f'{od}/config.json', 'w') as f:
-                json.dump({
-                    'rank': i+1, 'score': det['score'],
-                    'fmin': float(fmin), 'fmax': float(fmax),
-                    'dmin': float(dmin), 'dmax': float(dmax),
-                    'frozen_bands': det['frozen'],
-                    'exclude_bands': excl_1idx,
-                    'num_wann': num_wann, 'num_bands': nb,
-                    'details': {k: (float(v) if isinstance(v, (np.floating, float)) else v)
-                                for k, v in det.items()},
-                }, f, indent=2)
-            print(f"  {dirname}: [{fmin:.1f},{fmax:.1f}] nf={det['nf']} "
-                  f"score={det['score']:.4f}")
+            # Write .win with optimizer-determined parameters
+            header = f"""! === {dirname}: {det['nf']} frozen {det['frozen']}, score={det['score']:.4f} ===
+num_wann        = {num_wann}
+num_bands       = {nb}
+dis_froz_min    = {fmin:.6f}
+dis_froz_max    = {fmax:.6f}
+dis_win_min     = {dmin:.6f}
+dis_win_max     = {dmax:.6f}
+exclude_bands   = {','.join(str(b) for b in excl_1idx)}
+dis_num_iter    = 10000
+dis_conv_tol    = 1.0e-12
+dis_conv_window = 5
+num_iter        = 10000
+conv_tol        = 1.0e-12
+conv_window     = 5
+! === end ===
+"""
+            with open(f'{od}/{case}.win', 'w') as f:
+                f.write(header + '\n' + base_win)
+
+            with open(f'{od}/APPROACH.txt', 'w') as f:
+                f.write(f'{dirname}: {det["nf"]} frozen {det["frozen"]}\n')
+                f.write(f'frozen=[{fmin:.1f},{fmax:.1f}] outer=[{dmin:.1f},{dmax:.1f}]\n')
+                f.write(f'exclude={excl_1idx}\n')
+                f.write(f'score={det["score"]:.4f}\n')
+
+            print(f"  {dirname}: frozen={det['frozen']} [{fmin:.1f},{fmax:.1f}] "
+                  f"excl={excl_1idx} score={det['score']:.4f}")
+
+        # Write SLURM script
+        names_str = ' '.join(config_names)
+        with open(f'{outdir}/run_opt.sh', 'w') as f:
+            f.write(f"""#!/bin/bash --login
+#SBATCH -J qtl_opt
+#SBATCH -o qtl_opt-%J.o
+#SBATCH --ntasks=25
+#SBATCH --cpus-per-task=1
+#SBATCH -N 1
+#SBATCH --mem-per-cpu=4G
+#SBATCH -p general,mendoza_q
+#SBATCH -t 4:00:00
+
+module purge
+module load Wannier90/3.1.0-intel-2024a
+
+DIR=$SLURM_SUBMIT_DIR
+
+for config in {names_str}; do
+    echo "========================================"
+    echo "Running config: $config"
+    cat "$DIR/$config/APPROACH.txt"
+    echo "========================================"
+    cd "$DIR/$config"
+    mpirun -n $SLURM_NTASKS wannier90.x {case}
+    echo "Finished: $config (exit code: $?)"
+    echo ""
+done
+
+echo "All configs complete."
+echo "=== Summary ==="
+for config in {names_str}; do
+    omega=$(grep "Omega Total" "$DIR/$config/{case}.wout" 2>/dev/null | tail -1 | awk '{{print $NF}}')
+    delta=$(grep "CONV" "$DIR/$config/{case}.wout" 2>/dev/null | tail -1 | awk '{{print $2}}')
+    echo "$config: Omega_Total=$omega  Delta=$delta"
+done
+""")
+        print(f"\n  SLURM script: {outdir}/run_opt.sh")
+        print(f"  Transfer {outdir}/ and: cd runs_opt && sbatch run_opt.sh")
 
     return 0
 
