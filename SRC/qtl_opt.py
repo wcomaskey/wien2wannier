@@ -171,34 +171,71 @@ def loss_function(fmin, fmax, dmin, dmax, eigvals, target_char,
     frozen = [ib for ib in active
               if eigvals[ib].min() >= fmin and eigvals[ib].max() <= fmax]
 
-    # Scoring
-    proj = sum(target_char[ib] for ib in frozen) / max(1, num_wann)
-    # Coverage: fraction of active energy range covered by frozen window
-    active_emin = min(eigvals[ib].min() for ib in active)
-    active_emax = max(eigvals[ib].max() for ib in active)
-    active_range = active_emax - active_emin
-    coverage = min(1.0, (fmax - fmin) / max(1.0, active_range))
-    n_dis = min_outer - len(frozen)
-    disent = min(1.0, n_dis / num_wann)
-    froz_frac = len(frozen) / num_wann
+    # ---- Scoring components ----
 
-    # Asymmetry penalty: prefer valence side wider
+    nf = len(frozen)
+    n_dis = min_outer - nf
+
+    # 1. Projectability: energy-weighted average target character.
+    #    Bands near E_F (=0) contribute more than distant bands.
+    #    weight(E) = exp(-|E|/sigma) with sigma = 8 eV
+    e_avg_band = eigvals.mean(axis=1)
+    sigma_prox = 8.0
+    if nf > 0:
+        weighted_proj = sum(target_char[ib] * np.exp(-abs(e_avg_band[ib]) / sigma_prox)
+                           for ib in frozen)
+        weight_sum = sum(np.exp(-abs(e_avg_band[ib]) / sigma_prox) for ib in frozen)
+        avg_proj = weighted_proj / weight_sum
+    else:
+        avg_proj = 0
+
+    # 2. Coverage: frozen window width, but only count the useful part.
+    #    Cap at 30 eV reference — beyond that, diminishing returns.
+    coverage = min(1.0, (fmax - fmin) / 30.0)
+
+    # 3. Gauge freedom: ratio of disentangle to total active bands.
+    #    More disentangle = more freedom for Wannier90 to optimize.
+    #    Use log scaling: going from 1→2 disentangle bands matters more
+    #    than 10→11.
+    gauge = np.log1p(n_dis) / np.log1p(num_wann)
+
+    # 4. Frozen efficiency: frozen_count / num_wann, but penalize
+    #    if frozen > 0.8 * num_wann (too little gauge freedom).
+    eff = nf / num_wann
+    if nf > 0.8 * num_wann:
+        eff *= 0.8  # penalty for over-freezing
+
+    # 5. Projectability floor: penalize if any frozen band has
+    #    target character below the median of all active bands.
+    active_median = np.median([target_char[ib] for ib in active])
+    weak_frozen = sum(1 for ib in frozen if target_char[ib] < active_median)
+    weak_penalty = 0.1 * weak_frozen / max(1, nf)
+
+    # 6. Asymmetry: prefer frozen window wider below E_F than above.
+    #    Valence states below E_F are more important for ground-state
+    #    properties; conduction states above benefit from gauge freedom.
     asym = 0
     if fmax > 0 and fmin < 0:
         ratio = abs(fmin) / max(0.1, fmax)
         if ratio < 1.5:
-            asym = 0.1 * (1.5 - ratio)
+            asym = 0.05 * (1.5 - ratio)
 
-    score = (1.0 * proj + 0.5 * coverage + 0.3 * disent
-             + 0.4 * froz_frac - asym)
+    # Combine with weights
+    score = (1.0 * avg_proj      # quality of frozen bands
+             + 0.2 * coverage    # window width (small weight)
+             + 0.8 * gauge       # gauge freedom (dominant!)
+             + 0.2 * eff         # frozen efficiency (small)
+             - weak_penalty      # penalize weak frozen bands
+             - asym)             # prefer valence-heavy windows
 
     return -score, {
         'frozen': [ib + 1 for ib in frozen],
-        'nf': len(frozen), 'nd': n_dis,
+        'nf': nf, 'nd': n_dis,
         'min_outer': min_outer, 'max_frozen': max_frozen,
-        'proj': proj, 'coverage': coverage,
-        'disent': disent, 'froz_frac': froz_frac,
-        'asym': asym, 'score': score,
+        'avg_proj': avg_proj, 'coverage': coverage,
+        'gauge': gauge, 'eff': eff,
+        'weak_penalty': weak_penalty, 'asym': asym,
+        'score': score,
     }
 
 
@@ -292,14 +329,15 @@ def main():
     print(f"TOP {n} CONFIGURATIONS (of {len(results)} valid)")
     print(f"{'='*110}")
     print(f"{'#':>3s} {'Score':>7s} {'Frozen':>14s} {'Outer':>14s} "
-          f"{'Nf':>3s} {'Nd':>3s} {'MxF':>4s} {'Proj':>6s} {'Cov':>5s} "
-          f"{'Frozen bands':>30s}")
-    print('-' * 110)
+          f"{'Nf':>3s} {'Nd':>3s} {'MxF':>4s} {'AvgP':>6s} {'Gauge':>6s} "
+          f"{'Weak':>5s} {'Frozen bands':>30s}")
+    print('-' * 115)
     for i, (loss, fmin, fmax, dmin, dmax, det) in enumerate(results[:n]):
         print(f"{i+1:3d} {det['score']:7.4f} [{fmin:5.1f},{fmax:5.1f}] "
               f"[{dmin:5.1f},{dmax:5.1f}] "
               f"{det['nf']:3d} {det['nd']:3d} {det['max_frozen']:4d} "
-              f"{det['proj']:6.3f} {det['coverage']:5.3f} "
+              f"{det['avg_proj']:6.4f} {det['gauge']:6.3f} "
+              f"{det['weak_penalty']:5.3f} "
               f"{str(det['frozen']):>30s}")
 
     if args.write:
