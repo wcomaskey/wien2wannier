@@ -245,15 +245,16 @@ def loss_function(fmin, fmax, dmin, dmax, eigvals, target_char,
         if ratio < 2.0:
             asym = 0.1 * (2.0 - ratio)
 
-    # 9. Fermi coverage: fraction of bands within ±5 eV of E_F that
-    #    are frozen. This is the key metric — bands near E_F MUST be
-    #    frozen for accurate Fermi surface interpolation.
-    fermi_range = 5.0  # eV
-    bands_near_ef = [ib for ib in active
-                     if abs(e_avg_band[ib]) <= fermi_range]
-    frozen_near_ef = [ib for ib in frozen
-                      if abs(e_avg_band[ib]) <= fermi_range]
-    fermi_cov = len(frozen_near_ef) / max(1, len(bands_near_ef))
+    # 9. Target coverage: fraction of the num_wann highest-character
+    #    bands that are frozen. These are the bands most likely to
+    #    form the Wannier manifold. For semiconductors, these are the
+    #    valence+gap-edge bands. For metals, these are the bands near E_F.
+    #    We pick the top num_wann bands by target character — if all of
+    #    them are frozen, fermi_cov = 1.0.
+    tc_ranked = sorted(active, key=lambda ib: target_char[ib], reverse=True)
+    target_bands = tc_ranked[:num_wann]  # top num_wann by character
+    frozen_targets = [ib for ib in frozen if ib in target_bands]
+    fermi_cov = len(frozen_targets) / max(1, len(target_bands))
 
     # Combine — Fermi coverage and projectability are dominant
     score = (1.0 * avg_proj      # quality of frozen bands
@@ -278,9 +279,35 @@ def loss_function(fmin, fmax, dmin, dmax, eigvals, target_char,
     }
 
 
+def find_gap_edges(eigvals, active):
+    """Find energy gap midpoints between consecutive active bands.
+    Returns sorted list of gap midpoint energies suitable for window edges."""
+    nb = eigvals.shape[0]
+    # Sort active bands by k-averaged energy
+    e_avg = eigvals.mean(axis=1)
+    sorted_active = sorted(active, key=lambda ib: e_avg[ib])
+
+    edges = []
+    for i in range(len(sorted_active) - 1):
+        ib_lo = sorted_active[i]
+        ib_hi = sorted_active[i + 1]
+        gap_min = eigvals[ib_hi].min() - eigvals[ib_lo].max()
+        if gap_min > 0.5:  # only use real gaps (> 0.5 eV)
+            midpoint = 0.5 * (eigvals[ib_lo].max() + eigvals[ib_hi].min())
+            edges.append(midpoint)
+
+    # Also add edges just outside the active range
+    e_lo = min(eigvals[ib].min() for ib in active)
+    e_hi = max(eigvals[ib].max() for ib in active)
+    edges.append(e_lo - 0.5)
+    edges.append(e_hi + 0.5)
+
+    return sorted(set(edges))
+
+
 def grid_sweep(eigvals, target_char, num_wann, exclude,
                min_fwin=(4.0, 2.0), step=0.5):
-    """Sweep frozen window grid, return sorted results."""
+    """Sweep frozen window using gap-snapped edges + regular grid."""
     active = [ib for ib in range(eigvals.shape[0]) if ib not in exclude]
     e_lo = min(eigvals[ib].min() for ib in active)
     e_hi = max(eigvals[ib].max() for ib in active)
@@ -288,9 +315,19 @@ def grid_sweep(eigvals, target_char, num_wann, exclude,
     dmin = e_lo - 2.0
     dmax = e_hi + 2.0
 
+    # Build candidate fmin/fmax values:
+    # Regular grid + gap-snapped edges (ensures we test mid-gap positions)
+    gap_edges = find_gap_edges(eigvals, active)
+    fmin_candidates = sorted(set(
+        list(np.arange(e_lo - 1, 1, step)) + [e for e in gap_edges if e < 1]
+    ))
+    fmax_candidates = sorted(set(
+        list(np.arange(0, e_hi + 1, step)) + [e for e in gap_edges if e > 0]
+    ))
+
     results = []
-    for fmin in np.arange(e_lo - 1, 1, step):
-        for fmax in np.arange(0, e_hi + 1, step):
+    for fmin in fmin_candidates:
+        for fmax in fmax_candidates:
             if fmax <= fmin:
                 continue
             loss, det = loss_function(
