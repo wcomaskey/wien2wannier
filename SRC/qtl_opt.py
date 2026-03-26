@@ -199,59 +199,80 @@ def loss_function(fmin, fmax, dmin, dmax, eigvals, target_char,
     else:
         avg_proj = 0
 
-    # 2. Coverage: reward frozen window width with diminishing returns.
-    #    Use asymmetric valence/conduction weighting: extending below
-    #    E_F (valence) is cheaper than extending above (conduction).
-    #    The conduction penalty increases quadratically with fmax.
-    valence_width = max(0, -fmin)  # how far below E_F
-    conduction_width = max(0, fmax)  # how far above E_F
-    # Valence coverage: linear, up to 20 eV
-    val_cov = min(1.0, valence_width / 20.0)
-    # Conduction coverage: diminishing returns, penalize >8 eV
-    cond_cov = min(1.0, conduction_width / 10.0)
-    cond_penalty = max(0, conduction_width - 8.0) ** 2 / 100.0  # quadratic penalty above 8 eV
-    coverage = 0.6 * val_cov + 0.4 * cond_cov
-    overextend = cond_penalty
+    # 2. Conduction restraint: penalize fmax extending above E_F.
+    #    Empirically, tighter frozen windows above E_F give better
+    #    band structures because conduction bands benefit from gauge
+    #    freedom more than from being frozen. Use a steep penalty
+    #    that increases linearly with fmax above a material-dependent
+    #    threshold (half the valence bandwidth).
+    conduction_width = max(0, fmax)
+    valence_width = max(0, -fmin)
+    cond_threshold = 0.5 * valence_width  # half the valence side
+    overextend = max(0, conduction_width - cond_threshold) * 0.05
 
-    # 3. Gauge freedom
+    # 3. Coverage: only reward valence-side coverage (below E_F).
+    #    Conduction coverage is NOT rewarded — it's handled by the
+    #    outer window (disentanglement), not the frozen window.
+    coverage = min(1.0, valence_width / 15.0)
+
+    # 4. Gauge freedom: strongly reward having disentangle bands.
     gauge = np.log1p(n_dis) / np.log1p(num_wann)
 
-    # 4. Frozen cap: freeze at most ~60% of num_wann
+    # 5. Frozen cap: freeze at most ~65% of num_wann.
     max_frozen_frac = 0.65
     if nf > max_frozen_frac * num_wann:
         return 1e6, {}
 
-    # 5. Frozen efficiency
-    eff = min(1.0, nf / (max_frozen_frac * num_wann))
+    # Minimum frozen: must freeze at least 2 bands (otherwise
+    # the frozen window is meaningless)
+    if nf < 2:
+        return 1e6, {}
 
-    # 6. Weak band penalty
+    # 6. Parsimony: mild preference for fewer frozen bands.
+    #    Uses sqrt to compress the range — going from 6→5 frozen
+    #    matters less than going from 2→1.
+    parsimony = np.sqrt(1.0 - nf / (max_frozen_frac * num_wann))
+
+    # 7. Weak band penalty
     active_median = np.median([target_char[ib] for ib in active])
     weak_frozen = sum(1 for ib in frozen if target_char[ib] < active_median)
     weak_penalty = 0.1 * weak_frozen / max(1, nf)
 
-    # 7. Asymmetry: valence side should be wider
+    # 8. Asymmetry: valence side should be at least 2x the conduction side
     asym = 0
-    if fmax > 0 and fmin < 0:
-        ratio = abs(fmin) / max(0.1, fmax)
-        if ratio < 1.5:
-            asym = 0.05 * (1.5 - ratio)
+    if conduction_width > 0 and valence_width > 0:
+        ratio = valence_width / conduction_width
+        if ratio < 2.0:
+            asym = 0.1 * (2.0 - ratio)
 
-    # Combine
+    # 9. Fermi coverage: fraction of bands within ±5 eV of E_F that
+    #    are frozen. This is the key metric — bands near E_F MUST be
+    #    frozen for accurate Fermi surface interpolation.
+    fermi_range = 5.0  # eV
+    bands_near_ef = [ib for ib in active
+                     if abs(e_avg_band[ib]) <= fermi_range]
+    frozen_near_ef = [ib for ib in frozen
+                      if abs(e_avg_band[ib]) <= fermi_range]
+    fermi_cov = len(frozen_near_ef) / max(1, len(bands_near_ef))
+
+    # Combine — Fermi coverage and projectability are dominant
     score = (1.0 * avg_proj      # quality of frozen bands
-             + 0.3 * coverage    # useful window width
-             + 0.5 * gauge       # gauge freedom
-             + 0.3 * eff         # frozen efficiency
-             - weak_penalty      # penalize weak frozen bands
-             - asym              # prefer valence-heavy windows
-             - floor_penalty     # penalize narrow windows
-             - overextend)       # penalize extending past natural gap
+             + 0.3 * coverage    # valence coverage
+             + 0.4 * gauge       # gauge freedom
+             + 0.6 * fermi_cov   # Fermi-level band coverage (key!)
+             + 0.1 * parsimony   # very mild fewer-frozen preference
+             - weak_penalty
+             - asym
+             - floor_penalty
+             - overextend)
 
     return -score, {
         'frozen': [ib + 1 for ib in frozen],
         'nf': nf, 'nd': n_dis,
         'min_outer': min_outer, 'max_frozen': max_frozen,
         'avg_proj': avg_proj, 'coverage': coverage,
-        'gauge': gauge, 'eff': eff, 'overextend': overextend,
+        'gauge': gauge, 'parsimony': parsimony, 'overextend': overextend,
+        'fermi_cov': fermi_cov,
         'weak_penalty': weak_penalty, 'asym': asym,
         'score': score,
     }
@@ -442,14 +463,15 @@ def main():
     print(f"TOP {n} CONFIGURATIONS (of {len(results)} valid)")
     print(f"{'='*110}")
     print(f"{'#':>3s} {'Score':>7s} {'Frozen':>14s} {'Outer':>14s} "
-          f"{'Nf':>3s} {'Nd':>3s} {'AvgP':>6s} {'Gauge':>5s} {'OvrEx':>5s} "
+          f"{'Nf':>3s} {'Nd':>3s} {'AvgP':>6s} {'Gauge':>5s} {'FeCov':>5s} {'OvEx':>5s} "
           f"{'Frozen bands':>30s}")
-    print('-' * 115)
+    print('-' * 120)
     for i, (loss, fmin, fmax, dmin, dmax, det) in enumerate(results[:n]):
         print(f"{i+1:3d} {det['score']:7.4f} [{fmin:5.1f},{fmax:5.1f}] "
               f"[{dmin:5.1f},{dmax:5.1f}] "
               f"{det['nf']:3d} {det['nd']:3d} "
               f"{det['avg_proj']:6.4f} {det['gauge']:5.3f} "
+              f"{det.get('fermi_cov',0):5.3f} "
               f"{det.get('overextend',0):5.3f} "
               f"{str(det['frozen']):>30s}")
 
