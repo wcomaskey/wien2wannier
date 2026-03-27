@@ -148,13 +148,12 @@ def loss_function(fmin, fmax, dmin, dmax, eigvals, target_char,
         return 1e6, {}
     if fmin < dmin or fmax > dmax:
         return 1e6, {}
-    # Minimum frozen window: soft constraint (penalty, not rejection)
-    # Configs with smaller frozen windows are penalized but not excluded
+    # Minimum frozen window: HARD constraint.
+    # The floor is computed adaptively from the band structure to ensure
+    # Fermi-crossing bands and gap-edge bands are fully inside.
     floor_penalty = 0
-    if fmin > -min_fwin[0]:
-        floor_penalty += 0.1 * (fmin + min_fwin[0])  # how far above floor
-    if fmax < min_fwin[1]:
-        floor_penalty += 0.1 * (min_fwin[1] - fmax)  # how far below floor
+    if fmin > -min_fwin[0] or fmax < min_fwin[1]:
+        return 1e6, {}
 
     # Band counts at each k
     min_outer = nb
@@ -486,10 +485,53 @@ def main():
               f"{qtl_int_aligned[ib]:5.3f} {st:>8s}")
 
     print(f"\nExcluded: {sorted(ib+1 for ib in exclude)}")
+
+    # Compute adaptive minimum frozen window from band structure.
+    # fmin_floor: must cover all active bands below E_F that have
+    #   significant target character (> 10% of max).
+    # fmax_floor: must cover all Fermi-crossing bands (metals) or
+    #   the first conduction band above the gap (semiconductors).
+    active_list = [ib for ib in range(nb) if ib not in exclude]
+    tc_thresh = 0.1 * max(target_char[ib] for ib in active_list)
+
+    # fmin: deepest target band below E_F
+    target_below = [ib for ib in active_list
+                    if e_avg[ib] < 0 and target_char[ib] > tc_thresh]
+    if target_below:
+        fmin_floor = abs(min(eigvals[ib].min() for ib in target_below)) + 0.5
+    else:
+        fmin_floor = args.efmin
+
+    # fmax: detect Fermi-crossing bands or first conduction band
+    crossing = [ib for ib in active_list
+                if eigvals[ib].min() < 0 and eigvals[ib].max() > 0]
+    if crossing:
+        # Metal: fmax must cover the top of all Fermi-crossing bands
+        fmax_floor = max(eigvals[ib].max() for ib in crossing) + 0.5
+    else:
+        # Semiconductor: fmax must cover first conduction band
+        cond_bands = [ib for ib in active_list if e_avg[ib] > 0]
+        if cond_bands:
+            first_cond = min(cond_bands, key=lambda ib: e_avg[ib])
+            fmax_floor = eigvals[first_cond].max() + 0.5
+        else:
+            fmax_floor = args.efmax
+
+    # Use the larger of adaptive and user-specified floors
+    fmin_floor = max(fmin_floor, args.efmin)
+    fmax_floor = max(fmax_floor, args.efmax)
+
+    print(f"Adaptive frozen floor: [-{fmin_floor:.1f}, +{fmax_floor:.1f}] eV")
+    if crossing:
+        print(f"  (metal: {len(crossing)} Fermi-crossing bands, "
+              f"max extent = +{max(eigvals[ib].max() for ib in crossing):.1f} eV)")
+    else:
+        print(f"  (semiconductor: first conduction band to +{fmax_floor-0.5:.1f} eV)")
+
     print(f"\nGrid sweep (step={args.step} eV)...")
 
     results = grid_sweep(eigvals, target_char, num_wann, exclude,
-                         (args.efmin, args.efmax), args.step)
+                         (fmin_floor, fmax_floor), args.step)
 
     if not results:
         print("ERROR: No valid configs found!")
