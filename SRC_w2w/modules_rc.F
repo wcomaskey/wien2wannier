@@ -85,6 +85,10 @@ subroutine almgen(Alm, stru, jatom, lfirst, NB, kkk)
   complex(C16) :: h_blyl((LMAX2+1)**2, iblock)
   complex(C16) :: ALMt  ((LMAX2+1)**2, Nb, Nrf, stru%mult(JATOM))
 
+  ! Precomputed conjugate spherical harmonics for each plane wave
+  complex(C16), allocatable :: YL_all(:,:)
+  integer  :: Npw
+
   real(R8) :: fac, arg, arg1, arg2, arg3
   integer  :: N, num, i,ii,i3, latom, mu, index, l, max, m,m1, irf,mirf, ibb, lda,ldb,ldc, jlo,jneq
 
@@ -100,39 +104,41 @@ subroutine almgen(Alm, stru, jatom, lfirst, NB, kkk)
 
   ! calculate Bessel functions j_l(|Q+k|*RMT)
   call harmon(stru, jatom, N, BKX, BKY, BKZ ,Lmax2, FJ, DFJ)
+
+  ! Precompute conjugate spherical harmonics for all LAPW plane waves.
+  ! YLM depends only on the direction of Q+k (via conv_rec), not on
+  ! atom position, so this can be done once before the mu loop.
+  Npw = N-(nlo+nlon+nlov)
+  allocate(YL_all((LMAX2+1)**2, Npw))
+  do I=1,Npw
+     BK = matmul(stru%conv_rec, (/BKX(I), BKY(I), BKZ(I)/))
+     call YLM(BK, LMAX2, YL)
+     YL_all(:,I) = conjg(YL)
+  end do
+
   do MU=1, stru%mult(jatom)
      latom=lfirst-1+mu
 
      ! matching of plane wave and atomic functions
-     do ii=1,N-(nlo+nlon+nlov),iblock
+     do ii=1,Npw,iblock
         i3=0
-        do i=ii,min(ii+iblock-1,N-(nlo+nlon+nlov))
+        do i=ii,min(ii+iblock-1,Npw)
            i3=i3+1
 
-           ! transform Q+k to cartesian coordinates
-           BK = matmul(stru%conv_rec, (/BKX(I), BKY(I), BKZ(I)/))
-
-           call YLM (BK,LMAX2,YL) ! calculate Y_lm(Q+k)
-
+           ! Phase factor exp(i(Q+k).R_j) depends on atom position
            ARG1=BKX(I) * stru%POS(1,LATOM)*TAU
            ARG2=BKY(I) * stru%POS(2,LATOM)*TAU
            ARG3=BKZ(I) * stru%POS(3,LATOM)*TAU
 
            PHSHEL=exp((0,1)*(ARG1+ARG2+ARG3)) ! exp(i(Q+k)R_j)
-           INDEX=0
-           do L=0,LMAX2
-              MAX=2*L+1
-              do M=1,MAX
-                 INDEX=INDEX+1
-                 h_yl(index,i3)=conjg(yl(index))*phshel
-              end do
-           end do
+           ! Combine precomputed conjg(YLM) with phase factor
+           h_yl(:,i3) = YL_all(:,I) * phshel
         end do
 
         INDEX=0
         do L=0,LMAX2
            i3=0
-           do i=ii,min(ii+iblock-1,N-(nlo+nlon+nlov))
+           do i=ii,min(ii+iblock-1,Npw)
               i3=i3+1
               if (lapw(l)) then
                  h_AL(i3)=DFJ(L,I)*P(L,2)-FJ(L,I)*DP(L,2)
@@ -147,7 +153,7 @@ subroutine almgen(Alm, stru, jatom, lfirst, NB, kkk)
            do M=1,MAX
               INDEX=INDEX+1
               i3=0
-              do i=ii,min(ii+iblock-1,N-(nlo+nlon+nlov))
+              do i=ii,min(ii+iblock-1,Npw)
                  i3=i3+1
                  h_alyl(index,i3)=h_AL(i3)*h_YL(INDEX,i3)
                  h_blyl(index,i3)=h_BL(i3)*h_YL(INDEX,i3)
@@ -155,7 +161,7 @@ subroutine almgen(Alm, stru, jatom, lfirst, NB, kkk)
            end do
         end do
 
-        ibb = min(iblock, N - (nlo+nlon+nlov) - ii + 1)
+        ibb = min(iblock, Npw - ii + 1)
 #ifndef _COMPLEX_
         lda=2*(LMAX2+1)**2
 #else
@@ -227,6 +233,7 @@ subroutine almgen(Alm, stru, jatom, lfirst, NB, kkk)
         end do
      end do
   end do
+  deallocate(YL_all)
 end subroutine almgen
 end module     almgen_m
 
@@ -271,10 +278,29 @@ subroutine l2Mmn(stru, inwf, num_kpts, NNTOT)
   integer  :: index1,index2,indexj, irf1,irf2, lj, m1,m2,mj, mu
   integer  :: latom, l_index, l1, l2
 
+  ! --- Batched zgemm variables (Opt 3: zgeru → zgemm) ---
+  ! Column map: col_a(irf, index) → flat column 1..Na for active (irf, L,M)
+  integer  :: col_map(NRF, (LMAX2+1)**2)
+  integer  :: Na          ! number of active columns
+  integer  :: ca, cb, ll  ! column indices for ALM/BLM
+  ! Coefficient matrix: S_base(col_b, col_a) accumulates ri_mat*YLB*gaunt
+  ! (without PHSHEL, which is factored out per mu)
+  complex(C16), allocatable :: S_base(:,:)
+  ! Gathered 2D views and workspace for zgemm
+  complex(C16), allocatable :: ALM_2d(:,:), BLM_2d(:,:), W(:,:)
+  logical  :: use_zgemm   ! runtime crossover: zgemm for Nb>=24, zgeru otherwise
+
   integer :: k1_prog_itvl
   k1_prog_itvl = min(max(num_kpts/10, 1), 100)
 
   Nb = inwf%bmax - inwf%bmin + 1
+
+  ! Runtime crossover: batched zgemm wins when Nb is large enough
+  ! for BLAS-3 efficiency to overcome gather/S_base overhead.
+  ! Below Nb=24, the original zgeru rank-1 updates are faster.
+  use_zgemm = (Nb >= 24)
+  write(unit_out, "(' Overlap method: ', A, ' (Nb=', I4, ')')") &
+       merge('batched zgemm', 'zgeru (small)', use_zgemm), Nb
 
   read(unit_vsp, '(50X,I2,//)') ISCF
   LFIRST=1
@@ -298,6 +324,27 @@ subroutine l2Mmn(stru, inwf, num_kpts, NNTOT)
      call atpar(stru, JATOM, itape, jtape)
      fac=2*TAU * stru%RMT(jatom)**2 / sqrt(stru%vol)
      rewind(itape)
+
+     if (use_zgemm) then
+        ! Build column map: enumerate active (irf, L, M) combinations
+        ! col_map(irf, index) = flat column number 1..Na, or 0 if inactive
+        col_map = 0
+        Na = 0
+        do ll = 0, LMAX2
+           do m1 = -ll, ll
+              index1 = ll*(ll+1) + m1 + 1
+              do irf1 = 1, n_rad(ll)
+                 Na = Na + 1
+                 col_map(irf1, index1) = Na
+              end do
+           end do
+        end do
+        write(unit_out, "(' Batched zgemm: Na=', I4, ' active columns')") Na
+
+        ! Allocate work arrays for batched zgemm
+        allocate(S_base(Na, Na))
+        allocate(ALM_2d(Nb, Na), BLM_2d(Nb, Na), W(Nb, Na))
+     end if
 
      pair_index=0
      k1loop: do k1=1,num_kpts      !   loop over k1
@@ -340,6 +387,7 @@ subroutine l2Mmn(stru, inwf, num_kpts, NNTOT)
               enddo
            enddo
            call cpu_time(tt2)
+
            muloop: do mu=1, stru%mult(jatom)
               latom=lfirst-1+mu
               arg1=Bx * stru%pos(1,latom)*TAU
@@ -347,37 +395,107 @@ subroutine l2Mmn(stru, inwf, num_kpts, NNTOT)
               arg3=Bz * stru%pos(3,latom)*TAU
               PHSHEL=exp((0,1)*(ARG1+ARG2+ARG3))*2*TAU
 
-              L_index=0
-              l1loop: do L1=0,LMAX2
-                 l2loop: do L2=0,LMAX2
-                    ljloop: do LJ = abs(L1-L2), min(L1+L2, inwf%LJmax), 2
-                       if (mod((L1+L2+LJ),2) == 1) cycle
-                       if ((L1+L2-LJ) < 0         &
-                            .or. (L1-L2+LJ) < 0   &
-                            .or. (-L1+L2+LJ) < 0) &
-                            & cycle
-                       L_index=L_index+1
-                       m1loop: do M1=-L1,L1
-                          ! OPTIMIZED: Hoist index1 outside MJ loop (depends only on L1, M1)
-                          index1=L1*(L1+1)+M1+1
-                          mjloop: do MJ = max(-LJ, -L2-M1), min(LJ, L2-M1)
-                             M2=M1+MJ                   ! abs(m2) <= l2 !
-                             index2=L2*(L2+1)+M2+1
-                             indexj=LJ*(LJ+1)+MJ+1
-                             tmp=YLB(indexj)*PHSHEL*get_gaunt(L2,LJ,L1,M2,MJ,M1)
-                             R_index=0
-                             do irf1=1,n_rad(L1)
-                                do irf2=1,n_rad(L2)
-                                   R_index=R_index+1
-                                   tmp1=ri_mat(R_index,L_index)*tmp
-                                   call zgeru(NB,NB,tmp1,BLM(1,irf2,index2,mu),1,ALM(1,irf1,index1,mu),1,overlap(1,1,pair_index),size(overlap,1))
+              if (use_zgemm) then
+                 ! --- Opt 3: Batched zgemm path (efficient for Nb >= 24) ---
+                 ! Build S_base on first mu; reuse for subsequent mu values
+                 if (mu == 1) then
+                    ! S_base(col_b, col_a) = sum over (LJ,MJ) of
+                    !   ri_mat * YLB * gaunt (without PHSHEL)
+                    S_base = (0.0_R8, 0.0_R8)
+                    L_index=0
+                    do L1=0,LMAX2
+                       do L2=0,LMAX2
+                          do LJ = abs(L1-L2), min(L1+L2, inwf%LJmax), 2
+                             if (mod((L1+L2+LJ),2) == 1) cycle
+                             if ((L1+L2-LJ) < 0         &
+                                  .or. (L1-L2+LJ) < 0   &
+                                  .or. (-L1+L2+LJ) < 0) &
+                                  & cycle
+                             L_index=L_index+1
+                             do M1=-L1,L1
+                                index1=L1*(L1+1)+M1+1
+                                do MJ = max(-LJ, -L2-M1), min(LJ, L2-M1)
+                                   M2=M1+MJ
+                                   index2=L2*(L2+1)+M2+1
+                                   indexj=LJ*(LJ+1)+MJ+1
+                                   tmp=YLB(indexj)*get_gaunt(L2,LJ,L1,M2,MJ,M1)
+                                   R_index=0
+                                   do irf1=1,n_rad(L1)
+                                      do irf2=1,n_rad(L2)
+                                         R_index=R_index+1
+                                         ca = col_map(irf1, index1)
+                                         cb = col_map(irf2, index2)
+                                         S_base(cb, ca) = S_base(cb, ca) &
+                                              + ri_mat(R_index,L_index)*tmp
+                                      enddo
+                                   enddo
                                 enddo
                              enddo
-                          enddo mjloop
-                       enddo m1loop
-                    enddo ljloop
-                 enddo l2loop
-              enddo l1loop
+                          enddo
+                       enddo
+                    enddo
+                 end if
+
+                 ! Gather ALM and BLM into contiguous 2D arrays (Nb x Na)
+                 do ll = 0, LMAX2
+                    do m1 = -ll, ll
+                       index1 = ll*(ll+1) + m1 + 1
+                       do irf1 = 1, n_rad(ll)
+                          ca = col_map(irf1, index1)
+                          ALM_2d(:, ca) = ALM(:, irf1, index1, mu)
+                          BLM_2d(:, ca) = BLM(:, irf1, index1, mu)
+                       end do
+                    end do
+                 end do
+
+                 ! W(Nb, Na) = BLM_2d(Nb, Na) * (PHSHEL * S_base(Na, Na))
+                 ! overlap += W * ALM_2d^T
+                 call zgemm('N', 'N', Nb, Na, Na, PHSHEL, &
+                      BLM_2d, Nb, S_base, Na, &
+                      (0.0_R8, 0.0_R8), W, Nb)
+                 call zgemm('N', 'T', Nb, Nb, Na, (1.0_R8, 0.0_R8), &
+                      W, Nb, ALM_2d, Nb, &
+                      (1.0_R8, 0.0_R8), overlap(1,1,pair_index), &
+                      size(overlap,1))
+
+              else
+                 ! --- Original zgeru path (efficient for small Nb) ---
+                 L_index=0
+                 do L1=0,LMAX2
+                    do L2=0,LMAX2
+                       do LJ = abs(L1-L2), min(L1+L2, inwf%LJmax), 2
+                          if (mod((L1+L2+LJ),2) == 1) cycle
+                          if ((L1+L2-LJ) < 0         &
+                               .or. (L1-L2+LJ) < 0   &
+                               .or. (-L1+L2+LJ) < 0) &
+                               & cycle
+                          L_index=L_index+1
+                          do M1=-L1,L1
+                             index1=L1*(L1+1)+M1+1
+                             do MJ = max(-LJ, -L2-M1), min(LJ, L2-M1)
+                                M2=M1+MJ
+                                index2=L2*(L2+1)+M2+1
+                                indexj=LJ*(LJ+1)+MJ+1
+                                tmp=YLB(indexj)*PHSHEL &
+                                     *get_gaunt(L2,LJ,L1,M2,MJ,M1)
+                                R_index=0
+                                do irf1=1,n_rad(L1)
+                                   do irf2=1,n_rad(L2)
+                                      R_index=R_index+1
+                                      tmp1=ri_mat(R_index,L_index)*tmp
+                                      call zgeru(NB,NB,tmp1, &
+                                           BLM(1,irf2,index2,mu),1, &
+                                           ALM(1,irf1,index1,mu),1, &
+                                           overlap(1,1,pair_index), &
+                                           size(overlap,1))
+                                   enddo
+                                enddo
+                             enddo
+                          enddo
+                       enddo
+                    enddo
+                 enddo
+              end if
            enddo muloop
            call cpu_time(tt3)
            talm=talm+tt1-tt0
@@ -389,7 +507,8 @@ subroutine l2Mmn(stru, inwf, num_kpts, NNTOT)
              write(unit_out, "('k1=', I5, ' /', I5, ' (', I3, '%)')") &
              &    k1, num_kpts, (100*k1)/num_kpts
      end do k1loop
-     deallocate(ALM,BLM)
+     if (use_zgemm) deallocate(S_base, ALM_2d, BLM_2d, W)
+     deallocate(ALM, BLM)
 
      call cpu_time(t2)
      talm=talm*(NNTOT+1)/NNTOT
@@ -684,6 +803,7 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
   integer  :: index, pair_index, m2x,m2y,m2z, max, i,j,k, ii,jj,kk
   integer  :: i_x,i_y,i_z, k1,k2, kkk, lfirst, jatom, latom, mu
   integer  :: num1,num2, id, ix1,ix2,iy1,iy2,iz1,iz2
+  integer  :: nvalid
   real(R8) :: t1,t2, tt1,tt2,tt3, t_b, t_prod, vv, bx,by,bz, x, arg
 
   logical, allocatable, dimension(:,:) :: a_null, a_null_fin
@@ -692,12 +812,41 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
   complex(C16)       PHSHEL
   complex(C16), allocatable, dimension(:,:,:) :: A_
   complex(C16), allocatable, dimension(:,:) :: B_
+  ! Workspace for gathering valid columns for BLAS zgemm in Step 2
+  complex(C16), allocatable, dimension(:,:) :: Agath, Bgath
+  ! Sparse compressed index lists for Step 1 loop acceleration
+  integer, allocatable :: idx_null(:,:), idx_fin(:,:)
+  integer, allocatable :: idx_null_ix(:,:), idx_null_iy(:,:), idx_null_iz(:,:)
+  integer, allocatable :: idx_fin_ix(:,:), idx_fin_iy(:,:), idx_fin_iz(:,:)
+  integer, allocatable :: n_null(:), n_fin(:)
+  integer :: ni, nj
+#ifdef HAVE_FFTW
+  include 'fftw3.f'
+  integer  :: Nfx, Nfy, Nfz, Nfft_total
+  integer*8 :: plan_fwd, plan_bwd
+  complex(C16), allocatable :: FAC_hat(:,:,:)
+  complex(C16), allocatable :: work3d(:,:,:)
+  real(R8) :: inv_Nfft
+  integer  :: band, wrap_ix, wrap_iy, wrap_iz
+  logical  :: use_fft
+#endif
 
   allocate(FAC(-(2*maxx+1):(2*maxx+1),-(2*maxy+1):(2*maxy+1),-(2*maxz+1):(2*maxz+1)) )
   allocate(A_(NB,0:(2*maxx+1)*(2*maxy+1)*(2*maxz+1)-1,NUM_KPTS) )
   allocate(B_(NB,0:(2*maxx+1)*(2*maxy+1)*(2*maxz+1)-1) )
   allocate(a_null(0:(2*maxx+1)*(2*maxy+1)*(2*maxz+1)-1,NUM_KPTS) )
   allocate(a_null_fin(0:(2*maxx+1)*(2*maxy+1)*(2*maxz+1)-1,NUM_KPTS) )
+  allocate(Agath(NB, (2*maxx+1)*(2*maxy+1)*(2*maxz+1)) )
+  allocate(Bgath(NB, (2*maxx+1)*(2*maxy+1)*(2*maxz+1)) )
+  allocate(idx_null((2*maxx+1)*(2*maxy+1)*(2*maxz+1), NUM_KPTS))
+  allocate(idx_fin((2*maxx+1)*(2*maxy+1)*(2*maxz+1), NUM_KPTS))
+  allocate(idx_null_ix((2*maxx+1)*(2*maxy+1)*(2*maxz+1), NUM_KPTS))
+  allocate(idx_null_iy((2*maxx+1)*(2*maxy+1)*(2*maxz+1), NUM_KPTS))
+  allocate(idx_null_iz((2*maxx+1)*(2*maxy+1)*(2*maxz+1), NUM_KPTS))
+  allocate(idx_fin_ix((2*maxx+1)*(2*maxy+1)*(2*maxz+1), NUM_KPTS))
+  allocate(idx_fin_iy((2*maxx+1)*(2*maxy+1)*(2*maxz+1), NUM_KPTS))
+  allocate(idx_fin_iz((2*maxx+1)*(2*maxy+1)*(2*maxz+1), NUM_KPTS))
+  allocate(n_null(NUM_KPTS), n_fin(NUM_KPTS))
 
   m2x=2*maxx+1
   m2y=2*maxy+1
@@ -706,6 +855,23 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
   write(unit_out,*)'MAX Q:',maxx,maxy,maxz
   t_b=0.d0
   t_prod=0.d0
+
+#ifdef HAVE_FFTW
+  ! FFT grid: 2*m2x per dim guarantees no circular aliasing
+  ! (kernel support [-(m2x-1), m2x-1] has width 2*m2x-1 <= 2*m2x = Nfx)
+  Nfx = 2 * m2x
+  Nfy = 2 * m2y
+  Nfz = 2 * m2z
+  Nfft_total = Nfx * Nfy * Nfz
+  inv_Nfft = 1.0_R8 / Nfft_total
+  allocate(FAC_hat(Nfx, Nfy, Nfz), work3d(Nfx, Nfy, Nfz))
+  ! Create FFTW plans (ESTIMATE: no destructive benchmarking)
+  call dfftw_plan_dft_3d(plan_fwd, Nfx, Nfy, Nfz, &
+       work3d, work3d, FFTW_FORWARD, FFTW_ESTIMATE)
+  call dfftw_plan_dft_3d(plan_bwd, Nfx, Nfy, Nfz, &
+       work3d, work3d, FFTW_BACKWARD, FFTW_ESTIMATE)
+  write(unit_out,*) 'FFT grid:', Nfx, Nfy, Nfz, ' total=', Nfft_total
+#endif
 
   call cpu_time(t1)
   A_=0
@@ -734,6 +900,33 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
            index=(I_Z*m2y+I_Y)*m2x+I_X
            a_null_fin(index,kkk)=.true.
         end do
+     end do
+  end do
+
+  ! Build compressed index lists from a_null and a_null_fin.
+  ! Reduces Step 1 from O(max^2) to O(n_null * n_fin).
+  n_null = 0
+  n_fin  = 0
+  do kkk=1,num_kpts
+     do J=0,max
+        if (a_null(J, kkk)) then
+           n_null(kkk) = n_null(kkk) + 1
+           ni = n_null(kkk)
+           idx_null(ni, kkk) = J
+           JJ = J/m2x
+           idx_null_iz(ni, kkk) = JJ/m2y
+           idx_null_iy(ni, kkk) = JJ - idx_null_iz(ni,kkk)*m2y
+           idx_null_ix(ni, kkk) = J - JJ*m2x
+        end if
+        if (a_null_fin(J, kkk)) then
+           n_fin(kkk) = n_fin(kkk) + 1
+           nj = n_fin(kkk)
+           idx_fin(nj, kkk) = J
+           JJ = J/m2x
+           idx_fin_iz(nj, kkk) = JJ/m2y
+           idx_fin_iy(nj, kkk) = JJ - idx_fin_iz(nj,kkk)*m2y
+           idx_fin_ix(nj, kkk) = J - JJ*m2x
+        end if
      end do
   end do
 
@@ -769,6 +962,26 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
   end do
   FAC(0,0,0)=FAC(0,0,0)+1
 
+#ifdef HAVE_FFTW
+  ! Pre-transform FAC kernel into Fourier space.
+  ! Place FAC(dx,dy,dz) into padded grid with circular wraparound:
+  !   non-negative d → position d+1 (Fortran 1-based)
+  !   negative d     → position Nf+d+1 (wraps to end of array)
+  ! Populate only [-(m2x-1), m2x-1] — the actual convolution support.
+  FAC_hat = (0.0_R8, 0.0_R8)
+  do k = -(m2z-1), m2z-1
+     wrap_iz = merge(k + 1, Nfz + k + 1, k >= 0)
+     do j = -(m2y-1), m2y-1
+        wrap_iy = merge(j + 1, Nfy + j + 1, j >= 0)
+        do i = -(m2x-1), m2x-1
+           wrap_ix = merge(i + 1, Nfx + i + 1, i >= 0)
+           FAC_hat(wrap_ix, wrap_iy, wrap_iz) = FAC(i, j, k)
+        end do
+     end do
+  end do
+  call dfftw_execute_dft(plan_fwd, FAC_hat, FAC_hat)
+#endif
+
   call cpu_time(t2)
   write(unit_out,*)'t_init=',t2-t1
 
@@ -778,60 +991,100 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
      pair_index=pair_index+1
      kkk=KP(pair_index)
      call cpu_time(tt1)
+     ! Step 1: Compute B_ = A_ conv FAC (interstitial overlap kernel).
      b_=0
-     do J=0,max
-        if (a_null_fin(J,kkk)) then
-           SUM=0
-           JJ=J/m2x
-           iz2=jj/m2y
-           iy2=jj-iz2*m2y
-           ix2=j-jj*m2x
-           do I=0,max
-              if(a_null(I,kkk)) then
-                 II=I/m2x
-                 iz1=II/m2y
-                 iy1=II-iz1*m2y
-                 ix1=I-II*m2x
-                 FF=FAC(ix2-ix1,iy2-iy1,iz2-iz1)
-                 !! Use explicit scalar loop to avoid gfortran
-                 !! vectorizer miscompilation (-ftree-vectorize,
-                 !! enabled at -O2 and above) on ARM targets.
-                 do num1=1,NB
-                    sum(num1)=sum(num1)+a_(num1,I,k1)*FF
-                 end do
-              end if
+#ifdef HAVE_FFTW
+     ! Runtime crossover: use FFT when sparse convolution is expensive.
+     ! The constant 16 accounts for FFT overhead (3 transforms + gather/scatter)
+     ! vs the simple multiply-add of the sparse loop.
+     use_fft = (int(n_null(kkk),8) * int(n_fin(kkk),8)) > &
+               (int(Nfft_total,8) * 16_8)
+     if (k1 == 1) write(unit_out,'(A,I6,A,I6,A,I10,A,L1)') &
+          ' FFT crossover: n_null=', n_null(kkk), ' n_fin=', n_fin(kkk), &
+          ' product=', n_null(kkk)*n_fin(kkk), ' use_fft=', use_fft
+     if (use_fft) then
+        ! FFT-based convolution: B = IFFT(FFT(A) * FAC_hat) per band
+        do band = 1, NB
+           ! (a) Scatter A_ for this band into zero-padded 3D grid
+           work3d = (0.0_R8, 0.0_R8)
+           do ni = 1, n_null(kkk)
+              work3d(idx_null_ix(ni,kkk)+1, &
+                     idx_null_iy(ni,kkk)+1, &
+                     idx_null_iz(ni,kkk)+1) = A_(band, idx_null(ni,kkk), k1)
            end do
+           ! (b) Forward FFT
+           call dfftw_execute_dft(plan_fwd, work3d, work3d)
+           ! (c) Pointwise multiply by pre-transformed kernel
+           work3d = work3d * FAC_hat
+           ! (d) Inverse FFT
+           call dfftw_execute_dft(plan_bwd, work3d, work3d)
+           ! (e) Gather B_ at output positions, with 1/N normalization
+           !     (FFTW backward transform is unnormalized)
+           do nj = 1, n_fin(kkk)
+              B_(band, idx_fin(nj,kkk)) = &
+                   work3d(idx_fin_ix(nj,kkk)+1, &
+                          idx_fin_iy(nj,kkk)+1, &
+                          idx_fin_iz(nj,kkk)+1) * inv_Nfft
+           end do
+        end do
+     else
+#endif
+     ! Sparse convolution using compressed index lists.
+     do nj=1,n_fin(kkk)
+        J   = idx_fin(nj, kkk)
+        ix2 = idx_fin_ix(nj, kkk)
+        iy2 = idx_fin_iy(nj, kkk)
+        iz2 = idx_fin_iz(nj, kkk)
+        SUM=0
+        do ni=1,n_null(kkk)
+           I   = idx_null(ni, kkk)
+           ix1 = idx_null_ix(ni, kkk)
+           iy1 = idx_null_iy(ni, kkk)
+           iz1 = idx_null_iz(ni, kkk)
+           FF=FAC(ix2-ix1,iy2-iy1,iz2-iz1)
+           !! Use explicit scalar loop to avoid gfortran
+           !! vectorizer miscompilation (-ftree-vectorize,
+           !! enabled at -O2 and above) on ARM targets.
            do num1=1,NB
-              b_(num1,j)=sum(num1)
+              sum(num1)=sum(num1)+a_(num1,I,k1)*FF
            end do
-        end if
+        end do
+        do num1=1,NB
+           b_(num1,j)=sum(num1)
+        end do
      end do
+#ifdef HAVE_FFTW
+     end if
+#endif
      call cpu_time(tt2)
      do k2=1,NNTOT
         if (k2 > 1) pair_index=pair_index+1
         kkk=KPB(pair_index)
 
         id=-(BQZ(pair_index)*m2y+BQY(pair_index))*m2x-BQX(pair_index)-1
-        SUMA=0
 
+        ! Gather valid column pairs into contiguous arrays for zgemm.
+        ! A_ and B_ are always complex(C16) in planew.
+        nvalid = 0
         do J=0,max
            id=id+1
-
-           !! Use explicit scalar loops (see comment above)
            if (a_null(j,kkk) .and. 0 <= id .and. id <= max) then
-              do NUM1=1,NB
-                 do NUM2=1,NB
+              nvalid = nvalid + 1
 #ifndef _COMPLEX_
-                    SUMA(num2,num1)=SUMA(num2,num1)+a_(num2,j,kkk)*b_(num1,id)
+              Agath(:,nvalid) = a_(1:NB,j,kkk)
 #else
-                    SUMA(num2,num1)=SUMA(num2,num1)+conjg(a_(num2,j,kkk))*b_(num1,id)
+              Agath(:,nvalid) = conjg(a_(1:NB,j,kkk))
 #endif
-                 end do
-              end do
+              Bgath(:,nvalid) = b_(1:NB,id)
            endif
         end do
 
-        overlap(1:nb,1:nb,pair_index) = overlap(1:nb,1:nb,pair_index) + SUMA
+        ! SUMA = Agath * Bgath^T via zgemm
+        if (nvalid > 0) then
+           call zgemm('N', 'T', NB, NB, nvalid,           &
+                &      (1._R8, 0._R8), Agath, NB, Bgath, NB, &
+                &      (1._R8, 0._R8), overlap(1,1,pair_index), size(overlap,1))
+        end if
 
         write(unit_mmn,235)KP(pair_index),KPB(pair_index),BQX1(pair_index),BQY1(pair_index), &
              BQZ1(pair_index)
@@ -855,11 +1108,22 @@ subroutine planew(stru, NB, num_kpts, Nntot, maxx, maxy, maxz)
 236 format(32f18.12)
 
   !release the memory
+#ifdef HAVE_FFTW
+  call dfftw_destroy_plan(plan_fwd)
+  call dfftw_destroy_plan(plan_bwd)
+  deallocate(FAC_hat, work3d)
+#endif
   deallocate(FAC)
   deallocate(A_)
   deallocate(B_)
   deallocate(a_null)
   deallocate(a_null_fin)
+  deallocate(Agath)
+  deallocate(Bgath)
+  deallocate(idx_null, idx_fin)
+  deallocate(idx_null_ix, idx_null_iy, idx_null_iz)
+  deallocate(idx_fin_ix, idx_fin_iy, idx_fin_iz)
+  deallocate(n_null, n_fin)
 end subroutine PLANEW
 end module planew_m
 

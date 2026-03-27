@@ -45,7 +45,14 @@ module w2w
 
   integer, parameter :: unit_amn=7,  unit_mmn  =8, unit_nnkp=11, unit_eig=12
   integer, parameter :: unit_ene=50, unit_fermi=51
-  ! Optimize IBLOCK for your hardware (32-255)
+  ! BLAS blocking factor for almgen/l2Amn plane-wave loops.
+  ! Controls the size of stack work arrays: h_alyl is (Lmax2+1)^2 x iBlock
+  ! complex*16 entries.  For best performance, keep iBlock small enough
+  ! that h_alyl + h_blyl + h_yl fit in L1 cache:
+  !   32KB L1 -> iBlock ~ 48-64     (e.g. Apple M-series, AMD Zen)
+  !   48KB L1 -> iBlock ~ 96        (e.g. Intel Golden Cove)
+  !  256KB L2 -> iBlock ~ 128-192   (falls back to L2, still fast)
+  ! Default 128 is a good general choice.  Change here to tune.
   integer, parameter :: iBlock=128
 
   integer :: NMAT=0
@@ -1012,9 +1019,11 @@ subroutine radint(stru, jatom, ljmax, bm)
   real(R8),       intent(in) :: bm
 
   real(R8) :: A(Nrad), B(Nrad), X(Nrad), Y(Nrad), RX
-  integer  :: L_index,l1,l2,lj, R_index, i, if1,if2
+  integer  :: L_index,l1,l2,lj, R_index, i, if1,if2, Npt
 
-  do  I=1,stru%Npt(JATOM)
+  Npt = stru%Npt(JATOM)
+
+  do  I=1,Npt
      RX=stru%R0(JATOM)*exp(stru%dx(JATOM)*(i-1))*BM
      call sphbes(LJMAX+1,RX,rj(:,I))
   enddo
@@ -1030,14 +1039,14 @@ subroutine radint(stru, jatom, ljmax, bm)
            L_index=L_index+1
            R_index=0
            do IF1=1,n_rad(l1)
+              ! Precompute rf1*rj and rf2*rj products (independent of if2)
+              ! using array syntax to enable vectorization
+              A(1:Npt) = rf1(1:Npt,l1,if1) * rj(lj,1:Npt)
+              B(1:Npt) = rf2(1:Npt,l1,if1) * rj(lj,1:Npt)
               do IF2=1,n_rad(l2)
                  R_index=R_index+1
-                 do  I=1,stru%Npt(JATOM)
-                    A(i)=rf1(i,l1,if1)*rj(lj,i)
-                    B(i)=rf2(i,l1,if1)*rj(lj,i)
-                    X(i)=rf1(i,l2,if2)
-                    Y(i)=rf2(i,l2,if2)
-                 enddo
+                 X(1:Npt) = rf1(1:Npt,l2,if2)
+                 Y(1:Npt) = rf2(1:Npt,l2,if2)
                  call RINT13(stru, jatom, A,B, X,Y, ri_mat(r_index,l_index))
 
               end do
