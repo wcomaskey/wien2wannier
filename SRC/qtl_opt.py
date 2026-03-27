@@ -580,31 +580,36 @@ def main():
             if os.path.exists(struct_path):
                 with open(struct_path) as sf:
                     slines = sf.readlines()
-                # Parse atom positions (fractional)
+                # Parse atom positions including equivalent atoms
                 nneq_s = int(re.search(r'ATOMS[:\s]+(\d+)', slines[1]).group(1))
-                atom_pos = []
+                atom_data = []  # list of (positions[], Z)
                 ii = 4
                 for iat in range(nneq_s):
                     pos = slines[ii]
                     x = float(pos[12:22])
                     y = float(pos[25:35])
                     z = float(pos[38:48])
+                    positions = [(x, y, z)]
                     ii += 1
                     mult = int(slines[ii].split('=')[1].split()[0])
                     ii += 1
-                    for _ in range(mult - 1):
+                    for mu in range(mult - 1):
+                        epos = slines[ii]
+                        positions.append((float(epos[12:22]),
+                                          float(epos[25:35]),
+                                          float(epos[38:48])))
                         ii += 1
                     z_val = int(float(re.search(r'Z:\s*([\d.]+)', slines[ii]).group(1)))
                     ii += 1 + 3
-                    atom_pos.append((x, y, z, mult, z_val))
+                    atom_data.append((positions, z_val))
 
-                # Generate projections matching num_wann
+                # Generate projections with correct positions per equivalent atom
                 l_names = {0: 's', 1: 'p', 2: 'd', 3: 'f'}
                 proj_lines = ['begin projections']
-                for x, y, z, mult, Z in atom_pos:
-                    for l in valence_config(Z):
-                        for mu in range(mult):
-                            proj_lines.append(f'  f={x:.8f},{y:.8f},{z:.8f}:{l_names[l]}')
+                for positions, Z in atom_data:
+                    for px, py, pz in positions:
+                        for l in valence_config(Z):
+                            proj_lines.append(f'  f={px:.8f},{py:.8f},{pz:.8f}:{l_names[l]}')
                 proj_lines.append('end projections')
                 proj_block = '\n'.join(proj_lines)
 
