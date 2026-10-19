@@ -1,0 +1,48 @@
+{
+  "title": "wien2wannier 3.0: hybrid pre-Wannierization for WIEN2k",
+  "upload_type": "software",
+  "version": "3.0",
+  "access_right": "open",
+  "license": "gpl-3.0-or-later",
+  "creators": [
+    {
+      "name": "Comaskey, William P.",
+      "affiliation": "Department of Mathematics, University of Nevada, Las Vegas",
+      "orcid": "0000-0001-9210-1084"
+    },
+    {
+      "name": "Mendoza-Cortes, Jose L.",
+      "affiliation": "Department of Chemical Engineering & Materials Science and Department of Physics and Astronomy, Michigan State University",
+      "orcid": "0000-0001-5184-1406"
+    }
+  ],
+  "description": "<p>wien2wannier 3.0 is a modified version of wien2wannier, the interface between WIEN2k and Wannier90. From a completed WIEN2k calculation, including spin-polarized and spin&ndash;orbit cases, it writes the projections, overlaps and band energies that Wannier90 reads.</p><p>Version 3.0 adds a hybrid pre-Wannierization, which freezes every Bloch state below an energy ceiling. Given the number of Wannier functions, the program can lower this ceiling from 8 eV above the Fermi energy until no k-point has more states below it than there are Wannier functions. With the frozen states held fixed, it minimizes the gauge-invariant spread, builds an SCDM gauge and writes Wannier90 input for an isolated set of bands, as many as there are Wannier functions. A second route writes the same selection as Wannier90 disentanglement windows.</p><p>Version 3.0 was developed and tested with WIEN2k 24.1, which it does not include. Installed into WIEN2k, it replaces only the programs w2w and w2wc and adds the program w2w_hybrid and a driver. The release has a user guide with a worked GaAs example and scripts that plot the projectability diagnostics of each run. The driver needs Python 3.10 or newer, and building needs a Fortran compiler, BLAS and LAPACK.</p><p>It is distributed under the GNU GPL, version 3 or later, and builds on wien2wannier 2.0 by J. Kune&scaron;, P. Wissgott, E. Assmann and others. Its license requires every publication that uses it to cite J. Kune&scaron; et al., Comput. Phys. Commun. 181, 1888 (2010). Please also cite W. P. Comaskey and J. L. Mendoza-Cortes, \"Fully Automated Wannier Disentanglement via Projectability Selection in Gaussian and Augmented Plane-Wave Frameworks\" (2026, in preparation). The calculations of the paper are archived at doi:10.5281/zenodo.23485290.</p>",
+  "keywords": [
+    "Wannier functions",
+    "WIEN2k",
+    "LAPW",
+    "disentanglement",
+    "projectability",
+    "Wannier90"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/wien2wannier/wien2wannier",
+      "relation": "isDerivedFrom",
+      "scheme": "url",
+      "resource_type": "software"
+    },
+    {
+      "identifier": "10.1016/j.cpc.2010.08.005",
+      "relation": "references",
+      "scheme": "doi",
+      "resource_type": "publication-article"
+    },
+    {
+      "identifier": "10.5281/zenodo.23485290",
+      "relation": "compiles",
+      "scheme": "doi",
+      "resource_type": "dataset"
+    }
+  ]
+}

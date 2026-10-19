@@ -1,0 +1,83 @@
+# Citation metadata for this modified wien2wannier (version 3.0).
+cff-version: 1.2.0
+message: >-
+  If you use this version of wien2wannier, please cite the original
+  wien2wannier paper listed under references, which every use of
+  wien2wannier must cite, together with the paper given under
+  preferred-citation and the archived release.
+title: "wien2wannier 3.0: hybrid pre-Wannierization for WIEN2k"
+type: software
+version: "3.0"
+date-released: "2026-10-19"
+license: GPL-3.0-or-later
+doi: 10.5281/zenodo.23485188
+repository-code: "https://github.com/wcomaskey/wien2wannier"
+abstract: >-
+  A modified version of wien2wannier (upstream 2.0), the interface between
+  WIEN2k and Wannier90. Version 3.0 adds a hybrid pre-Wannierization, which
+  freezes every Bloch state below an energy ceiling derived from the number
+  of Wannier functions, minimizes the gauge-invariant spread with the frozen
+  states held fixed, builds an SCDM gauge and writes Wannier90 input for an
+  isolated set of bands. A second route writes the same selection as
+  Wannier90 disentanglement windows.
+authors:
+  - family-names: Comaskey
+    given-names: "William P."
+    orcid: "https://orcid.org/0000-0001-9210-1084"
+    affiliation: "Department of Mathematics, University of Nevada, Las Vegas"
+  - family-names: Mendoza-Cortes
+    given-names: "Jose L."
+    orcid: "https://orcid.org/0000-0001-5184-1406"
+    affiliation: "Department of Chemical Engineering & Materials Science and Department of Physics and Astronomy, Michigan State University"
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.23485188
+    description: "Zenodo archive of this release"
+  - type: doi
+    value: 10.5281/zenodo.23485290
+    description: "Zenodo data record of the paper, made with this release"
+keywords:
+  - Wannier functions
+  - WIEN2k
+  - LAPW
+  - disentanglement
+  - projectability
+  - Wannier90
+preferred-citation:
+  type: article
+  title: >-
+    Fully Automated Wannier Disentanglement via Projectability Selection
+    in Gaussian and Augmented Plane-Wave Frameworks
+  authors:
+    - family-names: Comaskey
+      given-names: "William P."
+      orcid: "https://orcid.org/0000-0001-9210-1084"
+      affiliation: "Department of Mathematics, University of Nevada, Las Vegas"
+    - family-names: Mendoza-Cortes
+      given-names: "Jose L."
+      orcid: "https://orcid.org/0000-0001-5184-1406"
+      affiliation: "Department of Chemical Engineering & Materials Science and Department of Physics and Astronomy, Michigan State University"
+  year: 2026
+  status: in-preparation
+references:
+  - type: article
+    title: "Wien2wannier: From linearized augmented plane waves to maximally localized Wannier functions"
+    authors:
+      - family-names: Kuneš
+        given-names: J.
+      - family-names: Arita
+        given-names: R.
+      - family-names: Wissgott
+        given-names: P.
+      - family-names: Toschi
+        given-names: A.
+      - family-names: Ikeda
+        given-names: H.
+      - family-names: Held
+        given-names: K.
+    journal: "Computer Physics Communications"
+    volume: 181
+    start: 1888
+    end: 1895
+    year: 2010
+    doi: "10.1016/j.cpc.2010.08.005"

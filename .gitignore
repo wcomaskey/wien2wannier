@@ -1,7 +1,14 @@
+# Build configuration
 make.sys
+
+# Project management
 TODO
+
+# Release archives
 wien2wannier-*.tar
 wien2wannier-*.tar.gz
+
+# Compiled executables
 SRC_trig/convham
 SRC_trig/findbands
 SRC_trig/join_vectorfiles
@@ -11,17 +18,31 @@ SRC_trig/vec2ascii
 SRC_trig/w2waddsp
 SRC_trig/write_inwplot
 SRC_trig/write_win_backend
-SRC_trig/*.o
+SRC_w2w/w2w
+SRC_w2w/w2wc
+SRC_wplot/wplot
+SRC_wplot/wplotc
+
+# Build artifacts - object files and modules
+*.o
+*.mod
+*.a
+
+# Build directories
+SRC_trig/lib/
 SRC_w2w/lib/
 SRC_w2w/libc/
 SRC_w2w/libr/
-SRC_w2w/w2w
-SRC_w2w/w2wc
 SRC_wplot/lib/
 SRC_wplot/libc/
 SRC_wplot/libr/
-SRC_wplot/wplot
-SRC_wplot/wplotc
+
+# Test and benchmark results
+tests/benchmark_results/
+tests/*.log
+tests/*.json
+
+# Documentation build artifacts
 doc/wien2wannier_userguide*.log
 doc/wien2wannier_userguide.aux*
 doc/wien2wannier_userguide.d
@@ -32,5 +53,117 @@ doc/wien2wannier_userguide.out*
 doc/wien2wannier_userguide.out.make
 doc/wien2wannier_userguide.tdo
 doc/wien2wannier_userguide.toc*
-doc/auto
+doc/auto/
+
+# Editor/IDE artifacts
 TAGS
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+NUL
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.egg
+
+# AI assistant files
+.claude/
+CLAUDE.md
+.clinerules
+
+# Implementation design documents
+docs/tasks/
+# built executables / MPI object dirs (SRC_w2w)
+SRC_w2w/w2w_hybrid
+SRC_w2w/w2w_mpi
+SRC_w2w/w2w_mpic
+SRC_w2w/lib_mpi/
+SRC_w2w/libr_mpi/
+SRC_w2w/libc_mpi/
+SRC_w2w/w2w_hybrid_acc
+
+# ---- data-product archives -------------------------------------------------
+# Superseded .npz products are zipped to ~/qotk_archives/ and the loose files
+# deleted, by the protocol in qotk/archive.py. Archives never enter git: they
+# are large and reproducible, and keeping them out is the point of the sweep.
+*.zip
+qotk_archives/
+_archive/
+
+# ---- generated run products (2026-09-06 cleanup) -------------------------------
+# WIEN2k / w2w / wannier90 / w2w_hybrid outputs are regenerable and never enter git;
+# the few intentionally tracked fixtures (tests/unit/fixtures, tests/s1gate/*/runs,
+# tests/Bi2D12/sewdev) stay tracked -- an ignore rule does not untrack a file.
+*.vector*
+*.energy*
+*.energydum*
+*.amn
+*.mmn
+*.amn.bin
+*.mmn.bin
+*.vdis
+*.sew
+*.sew.s2
+*.sew.meta
+*.sew.s2.meta
+*.chk
+*_hr.dat
+*_wsvec.dat
+*_centres.xyz
+*.wout
+*.werr
+*.hyblog
+*.w2wlog
+*.dayfile
+*.error
+*.output*
+*.scf*
+*.clm*
+*.vsp*
+*.vns*
+*.vorb*
+*.r2v
+*.broyd*
+*.def
+*.klist_*
+*.klist.tmp
+*.stdout
+*.tmp
+*.bak
+*.bak-*
+*.bak[0-9]
+*.pre_*
+*.orig
+*.rej
+.machine*
+.processes*
+.lapw*para
+.timeso_*
+:log
+:parallel
+# per-run analysis and w90 products (same cleanup); inputs (.struct .inwf .klist .in*) stay visible
+*.eig
+*.anchors
+*.win
+*.nnkp
+*.npz
+*.npy
+*.kpt
+*.gnu
+*.tauspec
+*.diag
+*.time
+*.vec
+*.out
+*.log
+*.iterate
+*.snapshot

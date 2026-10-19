@@ -1,0 +1,1181 @@
+<title>w2w perf-redesign — Phase A + B1 benchmarks</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7;
+    --surface: #fcfcfb;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --baseline: #c3c2b7;
+    --ring: rgba(11,11,11,0.10);
+    --s1: #2a78d6;   /* blue: measured series */
+    --s1-strong: #184f95;
+    --s2: #1baf7a;   /* aqua: disentangle segment */
+    --s3: #eda100;   /* yellow: fixed-stage segment */
+    --crit: #d03b3b;
+    --good-text: #006300;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page: #0d0d0d; --surface: #1a1a19;
+      --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+      --grid: #2c2c2a; --baseline: #383835; --ring: rgba(255,255,255,0.10);
+      --s1: #3987e5; --s1-strong: #86b6ef;
+      --s2: #199e70; --s3: #c98500;
+      --crit: #d03b3b; --good-text: #0ca30c;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19;
+    --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --baseline: #383835; --ring: rgba(255,255,255,0.10);
+    --s1: #3987e5; --s1-strong: #86b6ef;
+    --s2: #199e70; --s3: #c98500;
+    --crit: #d03b3b; --good-text: #0ca30c;
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --page: #f9f9f7; --surface: #fcfcfb;
+    --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+    --grid: #e1e0d9; --baseline: #c3c2b7; --ring: rgba(11,11,11,0.10);
+    --s1: #2a78d6; --s1-strong: #184f95;
+    --s2: #1baf7a; --s3: #eda100;
+    --crit: #d03b3b; --good-text: #006300;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--ink);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 40px 24px 72px; }
+  .mono { font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace; }
+
+  header h1 { font-size: 26px; margin: 4px 0 6px; letter-spacing: -0.01em; text-wrap: balance; }
+  .prov { color: var(--ink-2); font-size: 13.5px; }
+  .prov .mono { font-size: 12.5px; }
+  .eyebrow {
+    font-family: ui-monospace, Menlo, monospace; font-size: 11.5px;
+    letter-spacing: 0.08em; text-transform: uppercase; color: var(--s1);
+    margin: 0 0 4px;
+  }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 26px 0 8px; }
+  .tile {
+    background: var(--surface); border: 1px solid var(--ring); border-radius: 8px;
+    padding: 14px 16px 12px;
+  }
+  .tile .lab { font-size: 12px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+  .tile .val { font-size: 26px; font-weight: 650; margin-top: 2px; }
+  .tile .val .unit { font-size: 15px; font-weight: 500; color: var(--ink-2); }
+  .tile .sub { font-size: 12.5px; color: var(--ink-2); margin-top: 2px; }
+  .tile .delta { color: var(--good-text); font-weight: 600; }
+
+  section { margin-top: 44px; }
+  section > h2 { font-size: 19px; margin: 0 0 8px; letter-spacing: -0.005em; }
+  section > p { max-width: 68ch; color: var(--ink-2); margin: 6px 0 14px; }
+  section > p strong { color: var(--ink); }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--ring); border-radius: 8px;
+    padding: 18px 18px 10px; margin: 14px 0;
+  }
+  .card h3 { font-size: 13.5px; font-weight: 600; margin: 0 0 2px; }
+  .card .note { font-size: 12px; color: var(--muted); margin: 0 0 10px; }
+  .card svg { width: 100%; height: auto; display: block; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12.5px; color: var(--ink-2); margin: 4px 2px 8px; }
+  .legend .chip { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .sw.dot { border-radius: 50%; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  th { font-size: 11.5px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  td.num, th.num { text-align: right; font-family: ui-monospace, Menlo, monospace; font-variant-numeric: tabular-nums; }
+  td .mono { font-size: 12px; }
+  .tblwrap { overflow-x: auto; }
+
+  .badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 12px; font-weight: 600; border-radius: 999px; padding: 1px 9px;
+    border: 1px solid var(--ring);
+  }
+  .badge.pass { color: var(--good-text); }
+  .badge.fail { color: var(--crit); }
+
+  details { margin-top: 14px; }
+  summary { cursor: pointer; font-size: 13.5px; color: var(--ink-2); }
+  summary:focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; border-radius: 3px; }
+
+  #tip {
+    position: fixed; pointer-events: none; z-index: 10; display: none;
+    background: var(--ink); color: var(--page);
+    font: 12px/1.4 ui-monospace, Menlo, monospace;
+    padding: 6px 9px; border-radius: 5px; max-width: 320px; white-space: pre-line;
+  }
+  footer { margin-top: 52px; color: var(--muted); font-size: 12.5px; }
+  footer .mono { font-size: 11.5px; }
+  @media (prefers-reduced-motion: no-preference) {
+    .tile, .card { transition: border-color 120ms ease; }
+  }
+</style>
+
+<div class="wrap">
+<header>
+  <p class="eyebrow">wien2wannier &middot; branch perf-redesign</p>
+  <h1>Performance redesign — Phase A + B1 benchmarks</h1>
+  <p class="prov">
+    Hybrid pre-Wannierization tool <span class="mono">w2w_hybrid</span>, measured on Rh<sub>3</sub>Si<sub>4</sub>
+    SOC (352 bands &middot; 120 k &middot; nntot 6 &middot; n<sub>w</sub>=120, pool 180) and bcc Fe (15 b &middot; 512 k &middot; n<sub>w</sub>=9).
+    Apple M5 Pro, gfortran 16, 10 OpenMP threads max. Phases A (telemetry, colored OpenMP,
+    adaptive monitor, Zd mixing), B (binary sidecars end-to-end, full-precision amn, clamps),
+    C (Alm cache, in-memory MODE=HYBR), D1 (one-process SOC &sigma;-loop) &mdash; 13 commits on
+    <span class="mono">perf-redesign</span>. Ledger: <span class="mono">SRC_w2w/bench/results.csv</span> &middot; 2026-07-18/19.
+  </p>
+</header>
+
+<div class="tiles">
+  <div class="tile"><div class="lab">Disentangle, converged H120</div>
+    <div class="val mono">2852 &rarr; 6.9 <span class="unit">s</span></div>
+    <div class="sub"><span class="delta">413&times;</span> — BLAS fix + colored threads + adaptive + Zd mixing</div></div>
+  <div class="tile"><div class="lab">Input read, cold</div>
+    <div class="val mono">22 min &rarr; 0.21 <span class="unit">s</span></div>
+    <div class="sub"><span class="delta">~6300&times;</span> — binary sidecars through the whole chain</div></div>
+  <div class="tile"><div class="lab">SOC vectors &rarr; hand-off</div>
+    <div class="val mono">~83 min &rarr; 275 <span class="unit">s</span></div>
+    <div class="sub"><span class="delta">18&times;</span> — one command (&sigma;-loop MODE=HYBR), was 5 tools</div></div>
+  <div class="tile"><div class="lab">Parity</div>
+    <div class="val" style="font-size:17px; padding-top:5px;">
+      <span class="badge pass">&#10003; Fe exact</span>
+      <span class="badge pass">&#10003; &sigma;-loop 1e-12</span>
+      <span class="badge pass">&#10003; MPI bit-identical</span></div>
+    <div class="sub">every feature gated; one-shot &sigma;-loop = multi-step automated route to 1e-8</div></div>
+</div>
+
+
+<section id="a1">
+  <p class="eyebrow">A1_telemetry</p>
+  <h2>A1 — Convergence telemetry</h2>
+  <p>Not a speed feature; a <strong>trust</strong> feature. The sweep-cap warning used to be verbose-gated,
+  so a production run could hit the 2000-sweep cap silently. Telemetry is now unconditional
+  (sweeps, converged flag, last |d&Omega;|) — and it immediately settled the open question:
+  the Rh<sub>3</sub>Si<sub>4</sub> H120 production run <strong>did converge</strong> (1071 sweeps,
+  |d&Omega;| = 8.2&times;10<sup>&minus;8</sup>), so the baseline &Omega;<sub>I</sub> anchor is legitimate.
+  Bonus finding: colored sweep order also converges in fewer sweeps (881 vs 1071).</p>
+  <div class="card">
+    <h3>Sweeps to convergence vs the 2000-sweep cap</h3>
+    <p class="note">All runs converged; none were cap-limited. Hover for the stopping |d&Omega;|.</p>
+    <div id="ch-sweeps"></div>
+  </div>
+</section>
+
+<section id="a2">
+  <p class="eyebrow">A2_colored_omp</p>
+  <h2>A2 — Colored (red-black) OpenMP sweeps</h2>
+  <p>Gauss-Seidel sweeps parallelize across k-points of the same graph color (no two neighbours share one).
+  First enablement produced <strong>NaN + a 13&times; slowdown</strong> — root-caused not to the OpenMP code but to
+  <strong>homebrew OpenBLAS</strong>, which is unsafe under concurrent LAPACK callers (built without
+  <span class="mono">USE_LOCKING</span>): its buffer allocator corrupts concurrent
+  <span class="mono">zheevd</span> results and serializes the threads. Linking Apple Accelerate fixed
+  both symptoms and is ~1.9&times; faster serially. The colored path itself is deterministic:
+  1-thread and 10-thread runs are <strong>bit-identical</strong>.</p>
+  <div class="card">
+    <h3>Converged H120 disentangle by configuration (log time axis)</h3>
+    <p class="note">Same source code throughout — only BLAS library, threading, and sweep order differ.</p>
+    <div id="ch-config"></div>
+  </div>
+  <div class="card">
+    <h3>Thread scaling — 50-sweep probe, Accelerate</h3>
+    <div class="legend">
+      <span class="chip"><span class="sw" style="background:var(--s1)"></span>measured wall time</span>
+      <span class="chip"><span class="sw dot" style="border:2px solid var(--muted); background:transparent;"></span>ideal 1/N scaling</span>
+    </div>
+    <div id="ch-scaling"></div>
+    <p class="note">4.35&times; at 10 threads (memory-bandwidth / AMX-contention bound on Apple Silicon).
+    &Omega; after 50 sweeps is bit-identical at every thread count. Small-case honesty: on Fe the colored path
+    is <em>slower</em> (0.44 &rarr; 1.11 s) — fork/join overhead dominates tiny problems; it stays opt-in.</p>
+  </div>
+</section>
+
+<section id="a3">
+  <p class="eyebrow">A3_adaptive_monitor</p>
+  <h2>A3 — Adaptive convergence monitor</h2>
+  <p>The exact &Omega;<sub>I</sub> monitor costs full-pool zgemms. The eigendecomposition inside each sweep
+  already yields the free-block overlap sum for free, so the adaptive mode watches that signal every sweep and
+  triggers the <em>exact</em> check only at plateaus — the converged &Omega;<sub>I</sub> is still exact-gated.
+  With checks already throttled to every 10 sweeps the additional gain is modest (6.4% here); it grows wherever
+  the exact check is relatively more expensive (larger pools, more frequent checking).</p>
+  <div class="tiles">
+    <div class="tile"><div class="lab">Rh<sub>3</sub>Si<sub>4</sub> H120 wall</div>
+      <div class="val mono">32.8 &rarr; 30.7 <span class="unit">s</span></div>
+      <div class="sub"><span class="delta">&minus;6.4%</span> on top of A2; &Omega;<sub>I</sub> matches A2 to 10<sup>&minus;8</sup></div></div>
+    <div class="tile"><div class="lab">Fe sweeps</div>
+      <div class="val mono">71 &rarr; 66</div>
+      <div class="sub">&Omega;<sub>I</sub> parity exact (7.72011655)</div></div>
+    <div class="tile"><div class="lab">Exact checks still gate the stop</div>
+      <div class="val" style="font-size:19px; padding-top:5px;"><span class="badge pass">&#10003; &Omega;<sub>I</sub> exact at exit</span></div>
+      <div class="sub">plateau signal only schedules them</div></div>
+  </div>
+</section>
+
+<section id="b1">
+  <p class="eyebrow">B1_binary_io</p>
+  <h2>B1 — Transparent binary sidecars</h2>
+  <p>The 3.3 GB text <span class="mono">.mmn</span> parses at ~2.5 MB/s. The readers now write a
+  <span class="mono">.bin</span> stream sidecar (magic + dims header) after any text parse and reuse it while it
+  is at least as new as the text file; validation failure falls back to text. Hand-off outputs are
+  <strong>bit-identical</strong> text-vs-sidecar on both materials, and the sidecar also shrinks storage:
+  mmn 3.3 GB &rarr; 1.3 GB, amn 340 &rarr; 103 MB.</p>
+  <div class="card">
+    <h3>Input read time by path (log time axis)</h3>
+    <p class="note">Rh<sub>3</sub>Si<sub>4</sub> reads = .amn + .mmn + .eig + .nnkp. Cold = first touch after reboot/eviction.</p>
+    <div id="ch-io"></div>
+  </div>
+</section>
+
+
+<section id="a5">
+  <p class="eyebrow">A5_mixing</p>
+  <h2>A5 — Zd mixing (SOR-style extrapolation)</h2>
+  <p>Each Gauss-Seidel update eigendecomposes a per-k Gram matrix Zd; A5 optionally forms
+  Zd<sub>eff</sub> = &alpha;&middot;Zd<sub>new</sub> + (1&minus;&alpha;)&middot;Zd<sub>hist</sub>.
+  Damping (&alpha;&lt;1) <em>hurts</em> Gauss-Seidel; extrapolation accelerates it strongly:
+  &alpha;=1.7 converges in <strong>197 sweeps instead of 881-1071</strong> and lands at the
+  <strong>lowest &Omega;<sub>I</sub> of any configuration</strong> — the extrapolation escapes the
+  colored-order basin back to (slightly below) the serial optimum. &alpha;=1.9 overshoots. Fe parity exact.</p>
+  <div class="card">
+    <h3>&Omega;<sub>I</sub> after 50 sweeps vs mixing factor &alpha; (Rh&#8323;Si&#8324; H120, colored 10T)</h3>
+    <div id="ch-alpha"></div>
+  </div>
+  <div class="card">
+    <h3>The full disentangle journey (log time axis, converged H120)</h3>
+    <div id="ch-journey"></div>
+  </div>
+</section>
+
+<section id="bc">
+  <p class="eyebrow">B2_amn_precision &middot; B3_eig_clamp &middot; B4_w2waddsp &middot; B4_sidecar_emit &middot; C1_alm_cache &middot; C2_mode_hybr</p>
+  <h2>Phase B completion + Phase C</h2>
+  <p><strong>B2:</strong> the .amn writer kept only 5 significant digits (2e18.5) — a 1e-5 floor under
+  P=|amn|&sup2; and the SCDM gauge; now full double (es24.15). <strong>B3:</strong> the bmax clamp was
+  AUTO-only; manual mode could reach read_vec's uninitialized-memory path — now unconditional, plus a
+  vector/energy mismatch stop. <strong>B4:</strong> w2waddsp rewritten on the sidecar readers (it now
+  <em>validates</em> the spin files against each other; the old tool summed blind and re-floored the
+  combined amn to 5 digits), and w2w emits sidecars at write time — no first-run parse anywhere.
+  <strong>C1:</strong> a per-(atom,k) Alm cache removes the (1+nntot)&times; almgen recompute:
+  MMN stage 163&rarr;98 s, bit-identical. <strong>C2:</strong> MODE=HYBR runs the validated Stage-2
+  in memory inside w2w — exact parity vs the standalone tool at Fe (3.15 s end-to-end),
+  &alpha;-Sn (18.2 s) and Rh&#8323;Si&#8324; (131.5 s).</p>
+  <div class="tiles">
+    <div class="tile"><div class="lab">C1 MMN stage (Rh&#8323;Si&#8324;)</div>
+      <div class="val mono">163 &rarr; 98 <span class="unit">s</span></div>
+      <div class="sub"><span class="delta">1.66&times;</span>, 3.3 GB output bit-identical</div></div>
+    <div class="tile"><div class="lab">C2 Fe vectors&rarr;hand-off</div>
+      <div class="val mono">3.15 <span class="unit">s</span></div>
+      <div class="sub">one process; invariants exact vs standalone</div></div>
+    <div class="tile"><div class="lab">w2waddsp combine</div>
+      <div class="val mono">300 &rarr; 33 <span class="unit">s</span></div>
+      <div class="sub"><span class="delta">9&times;</span> warm; mmn byte-identical from line 2</div></div>
+  </div>
+</section>
+
+<section id="d1">
+  <p class="eyebrow">D1_sigma_loop</p>
+  <h2>D1 — One-process SOC &sigma;-loop</h2>
+  <p>Def unit 9 (second spin-component vectors; unit 19 for SP+SOC vsp) turns the per-spin
+  w2w &times;2 + w2waddsp chain into <strong>one process</strong>: the &sigma;2 vectors are re-read in
+  place, the overlap simply isn't re-zeroed (the spinor sum falls out), and per-&sigma; projections land
+  in separate amn <strong>column blocks</strong> — the zero-coefficient doubled-inwf construction of the original automated workflow is
+  obsolete. Gates: amn blocks match the per-spin references at <span class="mono">2.4e-16</span>
+  (an order-swap discriminator traced an apparent 6e-11 delta to vspup-vs-vspdn SCF residual in the
+  <em>reference</em> chain); the &sigma;-summed 3.3 GB mmn matches the w2waddsp file at
+  <span class="mono">1.0e-12</span> — the print-rounding bound, i.e. the loop is <em>more</em> precise
+  than the chain it replaces. <strong>Headline:</strong> the fully-automatic spinor model (AUTO 80&times;2
+  candidates) reproduces the original multi-step automated route: &Omega;<sub>I</sub> 840.05615289 vs
+  840.05615290, &sigma;<sub>min</sub> 3.643e-4 vs 3.6425e-4.</p>
+  <div class="card">
+    <h3>Rh&#8323;Si&#8324; SOC pipeline, vectors &rarr; wannier90-ready hand-off (log time axis)</h3>
+    <div id="ch-soc"></div>
+    <p class="note">&alpha;-Sn (30 bands) is the quick SOC test tier: the same full cycle in ~45 s.</p>
+  </div>
+</section>
+
+<section id="anatomy">
+  <p class="eyebrow">combined effect</p>
+  <h2>Warm-run anatomy at the end of Phase A (historical view)</h2>
+  <p>Honest apples-to-apples: both bars use the correctly-pinned Accelerate build; “before” is serial sweeps +
+  text parse, “after” is colored 10-thread + adaptive + sidecar. The unchanged stages (masks, rotate, SCDM,
+  hand-off write, &approx;6.5 s) now dominate less of a much smaller total — they are Phase C's target.</p>
+  <div class="card">
+    <h3>w2w_hybrid H120, warm inputs — 216 s &rarr; 37 s (5.8&times;)</h3>
+    <div class="legend">
+      <span class="chip"><span class="sw" style="background:var(--s1)"></span>input read</span>
+      <span class="chip"><span class="sw" style="background:var(--s2)"></span>disentangle</span>
+      <span class="chip"><span class="sw" style="background:var(--s3)"></span>masks + rotate + SCDM + write (unchanged)</span>
+    </div>
+    <div id="ch-anatomy"></div>
+  </div>
+</section>
+
+<section id="parity">
+  <p class="eyebrow">parity ledger</p>
+  <h2>Parity &amp; the one caveat worth knowing</h2>
+  <p>Fe reaches the <strong>identical</strong> fixed point under every configuration. On Rh<sub>3</sub>Si<sub>4</sub>
+  the colored sweep <em>order</em> converges to a different (equally valid) local optimum of the non-convex
+  objective — 0.11% higher &Omega;<sub>I</sub>, but a <strong>3.9&times; better</strong> SCDM anchor conditioning.
+  Threaded runs are reproducible per-order; cross-order &Omega; equality is not the gate.</p>
+  <div class="card"><div class="tblwrap">
+    <table>
+      <tr><th>Check</th><th>Configuration</th><th class="num">&Omega;<sub>I</sub> (&Aring;&sup2;)</th><th class="num">&sigma;<sub>min</sub>(SCDM)</th><th>Verdict</th></tr>
+      <tr><td>Fe up-spin, legacy defaults</td><td>serial, any BLAS</td><td class="num">7.72011655</td><td class="num">4.2926e-01</td><td><span class="badge pass">&#10003; exact</span></td></tr>
+      <tr><td>Fe up-spin, colored + adaptive, 10T</td><td>Accelerate</td><td class="num">7.72011655</td><td class="num">4.2926e-01</td><td><span class="badge pass">&#10003; exact</span></td></tr>
+      <tr><td>Rh<sub>3</sub>Si<sub>4</sub> H120, natural order</td><td>serial</td><td class="num">840.05735887</td><td class="num">3.6498e-04</td><td><span class="badge pass">&#10003; reproduces anchor</span></td></tr>
+      <tr><td>Rh<sub>3</sub>Si<sub>4</sub> H120, colored order</td><td>1T = 10T bit-identical</td><td class="num">840.98187612</td><td class="num">1.4068e-03</td><td><span class="badge pass">&#10003; different basin, &sigma;<sub>min</sub> 3.9&times; better</span></td></tr>
+      <tr><td>Rh<sub>3</sub>Si<sub>4</sub> colored, OpenBLAS 10T</td><td>pre-fix</td><td class="num">NaN</td><td class="num">&mdash;</td><td><span class="badge fail">&#10007; BLAS thread-safety, fixed in 676d4ed</span></td></tr>
+      <tr><td>Hand-off files, text vs sidecar</td><td>Fe + Rh<sub>3</sub>Si<sub>4</sub></td><td class="num" colspan="2">cmp: 0 bytes differ</td><td><span class="badge pass">&#10003; bit-identical</span></td></tr>
+    </table>
+  </div></div>
+
+  <details>
+    <summary>Full benchmark ledger — SRC_w2w/bench/results.csv (65 rows)</summary>
+    <div class="card"><div class="tblwrap"><table id="ledger">
+      <tr><th>Feature</th><th>Case</th><th>Metric</th><th class="num">Value</th><th>Unit</th><th>Notes</th></tr>
+    </table></div></div>
+  </details>
+</section>
+
+<footer>
+  <p>Remaining (development notes, D2): k-block ownership across all four kernels, owner-local pool-M,
+  per-owned-k planew grids (the first OOM at 3&times; scale), distributed Stage-2.</p>
+  <p class="mono">Reproduce: OMP_NUM_THREADS=10 w2w_hybrid_acc --seed &lt;seed&gt; --nw 120 --out &lt;out&gt; --rescale occ99 --regime per-state --froz-emax auto --efermi 0.0 --sweeps 2000 --rtol 1e-10 --check-every 10 --colored --adaptive --solver gs</p>
+</footer>
+</div>
+
+<div id="tip" role="status"></div>
+
+<script>
+(function () {
+  var css = getComputedStyle(document.documentElement);
+  function v(name) { return css.getPropertyValue(name).trim(); }
+  var NS = 'http://www.w3.org/2000/svg';
+  function el(tag, attrs, parent, text) {
+    var e = document.createElementNS(NS, tag);
+    for (var a in attrs) e.setAttribute(a, attrs[a]);
+    if (text != null) e.textContent = text;
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  function svg(id, wpx, hpx) {
+    var s = el('svg', { viewBox: '0 0 ' + wpx + ' ' + hpx, role: 'img' });
+    document.getElementById(id).appendChild(s);
+    return s;
+  }
+  // shared tooltip
+  var tip = document.getElementById('tip');
+  function bindTips(root) {
+    root.querySelectorAll('[data-tip]').forEach(function (m) {
+      m.addEventListener('mouseenter', function () { tip.textContent = m.getAttribute('data-tip'); tip.style.display = 'block'; });
+      m.addEventListener('mousemove', function (ev) {
+        var x = Math.min(ev.clientX + 14, window.innerWidth - tip.offsetWidth - 8);
+        tip.style.left = x + 'px'; tip.style.top = (ev.clientY + 14) + 'px';
+      });
+      m.addEventListener('mouseleave', function () { tip.style.display = 'none'; });
+    });
+  }
+  var FONT = '12px ui-monospace, Menlo, monospace';
+  function label(s, x, y, txt, anchor, fill, size) {
+    var t = el('text', { x: x, y: y, 'text-anchor': anchor || 'start',
+      fill: fill || v('--ink-2'), style: 'font: ' + (size || 12) + 'px ui-monospace, Menlo, monospace;' }, s, txt);
+    return t;
+  }
+  function sysLabel(s, x, y, txt, anchor, fill, size) {
+    return el('text', { x: x, y: y, 'text-anchor': anchor || 'start',
+      fill: fill || v('--ink-2'), style: 'font: ' + (size || 12.5) + 'px system-ui, sans-serif;' }, s, txt);
+  }
+
+  /* ---------- A1: sweeps vs cap (horizontal bars, linear) ---------- */
+  (function () {
+    var rows = [
+      { name: 'Fe, natural order',            sw: 71,   d: '|dΩ| = 5.0e-11' },
+      { name: 'Fe, colored',                  sw: 61,   d: '|dΩ| = 8.9e-10' },
+      { name: 'Rh₃Si₄ H120, natural order',   sw: 1071, d: '|dΩ| = 8.2e-08' },
+      { name: 'Rh₃Si₄ H120, colored',         sw: 881,  d: '|dΩ| = 8.0e-08' },
+      { name: 'Rh₃Si₄ H120, colored+adaptive',sw: 882,  d: '|dΩ| = 7.9e-08' }
+    ];
+    var W = 960, ML = 250, MR = 70, MT = 8, BH = 22, GAP = 12;
+    var H = MT + rows.length * (BH + GAP) + 30;
+    var s = svg('ch-sweeps', W, H);
+    var plotW = W - ML - MR, xmax = 2000;
+    function X(x) { return ML + plotW * x / xmax; }
+    [0, 500, 1000, 1500, 2000].forEach(function (t) {
+      el('line', { x1: X(t), y1: MT, x2: X(t), y2: H - 28, stroke: v('--grid'), 'stroke-width': 1 }, s);
+      label(s, X(t), H - 12, String(t), 'middle', v('--muted'), 11);
+    });
+    rows.forEach(function (r, i) {
+      var y = MT + i * (BH + GAP);
+      sysLabel(s, ML - 10, y + BH / 2 + 4, r.name, 'end', v('--ink'), 12.5);
+      el('rect', { x: ML, y: y, width: Math.max(X(r.sw) - ML, 2), height: BH,
+        rx: 4, fill: v('--s1'),
+        'data-tip': r.name + '\n' + r.sw + ' sweeps of 2000 cap\nconverged=T  ' + r.d }, s);
+      label(s, X(r.sw) + 8, y + BH / 2 + 4, r.sw + '', 'start', v('--ink'), 12);
+    });
+    // cap line
+    el('line', { x1: X(2000), y1: MT - 2, x2: X(2000), y2: H - 28, stroke: v('--crit'), 'stroke-width': 1.5, 'stroke-dasharray': '5 4' }, s);
+    label(s, X(2000) - 6, MT + 10, 'cap 2000', 'end', v('--crit'), 11);
+    label(s, ML, H - 12, '', 'start');
+    bindTips(s);
+  })();
+
+  /* ---------- A2: configuration dot plot (log axis) ---------- */
+  (function () {
+    var rows = [
+      { name: 'OpenBLAS auto-threads, serial (as-shipped)', t: 2852, tip: '2852.34 s CPU\n1071 sweeps, converged\nΩ_I 840.05735887\n~15× inflated by OpenBLAS auto-threading thrash' },
+      { name: 'OpenBLAS, colored 10T (pre-fix)', t: 9139, bad: true, tip: '9139 s — INVALID\nhit 2000-sweep cap with NaN\nOpenBLAS unsafe under concurrent zheevd callers' },
+      { name: 'Accelerate, serial (honest baseline)', t: 187.05, tip: '187.05 s wall\n1071 sweeps, converged\nΩ_I 840.05735887 (exact anchor match)' },
+      { name: 'Accelerate, colored 10T', t: 32.81, tip: '32.81 s wall — 5.7×\n881 sweeps, converged\nΩ_I 840.98187612, σ_min 1.41e-3' },
+      { name: 'Accelerate, colored 10T + adaptive', t: 30.71, tip: '30.71 s wall — 6.1×\n882 sweeps, converged\nΩ_I 840.98187611' }
+    ];
+    var W = 960, ML = 330, MR = 90, MT = 10, RH = 34;
+    var H = MT + rows.length * RH + 36;
+    var s = svg('ch-config', W, H);
+    var lo = Math.log10(10), hi = Math.log10(20000), plotW = W - ML - MR;
+    function X(t) { return ML + plotW * (Math.log10(t) - lo) / (hi - lo); }
+    [10, 100, 1000, 10000].forEach(function (t) {
+      el('line', { x1: X(t), y1: MT, x2: X(t), y2: H - 30, stroke: v('--grid'), 'stroke-width': 1 }, s);
+      label(s, X(t), H - 14, t >= 1000 ? (t / 1000) + 'ks' : t + 's', 'middle', v('--muted'), 11);
+    });
+    rows.forEach(function (r, i) {
+      var y = MT + i * RH + RH / 2;
+      sysLabel(s, ML - 10, y + 4, r.name, 'end', v('--ink'), 12.5);
+      el('line', { x1: ML, y1: y, x2: X(r.t), y2: y, stroke: v('--grid'), 'stroke-width': 1 }, s);
+      var c = r.bad ? v('--crit') : v('--s1');
+      el('circle', { cx: X(r.t), cy: y, r: 7, fill: c, stroke: v('--surface'), 'stroke-width': 2, 'data-tip': r.name + '\n' + r.tip }, s);
+      label(s, X(r.t) + 13, y + 4, r.bad ? '✗ NaN' : (r.t >= 100 ? Math.round(r.t) + ' s' : r.t + ' s'), 'start', r.bad ? v('--crit') : v('--ink'), 12);
+    });
+    bindTips(s);
+  })();
+
+  /* ---------- A2: thread scaling bars ---------- */
+  (function () {
+    var rows = [
+      { n: 1, t: 9.53 }, { n: 4, t: 3.44 }, { n: 10, t: 2.19 }
+    ];
+    var W = 960, H = 250, ML = 60, MB = 40, MT = 16, MR = 20;
+    var s = svg('ch-scaling', W, H);
+    var plotW = W - ML - MR, plotH = H - MT - MB, ymax = 10;
+    function Y(t) { return MT + plotH * (1 - t / ymax); }
+    [0, 2.5, 5, 7.5, 10].forEach(function (t) {
+      el('line', { x1: ML, y1: Y(t), x2: W - MR, y2: Y(t), stroke: v('--grid'), 'stroke-width': 1 }, s);
+      label(s, ML - 8, Y(t) + 4, t + '', 'end', v('--muted'), 11);
+    });
+    label(s, 16, MT + 8, 's', 'start', v('--muted'), 11);
+    var bw = 90, step = plotW / rows.length;
+    rows.forEach(function (r, i) {
+      var xc = ML + step * (i + 0.5);
+      el('rect', { x: xc - bw / 2, y: Y(r.t), width: bw, height: Y(0) - Y(r.t), rx: 4, fill: v('--s1'),
+        'data-tip': r.n + ' thread' + (r.n > 1 ? 's' : '') + '\n' + r.t + ' s for 50 sweeps\nspeedup ' + (9.53 / r.t).toFixed(2) + '×\nΩ(50) = 841.12297418 (bit-identical)' }, s);
+      label(s, xc, Y(r.t) - 8, r.t + ' s', 'middle', v('--ink'), 12);
+      var ideal = 9.53 / r.n;
+      el('circle', { cx: xc, cy: Y(ideal), r: 5, fill: 'none', stroke: v('--muted'), 'stroke-width': 2,
+        'data-tip': 'ideal 1/N: ' + ideal.toFixed(2) + ' s' }, s);
+      sysLabel(s, xc, H - 14, r.n + (r.n === 1 ? ' thread' : ' threads'), 'middle', v('--ink-2'), 12.5);
+    });
+    el('line', { x1: ML, y1: Y(0), x2: W - MR, y2: Y(0), stroke: v('--baseline'), 'stroke-width': 1 }, s);
+    bindTips(s);
+  })();
+
+  /* ---------- B1: IO dot plot (log axis) ---------- */
+  (function () {
+    var rows = [
+      { name: 'Rh₃Si₄ — cold text parse', t: 1320, tip: '1320 s (22 min)\n3.3 GB .mmn at ~2.5 MB/s' },
+      { name: 'Rh₃Si₄ — warm text parse', t: 22.15, tip: '22.15 s\npage-cached, incl. sidecar write' },
+      { name: 'Rh₃Si₄ — binary sidecar', t: 0.21, tip: '0.21 s\n105× vs warm, ~6300× vs cold\nmmn.bin 1.3 GB + amn.bin 103 MB' },
+      { name: 'Fe — text parse', t: 0.35, tip: '0.35 s (small case)' },
+      { name: 'Fe — binary sidecar', t: 0.01, tip: '0.01 s\nhand-off bit-identical' }
+    ];
+    var W = 960, ML = 270, MR = 110, MT = 10, RH = 34;
+    var H = MT + rows.length * RH + 36;
+    var s = svg('ch-io', W, H);
+    var lo = Math.log10(0.01), hi = Math.log10(3000), plotW = W - ML - MR;
+    function X(t) { return ML + plotW * (Math.log10(t) - lo) / (hi - lo); }
+    [0.01, 0.1, 1, 10, 100, 1000].forEach(function (t) {
+      el('line', { x1: X(t), y1: MT, x2: X(t), y2: H - 30, stroke: v('--grid'), 'stroke-width': 1 }, s);
+      label(s, X(t), H - 14, t < 1 ? t + 's' : t + 's', 'middle', v('--muted'), 11);
+    });
+    rows.forEach(function (r, i) {
+      var y = MT + i * RH + RH / 2;
+      sysLabel(s, ML - 10, y + 4, r.name, 'end', v('--ink'), 12.5);
+      el('line', { x1: ML, y1: y, x2: X(r.t), y2: y, stroke: v('--grid'), 'stroke-width': 1 }, s);
+      el('circle', { cx: X(r.t), cy: y, r: 7, fill: v('--s1'), stroke: v('--surface'), 'stroke-width': 2, 'data-tip': r.name + '\n' + r.tip }, s);
+      label(s, X(r.t) + 13, y + 4, (r.t >= 100 ? Math.round(r.t) : r.t) + ' s', 'start', v('--ink'), 12);
+    });
+    bindTips(s);
+  })();
+
+  /* ---------- anatomy: stacked horizontal bars ---------- */
+  (function () {
+    var segs = [
+      { key: 'input read', color: v('--s1') },
+      { key: 'disentangle', color: v('--s2') },
+      { key: 'fixed stages', color: v('--s3') }
+    ];
+    var rows = [
+      { name: 'Before — serial + text', vals: [22.15, 187.05, 6.5], total: '215.7 s' },
+      { name: 'After — colored 10T + sidecar', vals: [0.21, 30.71, 6.5], total: '37.4 s' }
+    ];
+    var W = 960, ML = 175, MR = 80, MT = 12, BH = 34, GAP = 26;
+    var H = MT + rows.length * (BH + GAP) + 26;
+    var s = svg('ch-anatomy', W, H);
+    var xmax = 230, plotW = W - ML - MR;
+    function X(x) { return ML + plotW * x / xmax; }
+    [0, 50, 100, 150, 200].forEach(function (t) {
+      el('line', { x1: X(t), y1: MT, x2: X(t), y2: H - 26, stroke: v('--grid'), 'stroke-width': 1 }, s);
+      label(s, X(t), H - 10, t + ' s', 'middle', v('--muted'), 11);
+    });
+    rows.forEach(function (r, i) {
+      var y = MT + i * (BH + GAP);
+      sysLabel(s, ML - 10, y + BH / 2 + 4, r.name.split(' — ')[0], 'end', v('--ink'), 12.5);
+      sysLabel(s, ML - 10, y + BH / 2 + 18, r.name.split(' — ')[1], 'end', v('--muted'), 10.5);
+      var acc = 0;
+      r.vals.forEach(function (val, j) {
+        var x0 = X(acc), x1 = X(acc + val);
+        el('rect', { x: x0, y: y, width: Math.max(x1 - x0 - 2, 1.5), height: BH,
+          rx: j === r.vals.length - 1 ? 4 : 0, fill: segs[j].color,
+          'data-tip': r.name + '\n' + segs[j].key + ': ' + val + ' s' }, s);
+        if (x1 - x0 > 46) label(s, (x0 + x1) / 2, y + BH / 2 + 4, val + 's', 'middle', '#fff', 11);
+        acc += val;
+      });
+      label(s, X(acc) + 8, y + BH / 2 + 4, r.total, 'start', v('--ink'), 12.5);
+    });
+    bindTips(s);
+  })();
+
+
+  /* ---------- A5: alpha sweep ---------- */
+  (function () {
+    var pts = [
+      { a: 0.7, om: 842.234 }, { a: 1.0, om: 841.123 }, { a: 1.3, om: 840.292 },
+      { a: 1.5, om: 840.220 }, { a: 1.7, om: 840.061 }, { a: 1.9, om: 843.034 }
+    ];
+    var W = 960, H = 260, ML = 90, MR = 30, MT = 18, MB = 40;
+    var s = svg('ch-alpha', W, H);
+    var y0 = 839.8, y1 = 843.4, plotW = W - ML - MR, plotH = H - MT - MB;
+    function X(a) { return ML + plotW * (a - 0.6) / (2.0 - 0.6); }
+    function Y(v) { return MT + plotH * (1 - (v - y0) / (y1 - y0)); }
+    [840, 841, 842, 843].forEach(function (t) {
+      el('line', { x1: ML, y1: Y(t), x2: W - MR, y2: Y(t), stroke: v('--grid'), 'stroke-width': 1 }, s);
+      label(s, ML - 8, Y(t) + 4, t + '', 'end', v('--muted'), 11);
+    });
+    var path = pts.map(function (p, i) { return (i ? 'L' : 'M') + X(p.a) + ',' + Y(p.om); }).join('');
+    el('path', { d: path, fill: 'none', stroke: v('--s1'), 'stroke-width': 2 }, s);
+    pts.forEach(function (p) {
+      var best = (p.a === 1.7);
+      el('circle', { cx: X(p.a), cy: Y(p.om), r: best ? 8 : 6, fill: best ? v('--s1-strong') : v('--s1'),
+        stroke: v('--surface'), 'stroke-width': 2,
+        'data-tip': 'alpha = ' + p.a + '\nOmega(50 sweeps) = ' + p.om.toFixed(3) + (best ? '\nOPTIMAL' : '') }, s);
+      sysLabel(s, X(p.a), H - 14, String(p.a), 'middle', v('--ink-2'), 12);
+      if (best) label(s, X(p.a), Y(p.om) - 14, 'best', 'middle', v('--ink'), 11.5);
+    });
+    label(s, 18, MT + 6, 'Omega(50)', 'start', v('--muted'), 11);
+    bindTips(s);
+  })();
+
+  /* ---------- A5: disentangle journey (log dot) ---------- */
+  (function () {
+    var rows = [
+      { name: 'as-shipped (OpenBLAS auto-threads, serial)', t: 2852, tip: '2852 s\n1071 sweeps' },
+      { name: '+ Accelerate BLAS (serial)', t: 187.05, tip: '187 s wall\nsame Omega, exact anchor' },
+      { name: '+ colored 10 threads', t: 32.81, tip: '32.8 s\n881 sweeps (colored order)' },
+      { name: '+ adaptive monitor', t: 30.71, tip: '30.7 s\n882 sweeps' },
+      { name: '+ Zd mixing alpha=1.7', t: 6.88, tip: '6.9 s\n197 sweeps, best Omega_I of all configs' }
+    ];
+    var W = 960, ML = 330, MR = 90, MT = 10, RH = 34;
+    var H = MT + rows.length * RH + 36;
+    var s = svg('ch-journey', W, H);
+    var lo = Math.log10(4), hi = Math.log10(4000), plotW = W - ML - MR;
+    function X(t) { return ML + plotW * (Math.log10(t) - lo) / (hi - lo); }
+    [10, 100, 1000].forEach(function (t) {
+      el('line', { x1: X(t), y1: MT, x2: X(t), y2: H - 30, stroke: v('--grid'), 'stroke-width': 1 }, s);
+      label(s, X(t), H - 14, t + 's', 'middle', v('--muted'), 11);
+    });
+    rows.forEach(function (r, i) {
+      var y = MT + i * RH + RH / 2;
+      sysLabel(s, ML - 10, y + 4, r.name, 'end', v('--ink'), 12.5);
+      el('line', { x1: ML, y1: y, x2: X(r.t), y2: y, stroke: v('--grid'), 'stroke-width': 1 }, s);
+      el('circle', { cx: X(r.t), cy: y, r: 7, fill: v('--s1'), stroke: v('--surface'), 'stroke-width': 2,
+        'data-tip': r.name + '\n' + r.tip }, s);
+      label(s, X(r.t) + 13, y + 4, (r.t >= 100 ? Math.round(r.t) : r.t.toFixed(1)) + ' s', 'start', v('--ink'), 12);
+    });
+    bindTips(s);
+  })();
+
+  /* ---------- D1: SOC pipeline (log dot) ---------- */
+  (function () {
+    var rows = [
+      { name: 'original chain (per-spin x2 + w2waddsp + parse + serial)', t: 5000, tip: '~83 min\n5 tools, 3.3 GB text round-trips' },
+      { name: 'optimized multi-process (A+B+C features)', t: 305, tip: '~305 s\nper-spin x2 + new w2waddsp + standalone hybrid, sidecars' },
+      { name: 'one-shot sigma-loop MODE=HYBR', t: 274.9, tip: '274.9 s, ONE command\nper-state model, Omega_I 840.0574' },
+      { name: 'alpha-Sn test tier (30 bands, same path)', t: 45, tip: '~45 s full cycle\nthe quick SOC gate' }
+    ];
+    var W = 960, ML = 420, MR = 100, MT = 10, RH = 36;
+    var H = MT + rows.length * RH + 36;
+    var s = svg('ch-soc', W, H);
+    var lo = Math.log10(20), hi = Math.log10(8000), plotW = W - ML - MR;
+    function X(t) { return ML + plotW * (Math.log10(t) - lo) / (hi - lo); }
+    [100, 1000].forEach(function (t) {
+      el('line', { x1: X(t), y1: MT, x2: X(t), y2: H - 30, stroke: v('--grid'), 'stroke-width': 1 }, s);
+      label(s, X(t), H - 14, t >= 1000 ? (t/1000) + 'ks' : t + 's', 'middle', v('--muted'), 11);
+    });
+    rows.forEach(function (r, i) {
+      var y = MT + i * RH + RH / 2;
+      sysLabel(s, ML - 10, y + 4, r.name, 'end', v('--ink'), 12);
+      el('line', { x1: ML, y1: y, x2: X(r.t), y2: y, stroke: v('--grid'), 'stroke-width': 1 }, s);
+      el('circle', { cx: X(r.t), cy: y, r: 7, fill: i === 3 ? v('--s2') : v('--s1'),
+        stroke: v('--surface'), 'stroke-width': 2, 'data-tip': r.name + '\n' + r.tip }, s);
+      label(s, X(r.t) + 13, y + 4, (r.t >= 1000 ? '~83 min' : Math.round(r.t) + ' s'), 'start', v('--ink'), 12);
+    });
+    bindTips(s);
+  })();
+
+  /* ---------- full ledger table ---------- */
+  var LEDGER = [
+  [
+  "baseline",
+  "rh3si4_soc",
+  "w2w_full_wall",
+  "186",
+  "s",
+  "352b/120k/160proj amn+mmn+AUTO; ~4 BLAS threads"
+  ],
+  [
+  "baseline",
+  "rh3si4_soc",
+  "mmn_parse_cold",
+  "1320",
+  "s",
+  "3.3GB text at 2.5MB/s; hybrid_files read_mmn"
+  ],
+  [
+  "baseline",
+  "rh3si4_soc",
+  "mmn_parse_warm",
+  "120",
+  "s",
+  "page-cached; parse-rate bound"
+  ],
+  [
+  "baseline",
+  "rh3si4_soc",
+  "disentangle_cpu_nw120",
+  "2815.7",
+  "s",
+  "npool=180; SERIAL; possibly 2000-sweep cap (telemetry pending)"
+  ],
+  [
+  "baseline",
+  "rh3si4_soc",
+  "disentangle_cpu_nw160",
+  "7320.5",
+  "s",
+  "npool=240; SERIAL; possibly cap-limited"
+  ],
+  [
+  "baseline",
+  "rh3si4_soc",
+  "omega_I_nw120",
+  "840.05735887",
+  "Ang^2",
+  "parity anchor (pre-telemetry; convergence unverified)"
+  ],
+  [
+  "baseline",
+  "rh3si4_soc",
+  "scdm_sigma_min_nw120",
+  "3.6498e-04",
+  "-",
+  "parity anchor"
+  ],
+  [
+  "baseline",
+  "rh3si4_soc",
+  "mmn_file_size",
+  "3300",
+  "MB",
+  "formatted 37B/element"
+  ],
+  [
+  "baseline",
+  "rh3si4_soc",
+  "w2waddsp_wall",
+  "300",
+  "s",
+  "10GB text streaming"
+  ],
+  [
+  "baseline",
+  "rh3si4_soc",
+  "pipeline_cold_total",
+  "5880",
+  "s",
+  "~98 min end-to-end incl lapw1+so 13min"
+  ],
+  [
+  "baseline",
+  "fe_nosoc",
+  "w2w_full_wall",
+  "150",
+  "s",
+  "15b/512k/9proj; historical ~2.5min serial"
+  ],
+  [
+  "baseline",
+  "fe_nosoc",
+  "omega_I",
+  "7.72011655",
+  "Ang^2",
+  "parity anchor up-spin"
+  ],
+  [
+  "baseline",
+  "fe_nosoc",
+  "scdm_sigma_min",
+  "4.2926e-01",
+  "-",
+  "parity anchor up-spin"
+  ],
+  [
+  "A1_telemetry",
+  "fe_nosoc",
+  "omega_I",
+  "7.72011655",
+  "Ang^2",
+  "parity EXACT vs baseline; sweeps=71 converged"
+  ],
+  [
+  "A1_telemetry",
+  "fe_nosoc",
+  "sweeps_to_conv",
+  "71",
+  "sweeps",
+  "telemetry now unconditional"
+  ],
+  [
+  "A2_colored_omp",
+  "fe_nosoc",
+  "omega_I",
+  "7.72011655",
+  "Ang^2",
+  "parity EXACT; colored 61 sweeps (different path, same fixed point)"
+  ],
+  [
+  "A2_colored_omp",
+  "fe_nosoc",
+  "scdm_sigma_min",
+  "4.2926e-01",
+  "-",
+  "parity EXACT"
+  ],
+  [
+  "A2_colored_omp",
+  "fe_nosoc",
+  "disentangle_wall",
+  "1.11",
+  "s",
+  "vs 0.44 serial: fork overhead dominates at this tiny size (expected)"
+  ],
+  [
+  "A1_telemetry",
+  "rh3si4_soc",
+  "sweeps_to_conv_nw120",
+  "1071",
+  "sweeps",
+  "CONVERGED (not cap-limited); |dOmega|=8.2e-8; Omega_I exact match to baseline"
+  ],
+  [
+  "A1_telemetry",
+  "rh3si4_soc",
+  "disentangle_cpu_serial",
+  "2852.34",
+  "s",
+  "reproduces 2815.7 baseline"
+  ],
+  [
+  "A3_adaptive_monitor",
+  "fe_nosoc",
+  "omega_I",
+  "7.72011655",
+  "Ang^2",
+  "parity EXACT; 66 sweeps, exact evals only at eigsum plateaus"
+  ],
+  [
+  "A2_colored_omp",
+  "rh3si4_soc",
+  "disentangle_result",
+  "NaN",
+  "-",
+  "FAILURE: colored 10-thread hit cap with NaN; serial converged 1071 sweeps; Fe colored fine -> mesh-specific colored bug under investigation"
+  ],
+  [
+  "A2_colored_omp",
+  "rh3si4_soc",
+  "failure_root_cause",
+  "0",
+  "-",
+  "NOT an OpenMP bug: homebrew OpenBLAS (no USE_LOCKING) corrupts + serializes concurrent zheevd callers; colored path correct (1T==10T bit-exact); fix = link Apple Accelerate"
+  ],
+  [
+  "A2_colored_omp",
+  "rh3si4_soc",
+  "blas_swap_serial_gain",
+  "1.9",
+  "x",
+  "Accelerate 0.19 s/sweep vs OpenBLAS 0.37 s/sweep (colored 1T, 50-sweep probe)"
+  ],
+  [
+  "A2_colored_omp",
+  "rh3si4_soc",
+  "dis_wall_50sweep_1T",
+  "9.53",
+  "s",
+  "Accelerate; Omega(50)=841.12297418"
+  ],
+  [
+  "A2_colored_omp",
+  "rh3si4_soc",
+  "dis_wall_50sweep_4T",
+  "3.44",
+  "s",
+  "speedup 2.77x; Omega bit-identical"
+  ],
+  [
+  "A2_colored_omp",
+  "rh3si4_soc",
+  "dis_wall_50sweep_10T",
+  "2.19",
+  "s",
+  "speedup 4.35x; Omega bit-identical (within-colour order-independent)"
+  ],
+  [
+  "A2_colored_omp",
+  "rh3si4_soc",
+  "disentangle_wall_10T",
+  "32.81",
+  "s",
+  "CONVERGED 881 sweeps; Omega_I=840.98187612 sigma_min=1.4068e-3; DIFFERENT fixed point vs serial order (non-convex GS; sigma_min 4x BETTER); Fe parity on Accelerate exact (71 sweeps 7.72011655)"
+  ],
+  [
+  "A3_adaptive_monitor",
+  "rh3si4_soc",
+  "disentangle_wall_10T",
+  "30.71",
+  "s",
+  "colored+adaptive; 882 sweeps; Omega_I=840.98187611 (matches A2 to 1e-8)"
+  ],
+  [
+  "A2_colored_omp",
+  "rh3si4_soc",
+  "disentangle_wall_serial",
+  "187.05",
+  "s",
+  "HONEST serial baseline (Accelerate, 1T): 1071 sweeps, Omega_I 840.05735887 exact; old 2852s anchor was ~15x inflated by OpenBLAS auto-threading thrash (no OPENBLAS_NUM_THREADS pin)"
+  ],
+  [
+  "A2_colored_omp",
+  "rh3si4_soc",
+  "disentangle_speedup_10T",
+  "5.7",
+  "x",
+  "187.05 -> 32.81 s wall; includes 1071->881 sweep reduction from colored order"
+  ],
+  [
+  "B1_binary_io",
+  "fe_nosoc",
+  "inputs_read_text",
+  "0.35",
+  "s",
+  "parse + sidecar write"
+  ],
+  [
+  "B1_binary_io",
+  "fe_nosoc",
+  "inputs_read_sidecar",
+  "0.01",
+  "s",
+  "hand-off files BIT-IDENTICAL text-vs-sidecar; Omega/sigma exact"
+  ],
+  [
+  "B1_binary_io",
+  "rh3si4_soc",
+  "inputs_read_text_warm",
+  "22.15",
+  "s",
+  "3.3GB mmn + 340MB amn, page-cached, incl sidecar write"
+  ],
+  [
+  "B1_binary_io",
+  "rh3si4_soc",
+  "inputs_read_sidecar",
+  "0.21",
+  "s",
+  "105x warm, ~6300x vs 1320s cold parse; mmn.bin 1.3GB amn.bin 103MB; hand-off BIT-IDENTICAL"
+  ],
+  [
+  "B2_amn_precision",
+  "fe_nosoc",
+  "omega_I",
+  "7.72011655",
+  "Ang^2",
+  "es24.15 amn writer (was 2e18.5 = 5 sig digits); Fe well-conditioned -> masks/Omega/sigma identical; removes the 1e-5 floor that matters for marginal-P cases (Rh3Si4 sigma_min ~1e-3)"
+  ],
+  [
+  "B2_amn_precision",
+  "fe_nosoc",
+  "mmn_rerun_regression",
+  "0",
+  "bytes-differ",
+  "full w2w AUTO rerun after B2+B3 edits reproduces Fe.mmnup bit-identically"
+  ],
+  [
+  "B3_eig_clamp",
+  "fe_nosoc",
+  "regression",
+  "0",
+  "-",
+  "unconditional bmax clamp (was AUTO-only) + read_vec NE<bmax error stop; Fe AUTO run unchanged"
+  ],
+  [
+  "A5_mixing",
+  "rh3si4_soc",
+  "omega50_alpha_sweep",
+  "840.061",
+  "Ang^2",
+  "Omega(50 sweeps) by Zd mix alpha: 1.0->841.123 0.7->842.234(damping hurts GS) 1.3->840.292 1.5->840.220 1.7->840.061(best) 1.9->843.034(overshoot); colored 10T"
+  ],
+  [
+  "A5_mixing",
+  "rh3si4_soc",
+  "disentangle_wall_10T",
+  "6.88",
+  "s",
+  "mix=1.7 colored+adaptive CONVERGED 197 sweeps; Omega_I=840.05615290 = BEST of all configs (serial-basin, below serial 840.05736); sigma_min 3.6425e-4; 4.5x over A3, 27x over honest serial 187s"
+  ],
+  [
+  "A5_mixing",
+  "rh3si4_soc",
+  "sweeps_to_conv",
+  "197",
+  "sweeps",
+  "vs 881 colored / 1071 serial; mix=1.5: 360 sweeps Omega 840.05599 (marginally lower Omega, 11.7 s)"
+  ],
+  [
+  "A5_mixing",
+  "fe_nosoc",
+  "omega_I",
+  "7.72011655",
+  "Ang^2",
+  "parity EXACT; 60 sweeps (vs 66 adaptive), 0.10 s wall; default mix=1.0 leaves legacy path untouched"
+  ],
+  [
+  "B4a_w2waddsp",
+  "rh3si4_soc",
+  "combine_wall_cold",
+  "79.16",
+  "s",
+  "new w2waddsp on hybrid_files readers: 2x3.3GB text parse + sidecar writes; old streamer ~300 s"
+  ],
+  [
+  "B4a_w2waddsp",
+  "rh3si4_soc",
+  "combine_wall_warm",
+  "33.37",
+  "s",
+  "all input sidecars fresh; now bound by combined 3.3GB TEXT output write"
+  ],
+  [
+  "B4a_w2waddsp",
+  "rh3si4_soc",
+  "parity_mmn",
+  "0",
+  "bytes-differ",
+  "combined mmn BYTE-IDENTICAL from line 2 (line 1: old tool truncated title at first blank; new preserves it)"
+  ],
+  [
+  "B4a_w2waddsp",
+  "rh3si4_soc",
+  "parity_amn",
+  "0.0",
+  "rel-diff",
+  "6758400 lines exact; combined amn now es24.15 (old 2E18.5 floored SOC pipeline to 5 digits); spin-file dims+neigh+gshift now VALIDATED (old summed blind)"
+  ],
+  [
+  "B4b_w2w_sidecar_emit",
+  "fe_nosoc",
+  "mmn_emit_parity",
+  "5.0e-13",
+  "max-abs",
+  "w2w now emits .amn.bin/.mmn.bin after the text write; element-wise bin-vs-text = exactly the f18.12/es24.15 print rounding; headers+neigh+gshift exact; conjugate-transpose convention verified"
+  ],
+  [
+  "B4b_w2w_sidecar_emit",
+  "fe_nosoc",
+  "invariant_parity",
+  "4.0e-12",
+  "eV",
+  "hybrid run from sidecar vs text: Omega_I/sigma_min identical, eig_t max diff 4e-12 eV; amn/mmn hand-off differs only by benign gauge slots on degenerate blocks (sidecar carries pre-print full doubles)"
+  ],
+  [
+  "C1_alm_cache",
+  "fe_nosoc",
+  "parity",
+  "0",
+  "bytes-differ",
+  "mmn+amn BIT-IDENTICAL after cache; 21.1 MB/atom class"
+  ],
+  [
+  "C1_alm_cache",
+  "rh3si4_soc",
+  "mmn_stage_wall",
+  "97.76",
+  "s",
+  "MMN-mode w2wc (l2Mmn+planew+3.3GB write+sidecar), was 162.65 s pre-C1 = 1.66x; cache 464.1 MB/atom class; output BIT-IDENTICAL"
+  ],
+  [
+  "C1_alm_cache",
+  "rh3si4_soc",
+  "almgen_calls_saved",
+  "6of7",
+  "-",
+  "each (atom,k) Alm computed once instead of 1+nntot times; remaining stage cost = planew + radint + text write"
+  ],
+  [
+  "C2_mode_hybr",
+  "fe_nosoc",
+  "end_to_end_wall",
+  "3.15",
+  "s",
+  "MODE=HYBR: one w2w run vectors->hand-off; regime/pool/frozen/71 sweeps/Omega_I 7.72011655/sigma_min 0.42926 all EXACT vs standalone chain"
+  ],
+  [
+  "testing_tier",
+  "asn_soc",
+  "w2w_per_spin_wall",
+  "17.8",
+  "s",
+  "alpha-Sn 30b/1728k/nntot8 AUTO; mmn BIT-IDENTICAL to pre-redesign reference = regression pass of B2+B3+B4+C1 on second SOC case"
+  ],
+  [
+  "testing_tier",
+  "asn_soc",
+  "combine_wall",
+  "5.19",
+  "s",
+  "new w2waddsp, sidecar inputs; full SOC cycle up+dn+combine+hybrid ~45 s vs Rh3Si4 ~270-300 s warm (~6x)"
+  ],
+  [
+  "testing_tier",
+  "asn_soc",
+  "defect_found",
+  "1",
+  "-",
+  "nw>nproj segfault in SCDM stage caught on first aSn use; guard added to driver + MODE=HYBR (croak instead of SIGSEGV)"
+  ],
+  [
+  "C2_mode_hybr",
+  "asn_soc",
+  "end_to_end_wall",
+  "18.20",
+  "s",
+  "MODE=HYBR up-spin: EXACT parity vs standalone on identical inputs (Omega 704.38411954, all digits); half-spinor physics expected per-spin"
+  ],
+  [
+  "C2_mode_hybr",
+  "rh3si4_soc",
+  "end_to_end_wall",
+  "131.5",
+  "s",
+  "MODE=HYBR up-spin nw=80 mix=1.7: ONE process vectors->hand-off; EXACT parity vs standalone (Omega 4481.28709567, sigma 4.1414e-10, svmax 0.996903); nproj guard fired correctly at nw=120>80"
+  ],
+  [
+  "D1_sigma_loop",
+  "asn_soc",
+  "sigma_loop_wall",
+  "31.08",
+  "s",
+  "ONE w2wc process: both spin vectors -> spinor-summed overlap + per-sigma amn column blocks + Stage-2 hand-off; replaces per-spin x2 + w2waddsp"
+  ],
+  [
+  "D1_sigma_loop",
+  "asn_soc",
+  "parity_amn_blocks",
+  "2.4e-16",
+  "max-abs",
+  "per-sigma vsp (def unit 19, SP+SOC support): both blocks match per-spin reference files at machine epsilon; order-swap discriminator proved the earlier 6e-11 delta was vspup-vs-vspdn SCF residual in the REFERENCE chain, not the loop"
+  ],
+  [
+  "D1_sigma_loop",
+  "asn_soc",
+  "parity_mmn_combined",
+  "1.0e-12",
+  "max-abs",
+  "vs w2waddsp combined = exactly the f18.12 print-rounding bound (sigma-loop sums full precision; old chain rounds each spin to text first)"
+  ],
+  [
+  "D1_sigma_loop",
+  "rh3si4_soc",
+  "sigma_loop_wall",
+  "219.2",
+  "s",
+  "ONE w2wc process: both spin vectors -> combined amn(160 blocks)+mmn+Stage-2 hand-off; replaces per-spin x2 + w2waddsp + standalone (~305 s optimized multi-process, ~90 min original)"
+  ],
+  [
+  "D1_sigma_loop",
+  "rh3si4_soc",
+  "parity_mmn_combined",
+  "1.0e-12",
+  "max-abs",
+  "3.3 GB sigma-summed mmn vs production w2waddsp file = print-rounding bound"
+  ],
+  [
+  "D1_sigma_loop",
+  "rh3si4_soc",
+  "auto_spinor_model",
+  "840.05615289",
+  "Ang^2",
+  "AUTO 80x2 spinor candidates + per-state + mix1.7: Omega_I matches the original multi-step automated route (840.05615290) to 1e-8, sigma_min 3.643e-4 vs 3.6425e-4 -- one-shot route reproduces the multi-step automated route (internal consistency)"
+  ],
+  [
+  "D1_sigma_loop",
+  "rh3si4_soc",
+  "oneshot_production_wall",
+  "274.9",
+  "s",
+  "regime knob (HYBR line: num_wann mix regime): per-state honored; Omega_I 840.05735656 sigma 3.6481e-4 (serial+mix basin; colored standalone: 840.0562); ONE command vectors->hand-off"
+  ],
+  [
+  "MPI_verify",
+  "fe_nosoc",
+  "mpi_4rank_parity",
+  "0",
+  "bytes-differ",
+  "w2w_mpi 4 ranks: amn+mmn BIT-IDENTICAL to serial after redundant-bcast deletion; MODE=HYBR under mpirun reproduces Omega_I/sigma exactly (root-only hook)"
+  ]
+  ];
+  var tbl = document.getElementById('ledger');
+  LEDGER.forEach(function (r) {
+    var tr = document.createElement('tr');
+    r.forEach(function (c, i) {
+      var td = document.createElement('td');
+      if (i === 3) td.className = 'num';
+      if (i === 0 || i === 2) { td.innerHTML = '<span class="mono">' + c + '</span>'; }
+      else td.textContent = c;
+      tr.appendChild(td);
+    });
+    tbl.appendChild(tr);
+  });
+})();
+</script>

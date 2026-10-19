@@ -8,7 +8,7 @@
 ### Copyright 2013-2016 Elias Assmann
 
 # FC ........... compiler name
-# FOPT ......... optimization flags
+# FOPT ......... optimization flags (passed via make.sys or command line)
 # FGEN ......... code generation flags (flags not related to optimization)
 # LDFLAGS ...... linker flags
 # R_LIBS ....... libraries needed to build the REAL executable
@@ -16,6 +16,19 @@
 # DESTDIR ...... dir. where the executable should go (without trailing '/'!)
 # R_EXECNAME ... name of the resulting REAL executable (without prefixed path!)
 # C_EXECNAME ... name of the resulting COMPLEX executable ( -"- )
+#
+# IMPORTANT: When building standalone (outside WIEN2k), set FOPT not FFLAGS
+# on the command line, because FFLAGS is constructed from FOPT:
+#
+#   make FOPT="-O2" all              (correct)
+#   make FFLAGS="-O2" all            (WRONG: overrides -I$(O_DIR))
+#
+# Recommended FOPT for common compilers:
+#   ifort:    FOPT="-O2"
+#   gfortran: FOPT="-O2 -ffree-form"
+#
+# Note: gfortran -O3 is safe with this code. A previous vectorizer bug in
+# planew was fixed by using explicit scalar loops (see modules_rc.F).
 
 SHELL = /bin/sh
 .SUFFIXES:
@@ -86,7 +99,8 @@ distclean: clean
 #  Object files common to both REAL and COMPLEX version
 #  (i.e., these are the same for REAL and COMPLEX)
 #
-OBJS = $(filter-out $(R_OBJS) $(RC_OBJS), \
+#  w2w_hybrid.o is a standalone program (own `main`); built by Makefile.hybrid
+OBJS = $(filter-out $(R_OBJS) $(RC_OBJS) w2w_hybrid.o, \
 	$(patsubst %.F, %.o, $(wildcard *.F)) \
 	$(patsubst %.f, %.o, $(wildcard *.f)))
 
@@ -114,13 +128,18 @@ RC_OBJS = $(filter-out $(R_OBJS), $(modrc_users))
 #
 
 ## util_w2w.F:   utilities used in SRC_w2w, SRC_wplot, SRC_trig
-util_users   = mod_w2w.o modules.o modules_rc.o main.o
+util_users   = mod_w2w.o modules.o modules_rc.o main.o mpi_w2w.o
 ## mod_w2w.f:    modules and procedures shared by SRC_w2w and SRC_wplot
 modw2w_users = modules.o modules_rc.o main.o
 ## modules.f:    modules and procedures for SRC_w2w
 mod_users    = modules_rc.o main.o
 ## modules_rc.f: modules and procedures for SRC_w2w -- real/complex
 modrc_users  = main.o
+## mpi_w2w.F:    MPI wrapper module (common, no _COMPLEX_ dependency)
+mpi_users    = modules.o modules_rc.o main.o
+## projection_support.F: state_support_max, the (band, k) reduction behind
+## compute_projectability's component_sum_max (common, no _COMPLEX_ dependency)
+projsup_users = modules_rc.o
 
 #........................................................................
 #
@@ -143,15 +162,15 @@ $(C_EXEC): $(objs) $(c_objs) Makefile
 #  Real and complex need to be kept separate!
 #
 $(O_DIR)/%.o: %.[fF] Makefile
-	@test -d $(O_DIR) || mkdir $(O_DIR)
+	@mkdir -p $(O_DIR)
 	$(FC) $(FFLAGS) -c $< -o$@ $(MODOPT) $(O_DIR)
 
 $(R_DIR)/%.o: %.[fF] Makefile
-	@test -d $(R_DIR) || mkdir $(R_DIR)
+	@mkdir -p $(R_DIR)
 	$(FC) $(FFLAGS) -c $< -o$@ $(MODOPT) $(R_DIR)
 
 $(C_DIR)/%.o: %.[fF] Makefile
-	@test -d $(C_DIR) || mkdir $(C_DIR)
+	@mkdir -p $(C_DIR)
 	$(FC) $(FFLAGS) -c $< -o$@ $(MODOPT) $(C_DIR) -D_COMPLEX_
 
 #........................................................................
@@ -175,7 +194,35 @@ $(mod_users):    $(O_DIR)/modules.o
 $(modw2w_users): $(O_DIR)/mod_w2w.o
 $(util_users):   $(O_DIR)/util_w2w.o
 
-# Dependencies on ‘modules_rc.o’; we know these files must have
+# Dependencies on mpi_w2w.o (common module, no _COMPLEX_ dependency)
+mpi_users    := $(foreach d, $(O_DIR) $(R_DIR) $(C_DIR), \
+	$(foreach o, $(mpi_users), $d/$o))
+$(mpi_users):   $(O_DIR)/mpi_w2w.o
+
+# Dependencies on 'modules_rc.o'; we know these files must have
 # real/complex versions
 $(foreach o, $(modrc_users), $(R_DIR)/$o): $(R_DIR)/modules_rc.o
 $(foreach o, $(modrc_users), $(C_DIR)/$o): $(C_DIR)/modules_rc.o
+
+# projection_support.o is common (a pure reduction, `use const' only); both
+# real and complex modules_rc need its .mod for compute_projectability.
+projsup_users := $(foreach d, $(R_DIR) $(C_DIR), \
+	$(foreach o, $(projsup_users), $d/$o))
+$(projsup_users): $(O_DIR)/projection_support.o
+
+# Dependencies on the hybrid Stage-2 modules (common, no _COMPLEX_
+# dependency); main.F uses them for MODE=HYBR
+hybrid_objs  := hybrid_core.o hybrid_prep.o hybrid_io.o hybrid_files.o \
+                hybrid_grass.o
+hybrid_users := $(foreach d, $(R_DIR) $(C_DIR), $d/main.o)
+$(hybrid_users): $(foreach o, $(hybrid_objs), $(O_DIR)/$o)
+# module order inside the hybrid set: hybrid_grass uses hybrid_core_m, and
+# hybrid_core uses hybrid_io_m (handoff_close).  Explicit, so a parallel or
+# clean build cannot compile a user before the module it needs.
+$(O_DIR)/hybrid_grass.o: $(O_DIR)/hybrid_core.o
+$(O_DIR)/hybrid_core.o: $(O_DIR)/hybrid_io.o
+
+# projection_support.F `uses const', which is DEFINED in util_w2w.F but is
+# not in util_users above; without this line a CLEAN tree can schedule it
+# before lib/util_w2w.o and fail on a missing const.mod.
+$(O_DIR)/projection_support.o: $(O_DIR)/util_w2w.o

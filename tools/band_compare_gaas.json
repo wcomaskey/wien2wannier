@@ -1,0 +1,32 @@
+{
+ "_comment": [
+  "Example spec for the GaAs worked example (doc/hybrid/05-worked-example.md).",
+  "Paths are relative to this file's directory: copy it into the GaAs-WANN case",
+  "directory, or run with --root /path/to/GaAs-WANN.  The DFT reference is the",
+  "WIEN2k band structure on a k-path: in a copy of the case directory named",
+  "dft_band/, put the path in GaAs-WANN.klist_band and run `x lapw1 -band`; keep",
+  "the resulting GaAs-WANN.energy and the .klist_band there.  The model is the",
+  "Wannier90 run of the worked example in hybF/ (write_hr = true, write_tb or",
+  "use_ws_distance as in the .win; GaAs-hybF_wsvec.dat is used when present).",
+  "eta_windows gives the index-paired RMS over each window (meV) in the .txt."
+ ],
+ "out": "band_compare_gaas.png",
+ "style": "plain",
+ "offset_search": true,
+ "panels": [
+  {
+   "title": "GaAs: LAPW reference vs the 18-WF hand-off model",
+   "cell": {"nnkp": "GaAs-WANN.nnkp"},
+   "ktransform": "fcc",
+   "dft": {"kind": "bandpath",
+           "klist_band": "dft_band/GaAs-WANN.klist_band",
+           "energy": "dft_band/GaAs-WANN.energy",
+           "fermi": "GaAs-WANN.fermi"},
+   "ylim": [-16, 8],
+   "windows": [[-16, 0], [0, 4]],
+   "eta_windows": [[-16, 0], [0, 4]],
+   "models": [{"kind": "hr", "dir": "hybF", "seed": "GaAs-hybF",
+               "label": "Wannier (18 WF)", "wout": "hybF/GaAs-hybF.wout"}]
+  }
+ ]
+}

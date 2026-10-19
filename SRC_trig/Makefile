@@ -67,6 +67,12 @@ distclean: clean
 $(UTILOBJ): $(SRCDIR)/util_w2w.F $(SRCDIR)/Makefile
 	make -C $(SRCDIR) $(LIBDIR)/util_w2w.o
 
+# w2waddsp reads/writes through the binary-sidecar-aware readers
+HYBFILES := $(UTILDIR)/hybrid_files.o
+$(HYBFILES): $(SRCDIR)/hybrid_files.F $(SRCDIR)/Makefile
+	make -C $(SRCDIR) $(LIBDIR)/hybrid_files.o
+w2waddsp: $(HYBFILES)
+
 $(EXE_UTIL): %: %.o $(UTILOBJ)
 	$(FC) $(FFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 

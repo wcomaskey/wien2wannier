@@ -28,14 +28,14 @@ module param
   public
 
   character(*), parameter, private :: &
-       rev_str = "$version: v2.0.0-7-g4c51be8$"
+       rev_str = "$version: v3.0$"
   character(*), parameter, public  :: &
        wien2wannier_version = rev_str(11 : len (rev_str)-1)
 
   integer, parameter :: unit_def=1, unit_in=5, unit_out=6, unit_vector=10
   integer, parameter :: unit_vsp=18, unit_struct=20
   
-  integer, parameter :: Lmax2=5, LOmax=3, Nloat=3, Nrad=881, Nrf=4
+  integer, parameter :: Lmax2=5, LOmax=3, Nloat=3, Nrad=881, Nrf=5
 end module param
 
 module PS1

@@ -140,7 +140,11 @@ contains
 
     character(BUFSZ) :: fmt
 
-    write(fmt, '( "( ''[ ''", I0, "(I0,1X)", "'' ]'' )" )') size(na)
+    ! The generated format MUST carry commas between the literals and the
+    ! repeat group: without them gfortran dies AT RUNTIME with "Missing comma
+    ! between descriptors" the first time the format executes.  The shipped
+    ! version emitted ( '[ 'N(I0,1X)' ]' ) and was runtime-fatal on any call.
+    write(fmt, '( "( ''[ '', ", I0, "(I0,1X), '' ]'' )" )') size(na)
     write(ints2str, fmt) na
   end function ints2str
 
@@ -154,7 +158,12 @@ contains
 
     character(BUFSZ) :: fmt
 
-    write(fmt, '( "( ''[''", I0, "(F0.4,1X)", "'' ]'' )" )') size(ra)
+    ! Same missing-comma defect as ints2str above; this one was the MEASURED
+    ! crash -- struct_read on a Pnma Rh3Si4 struct file reaches a message
+    ! that stringifies reals and died with "Missing comma between descriptors"
+    ! (the w2w_hybrid.struct copy does not reach that path, which is why the
+    ! unit suite never saw it).
+    write(fmt, '( "( ''['', ", I0, "(F0.4,1X), '' ]'' )" )') size(ra)
     write(reals2str, fmt) ra
   end function reals2str
 
@@ -417,7 +426,7 @@ module clio
   implicit none
   private
 
-  public :: croak, carp, cluck, argstr, argstr_set, fetcharg, fetchenv
+  public :: croak, carp, cluck, argstr, argstr_set, fetcharg, fetchenv, close_checked
 
   type argstr
 #ifdef HAVE_VARLEN_STR
@@ -961,6 +970,34 @@ contains
        end if
     end if
   end subroutine fetchenv_real
+
+  !> Closes `unit` and refuses the run (croak) when the file on disk is shorter than what was written to it.
+  !> gfortran reports no error for buffered writes that hit a full disk -- not on the write, the flush or the
+  !> close, with or without iostat -- and the file simply stops short (measured on this machine, gfortran 16,
+  !> macOS).  The size libgfortran believes it wrote, inquired before the close,
+  !> is compared with the size on disk after it; on a healthy disk the two are equal.  Unnamed units are just closed.
+  subroutine close_checked(unit, what)
+    use iso_fortran_env, only: int64
+    integer,          intent(in) :: unit
+    character(len=*), intent(in) :: what
+
+    character(len=4096) :: fname
+    character(len=512)  :: msg
+    integer(int64)      :: szw, szd
+    integer             :: ios
+    logical             :: named
+
+    fname = ''; szw = -1; szd = -1
+    inquire(unit=unit, named=named, name=fname, size=szw)
+    close(unit, iostat=ios)
+    if (named) inquire(file=trim(fname), size=szd)
+    if (ios /= 0 .or. (named .and. szw >= 0 .and. szd /= szw)) then
+       write(msg, '(a,i0,a,i0,a,i0,a)') ': ', szd, ' bytes on disk but ', szw, &
+            ' were written (close iostat ', ios, '). The write was lost, most likely because the disk is full.'
+       call croak(trim(what)//' '//trim(fname)//trim(msg)// &
+            ' Refusing: the product is incomplete. Free disk space and rerun.')
+    end if
+  end subroutine close_checked
 end module clio
 
 
@@ -1363,6 +1400,27 @@ contains
          mult: do m = 1,stru%mult(jatom)
             idx = idx+1
 
+            ! Canonical frame for the representative: the identity.  Every
+            ! site-group operation maps the representative to itself, so a
+            ! first match here is decided by the ORDER of the operations in
+            ! the struct file -- identity for SrVO3, but a z-flip plus an
+            ! in-plane rotation for MgB2, and arbitrary in general.  That
+            ! silently redefines what the inwf (l,m) labels mean, while the
+            ! downstream conventions (projmap m-ordering, W90/WannSymm
+            ! positional assignment) all assume the rotloc frame.
+            ! Measured A/B (MgB2, the case where op 1 is not the identity):
+            ! the amn gauge changes by O(1), but mmn is bit-identical and
+            ! Omega_I agrees to 8 digits -- a gauge choice, not physics.
+            if (idx == jdx) then
+               Ncount = Ncount+1
+               stru%transij(:, idx) = 0
+               stru%rotij(:,:, idx) = 0
+               stru%rotij(1,1,idx) = 1
+               stru%rotij(2,2,idx) = 1
+               stru%rotij(3,3,idx) = 1
+               cycle mult
+            end if
+
             sym: do i = 1,size(stru%rsym, 3)
                x = matmul(transpose(stru%rsym(:,:, i)), stru%pos(:, jdx))
                x = x + stru%rtrans(:, i)
@@ -1477,7 +1535,7 @@ module inwfmod
   implicit none
 
   private
-  public :: inwf_t, inwf_read
+  public :: inwf_t, inwf_read, auto_config_t
 
   interface inwf_read
      module procedure inwf_read_unit, inwf_read_fname, inwf_read_argstr
@@ -1487,14 +1545,159 @@ module inwfmod
      integer                   :: NY
      integer,      allocatable :: iat(:), l(:), m(:)
      complex(DPk), allocatable :: coeff(:)
+     ! radial tag per Y-term: 1 = u_l (legacy projector, default);
+     ! 3..5 = orthogonalized-shell LO projector using that rf's radial
+     ! (semicore shells invisible to the u-based projector, e.g. Ga-3d)
+     integer,      allocatable :: rf(:)
   end type proj
 
+  type auto_config_t
+     real(DPk) :: threshold  = 0.10_DPk  ! min relative weight (w_i/w_max)
+     integer   :: max_proj   = 0         ! max projections (0=auto)
+     logical   :: write_proj = .false.   ! write .autoproj diagnostic
+     logical   :: p2_weight  = .true.    ! erfc energy weight in ranking (P2)
+     real(DPk) :: support_ratio = 0.5_DPk ! P3 gate (0 disables); full windows
+                                          ! with a dominant channel need < 0.5
+     ! ---- selection payload, set by generate_projections (in-process
+     ! consumers read these instead of parsing projmap.dat; replaces the
+     ! old negative-max_proj mask_cols smuggle) ----
+     integer :: mask_cols = 0            ! cliff mode: Otsu mask boundary in
+                                         ! amn columns (leading block)
+     integer :: nsel      = 0            ! selected channels (post-feasibility)
+     integer,   allocatable :: sel_atom(:), sel_l(:), sel_rf(:)  ! per channel
+     logical,   allocatable :: sel_mask(:)     ! physical (Otsu upper) channel
+     real(DPk), allocatable :: sel_weight(:), sel_support(:)
+  end type auto_config_t
+
   type inwf_t
-     !! Structure to represent a ‘inwf’ file
+     !! Structure to represent a 'inwf' file
      character(len=4)        :: mode
-     logical                 :: Mmn, Amn
+     logical                 :: Mmn  = .false.
+     logical                 :: Amn  = .false.
+     logical                 :: auto_mode = .false.
+     logical                 :: hybrid    = .false.  ! MODE=HYBR in-memory Stage-2
      integer                 :: bmin, bmax, Nproj, LJmax
-     type(proj), allocatable :: projections(:)
+     integer                 :: num_wann = 0         ! HYBR: target WF count
+                                                     ! (0 = capacity-driven auto)
+     ! HYBR: Zd relaxation.  1 = off; >1 fixed over-relaxation; <0 SCHEDULED
+     ! (start at |mix|, taper geometrically toward 1).
+     !
+     ! Default -2.5 + kick, chosen by WORST-CASE REGRET across four cells,
+     ! not by best-case on one.  Measured Omega_I, best-of-three per cell:
+     !   cell     fixed 1.9      -1.7            -2.5+kick
+     !   MgB2     9.21800613     9.21800615      9.21800614   (one minimum)
+     !   Fe-up    6.51159711     6.97607570 !!   6.51382534
+     !   Fe-dn    6.57988366     7.17933349 !!   6.57597181
+     !   GaAs    21.86150562    21.83306107     21.82791941
+     ! Worst-case excess: -2.5+kick 0.034%, fixed 1.9 0.154%, -1.7 9.2%.
+     ! -1.7 converges on Fe in SIXTY sweeps to a 7-9% worse minimum with
+     ! converged=T and no warning -- the fastest run and the worst answer.
+     ! The ranking REVERSES between materials, so no fixed alpha is optimal
+     ! everywhere; this is the minimax choice, not the best choice.
+     !
+     ! Historical note -- the earlier reasoning, kept because it is still  Measured on the GaAs
+     ! one-shot: -1.5 and -1.7 both converge to Omega_I = 21.83306107 (the
+     ! true minimum, reached independently), while -1.9 "converges" 6.6x
+     ! sooner at 21.86150570 -- 0.13% HIGHER.  That is a false convergence
+     ! into a flatter, worse basin, and `converged=T` does not distinguish
+     ! the two.  -1.7 is the fastest factor that still reaches the minimum,
+     ! and it matches the Rh3Si4 H120 relaxation probes.  At mix=1 the
+     ! disentangler needs far more sweeps and still does not get there; the
+     ! one-shot silently ran that way until 2026-07-29.
+     real(DPk)               :: hyb_mix  = -2.5_DPk
+     character(len=16)       :: hyb_regime = 'auto'  ! HYBR: mask regime
+     ! HYBR keyword tail (optional `key = value' lines after line 5;
+     ! defaults = the validated recipe)
+     character(len=16)       :: hyb_froz_mode = 'auto'   ! auto | none | <eV>
+     real(DPk)               :: hyb_froz_val  = 8.0_DPk  ! ceiling for numeric mode
+     real(DPk)               :: hyb_pool_factor = 1.5_DPk
+     integer                 :: hyb_margin = 0           ! 0 = max(4, 4% of need)
+     character(len=16)       :: hyb_gauge  = 'auto8'     ! gauge dispatch mode
+     character(len=16)       :: hyb_seedk  = 'opt16'     ! seed policy
+     character(len=16)       :: hyb_seedloss = 'smooth'  ! tournament loss
+     logical                 :: hyb_cap_strict = .true.  ! capacity violations
+                                                         ! croak (strict) or
+                                                         ! warn (capacity=warn)
+     ! ---- Gate A (W8): what to do when a band-window edge or a pool edge
+     ! falls INSIDE a degenerate multiplet.  A cut through a multiplet puts
+     ! only part of it in the model, and no unitary rotation of the model's
+     ! states can restore the degeneracy (MgB2 12x12x8: the window 5-22 cuts
+     ! the doublet at bands 22/23 at 8 of 1152 k; the window 5-23 is closed).
+     !   auto   -- snap AUTO-sentinel edges to the nearest closed edge, then
+     !             warn on a surviving stuck edge.
+     !   warn   -- diagnose only; never snap, never croak (pre-W8 behaviour,
+     !             and the keyword-level rollback)
+     !   strict -- croak on any surviving stuck edge
+     !   snap   -- snap ANY stuck edge within the walk cap, sentinel or
+     !             explicit, then behave as `strict' on what survives
+     ! Overridden by the environment variable W2W_EDGES (which is the only
+     ! way to set it for a non-HYBR deck, since the keyword tail is HYBR's).
+     character(len=16)       :: hyb_edges = 'auto'
+     ! Disentangler controls.  These were hardcoded at the call site until
+     ! 2026-07-29, which left the one-shot running a configuration we never
+     ! validated: half the sweep budget of the production recipe, with both
+     ! the relaxation and the adaptive convergence cadence off.  Defaults
+     ! below ARE the production recipe.
+     ! Sweep cap 20000, not the recipe's 4000.  A cap costs nothing when
+     ! convergence is quick (the loop exits on the tolerance), but 4000 is
+     ! demonstrably too few: GaAs needs 10042 sweeps at relax=-1.7 to reach
+     ! its minimum, and feup/fedn hit 4000 unconverged in every recorded
+     ! baseline; on the LCAO frontend SnTe needs 15889 sweeps.  A run that
+     ! still stops at the cap is graded (flat or still descending) in the
+     ! log and in <case>-hyb.dis.  Lower it deliberately on very large cells
+     ! if you would rather fail fast than wait.
+     integer                 :: hyb_sweeps   = 20000    ! disentangle sweep cap
+     ! Convergence floor.  The test is `dlast < tol .OR. dlast < rel_tol*|Om|',
+     ! so the LOOSER branch decides: at Omega ~ 22 the rel_tol branch fires at
+     ! 2.2e-9 and `tol' never gets a say.  Tighten BOTH to move the floor.
+     ! Re-kick the relaxation schedule when the taper has spent itself,
+     ! instead of finishing the run effectively unrelaxed.  Experimental
+     ! until measured across materials -- default off.
+     ! The upstream text .amn/.mmn are INTERMEDIATES under HYBR: nothing in
+     ! process or in the hand-off chain reads them (Stage-2 works from memory,
+     ! Wannier90 gets <case>-hyb.*), and the binary sidecars carry the same
+     ! numbers for every in-tree reader.  Off by default; turn on for debugging
+     ! or to feed a stock-Wannier90 full-window run.
+     ! Omega_I solver.  'cg' (default since 2026-10) = direct Riemannian CG on
+     ! the Grassmann manifold, stopping on the projected gradient; it
+     ! parallelizes exactly over k with no colouring.  'gs' = the Gauss-Seidel
+     ! sweep (the default before).  'auto' picks on ndis and says why
+     ! (LCAO-measured per-step crossover ndis ~ 250).
+     character(len=8)        :: hyb_solver   = 'cg'
+     logical                 :: hyb_text_io  = .false.
+     logical                 :: hyb_kick     = .true.
+     real(DPk)               :: hyb_taper    = 0.5_DPk   ! schedule down-step
+     real(DPk)               :: hyb_taper_late = 0.0_DPk ! 0 = same as taper
+     ! Late-phase restart target.  MEASURED optimum per cell (sweeps at the
+     ! minimum, opening held at -2.5 so the basin is fixed and this isolates
+     ! the local rate):
+     !   GaAs  1.99 (1596)   MgB2 1.95 (996)
+     !   Fe-up 1.95 (1034)   Fe-dn 1.95 (1020)
+     ! The curve is the classical SOR shape -- monotone down to an optimum,
+     ! then a sharp rise as the iteration turns oscillatory -- but the optimum
+     ! is MATERIAL-DEPENDENT, so any fixed value is wrong somewhere.  Worst-case
+     ! extra sweeps for a single hard-coded choice: 1.85 +392%, 1.95 +168%,
+     ! 1.99 +41%.  1.99 is therefore the minimax pick, NOT a good pick; a
+     ! runtime probe (golden section on alpha at the first kick, ~10% overhead)
+     ! would drive this to zero and is the right eventual fix.
+     ! At exactly 2.0 GaAs loses quality as well as rate (Omega_I 21.8280846 vs
+     ! 21.8279193) -- Kahan's bound showing up in the answer, not just the cost.
+     real(DPk)               :: hyb_relax_late = 1.99_DPk ! 0 = same as relax
+     real(DPk)               :: hyb_tol      = 1.0e-9_DPk
+     real(DPk)               :: hyb_rel_tol  = 1.0e-10_DPk
+     logical                 :: hyb_adaptive = .true.   ! defer the exact
+                                                        ! Omega_I check until
+                                                        ! the free eigen-sum
+                                                        ! plateaus
+     integer                 :: hyb_anderson = 0        ! AA history depth
+                                                        ! (0 = off)
+     ! Red-black k-parallel sweep.  OFF by default and deliberately so: it is
+     ! a different Gauss-Seidel ordering that lands on a different (equally
+     ! valid) fixed point, and w2w/w2wc are built WITHOUT -fopenmp, so
+     ! enabling it here would change the answer while buying no speed.
+     logical                 :: hyb_colored  = .false.
+     type(proj),          allocatable :: projections(:)
+     type(auto_config_t) :: auto_config
   end type inwf_t
 
 contains
@@ -1506,8 +1709,9 @@ contains
     integer,      intent(in)  :: lun
     type(inwf_t), intent(out) :: inwf
 
-    integer             :: w, y, NY
+    integer             :: w, y, NY, confios
     real(DPk)           :: re, im
+    character(len=256)  :: confline
 
     read(lun, *) inwf%mode
 
@@ -1519,34 +1723,244 @@ contains
     case('BOTH')
        inwf%Amn = .true.
        inwf%Mmn = .true.
+    case('AUTO')
+       inwf%Amn = .true.
+       inwf%Mmn = .true.
+       inwf%auto_mode = .true.
+    case('AAMN')
+       ! AUTO channel selection, amn ONLY: re-select projections against an
+       ! EXISTING mmn (same band window) without the overlap recompute.
+       ! Rh3Si4: the mmn is 12 GB / hours, the amn minutes -- this is what
+       ! makes widening the candidate set affordable.
+       inwf%Amn = .true.
+       inwf%Mmn = .false.
+       inwf%auto_mode = .true.
+    case('HYBR')
+       ! AUTO + in-memory hybrid Stage-2 (masks -> disentangle -> SCDM ->
+       ! isolated Nb=Nw hand-off) run inside w2w after l2Amn.
+       inwf%Amn = .true.
+       inwf%Mmn = .true.
+       inwf%auto_mode = .true.
+       inwf%hybrid = .true.
     case default
        call croak('unknown MODE in inwf, '//inwf%mode)
     end select
 
     read(lun, *) inwf%bmin, inwf%bmax
-    if (inwf%bmax < inwf%bmin) &
-         call croak('bmin > bmax in inwf')
+    if (inwf%auto_mode) then
+       ! AUTO sentinels resolved in main after the energy-file scan:
+       !   bmin =  0 -> gap-walk auto-bmin (trim core/semicore complexes)
+       !   bmax =  0 -> all bands present at every k
+       !   bmax = -1 -> highest band with bottom <= E_F + 40 eV
+       if (inwf%bmin < 0 .or. inwf%bmax < -1) &
+            call croak('invalid band index in inwf')
+       if (inwf%bmin > 0 .and. inwf%bmax > 0 .and. inwf%bmax < inwf%bmin) &
+            call croak('bmin > bmax in inwf')
+    else
+       if (inwf%bmax < inwf%bmin) &
+            call croak('bmin > bmax in inwf')
+    end if
 
-    read(lun,*) inwf%LJmax, inwf%Nproj
+    if (inwf%auto_mode) then
+       ! AUTO mode: read LJmax and auto-config parameters.  The config
+       ! line is `threshold max_proj write_proj [p2_weight]'; the 4th
+       ! field is optional (default T) for back-compatibility.
+       read(lun, *) inwf%LJmax
+       read(lun, '(A)') confline
+       read(confline, *, IOSTAT=confios)          &
+            &       inwf%auto_config%threshold,   &
+            &       inwf%auto_config%max_proj,    &
+            &       inwf%auto_config%write_proj,  &
+            &       inwf%auto_config%p2_weight,   &
+            &       inwf%auto_config%support_ratio
+       if (confios /= 0) then
+          inwf%auto_config%support_ratio = 0.5_DPk
+          read(confline, *, IOSTAT=confios)          &
+               &       inwf%auto_config%threshold,   &
+               &       inwf%auto_config%max_proj,    &
+               &       inwf%auto_config%write_proj,  &
+               &       inwf%auto_config%p2_weight
+          if (confios /= 0) then
+             inwf%auto_config%p2_weight = .true.
+             read(confline, *) inwf%auto_config%threshold, &
+                  &            inwf%auto_config%max_proj,  &
+                  &            inwf%auto_config%write_proj
+          end if
+       end if
+       inwf%Nproj = 0  ! will be set by generate_projections
+       if (inwf%hybrid) then
+          ! HYBR extra line: `num_wann [mix] [regime]'.  mix = Zd relaxation:
+          ! 1 = off, >1 fixed over-relaxation, NEGATIVE = scheduled (start at
+          ! |mix|, taper toward 1); default -2.5 (see hyb_mix: -1.9 reaches
+          ! the convergence test sooner but at a worse Omega_I).
+          ! regime = auto | per-state | band-level, default auto.
+          ! num_wann = 0 means capacity-driven auto (requires an explicit
+          ! froz_emax keyword).  Prefer the `relax =' keyword to the
+          ! positional field -- it is clearer and does not depend on the
+          ! optional-field parse succeeding.
+          read(lun, '(A)') confline
+          read(confline, *, IOSTAT=confios) inwf%num_wann, inwf%hyb_mix, &
+               inwf%hyb_regime
+          if (confios /= 0) then
+             inwf%hyb_regime = 'auto'
+             read(confline, *, IOSTAT=confios) inwf%num_wann, inwf%hyb_mix
+             if (confios /= 0) then
+                inwf%hyb_mix = -2.5_DPk
+                read(confline, *) inwf%num_wann
+             end if
+          end if
+          if (inwf%num_wann < 0) call croak('HYBR: num_wann must be >= 0 &
+               &(0 = capacity-driven auto)')
+          ! optional keyword tail: `key = value' lines until EOF/blank.
+          ! Unknown keys are a hard error (typo protection).
+          kwloop: do
+             read(lun, '(A)', IOSTAT=confios) confline
+             if (confios /= 0) exit kwloop
+             if (len_trim(confline) == 0) exit kwloop
+             block
+               integer :: ieq, iosk
+               character(len=64)  :: key
+               character(len=192) :: val
+               ieq = index(confline, '=')
+               if (ieq == 0) call croak('HYBR keyword line without "=": '// &
+                    trim(confline))
+               key = adjustl(confline(1:ieq-1))
+               val = adjustl(confline(ieq+1:))
+               select case (trim(key))
+               case ('froz_emax')
+                  if (trim(val) == 'auto' .or. trim(val) == 'none') then
+                     inwf%hyb_froz_mode = trim(val)
+                  else
+                     inwf%hyb_froz_mode = trim(val)   ! numeric mode: the value
+                     read(val, *, IOSTAT=iosk) inwf%hyb_froz_val
+                     if (iosk /= 0) call croak('HYBR froz_emax: bad value '// &
+                          trim(val))
+                  end if
+               case ('pool_factor')
+                  read(val, *, IOSTAT=iosk) inwf%hyb_pool_factor
+                  if (iosk /= 0) call croak('HYBR pool_factor: bad value')
+               case ('margin')
+                  read(val, *, IOSTAT=iosk) inwf%hyb_margin
+                  if (iosk /= 0) call croak('HYBR margin: bad value')
+               case ('gauge')
+                  inwf%hyb_gauge = trim(val)
+               case ('seedk')
+                  inwf%hyb_seedk = trim(val)
+               case ('seedloss')
+                  inwf%hyb_seedloss = trim(val)
+               case ('capacity')
+                  select case (trim(val))
+                  case ('strict'); inwf%hyb_cap_strict = .true.
+                  case ('warn');   inwf%hyb_cap_strict = .false.
+                  case default
+                     call croak('HYBR capacity: strict|warn, got '//trim(val))
+                  end select
+               case ('edges')
+                  select case (trim(val))
+                  case ('auto', 'warn', 'strict', 'snap')
+                     inwf%hyb_edges = trim(val)
+                  case default
+                     call croak('HYBR edges: auto|warn|strict|snap, got '// &
+                          trim(val))
+                  end select
+               case ('sweeps')
+                  read(val, *, IOSTAT=iosk) inwf%hyb_sweeps
+                  if (iosk /= 0 .or. inwf%hyb_sweeps < 1) &
+                       call croak('HYBR sweeps: want a positive integer, got '&
+                       &//trim(val))
+               case ('relax')
+                  read(val, *, IOSTAT=iosk) inwf%hyb_mix
+                  if (iosk /= 0) call croak('HYBR relax: bad value '//trim(val))
+                  if (inwf%hyb_mix == 0.0_DPk) call croak('HYBR relax: 0 is &
+                       &not a relaxation factor (1 = off, <0 = scheduled)')
+               case ('adaptive')
+                  inwf%hyb_adaptive = yesno(val, 'adaptive')
+               case ('colored')
+                  inwf%hyb_colored = yesno(val, 'colored')
+               case ('relax_late')
+                  if (trim(val) == 'auto') then
+                     inwf%hyb_relax_late = -1.0_DPk   ! probe at the first kick
+                  else
+                     read(val, *, IOSTAT=iosk) inwf%hyb_relax_late
+                     if (iosk /= 0) call croak('HYBR relax_late: want a real &
+                          &or "auto", got '//trim(val))
+                  end if
+               case ('taper_late')
+                  read(val, *, IOSTAT=iosk) inwf%hyb_taper_late
+                  if (iosk /= 0 .or. inwf%hyb_taper_late <= 0.0_DPk &
+                       .or. inwf%hyb_taper_late >= 1.0_DPk) call croak('HYBR &
+                       &taper_late: want 0 < taper_late < 1, got '//trim(val))
+               case ('taper')
+                  read(val, *, IOSTAT=iosk) inwf%hyb_taper
+                  if (iosk /= 0 .or. inwf%hyb_taper <= 0.0_DPk &
+                       .or. inwf%hyb_taper >= 1.0_DPk) call croak('HYBR &
+                       &taper: want 0 < taper < 1, got '//trim(val))
+               case ('solver')
+                  select case (trim(val))
+                  case ('gs', 'cg', 'auto'); inwf%hyb_solver = trim(val)
+                  case default
+                     call croak('HYBR solver: gs|cg|auto, got '//trim(val))
+                  end select
+               case ('text_io')
+                  inwf%hyb_text_io = yesno(val, 'text_io')
+               case ('kick')
+                  inwf%hyb_kick = yesno(val, 'kick')
+               case ('tol')
+                  read(val, *, IOSTAT=iosk) inwf%hyb_tol
+                  if (iosk /= 0 .or. inwf%hyb_tol <= 0.0_DPk) &
+                       call croak('HYBR tol: want a positive real, got '&
+                       &//trim(val))
+               case ('rel_tol')
+                  read(val, *, IOSTAT=iosk) inwf%hyb_rel_tol
+                  if (iosk /= 0 .or. inwf%hyb_rel_tol <= 0.0_DPk) &
+                       call croak('HYBR rel_tol: want a positive real, got '&
+                       &//trim(val))
+               case ('anderson')
+                  read(val, *, IOSTAT=iosk) inwf%hyb_anderson
+                  if (iosk /= 0 .or. inwf%hyb_anderson < 0) &
+                       call croak('HYBR anderson: want a history depth >= 0 &
+                       &(0 = off), got '//trim(val))
+               case default
+                  call croak('HYBR: unknown keyword "'//trim(key)//'"')
+               end select
+             end block
+          end do kwloop
+       end if
+    else
+       read(lun,*) inwf%LJmax, inwf%Nproj
 
-    if (inwf%Amn) then
-       allocate(inwf%projections(inwf%Nproj))
-       do w = 1, inwf%Nproj
-          read(lun, *) NY
-          inwf%projections(w)%NY = NY
-          allocate( inwf%projections(w)%iat  (NY), &
-               &    inwf%projections(w)%l    (NY), &
-               &    inwf%projections(w)%m    (NY), &
-               &    inwf%projections(w)%coeff(NY))
+       if (inwf%Amn) then
+          allocate(inwf%projections(inwf%Nproj))
+          do w = 1, inwf%Nproj
+             read(lun, *) NY
+             inwf%projections(w)%NY = NY
+             allocate( inwf%projections(w)%iat  (NY), &
+                  &    inwf%projections(w)%l    (NY), &
+                  &    inwf%projections(w)%m    (NY), &
+                  &    inwf%projections(w)%coeff(NY), &
+                  &    inwf%projections(w)%rf   (NY))
+             inwf%projections(w)%rf = 1
 
-          ylm: do y = 1,NY
-             read(lun, *) inwf%projections(w)%iat(y), &
-                  &       inwf%projections(w)%l  (y), &
-                  &       inwf%projections(w)%m  (y), &
-                  re, im
-             inwf%projections(w)%coeff(y) = cmplx(re, im, DPk)
-          end do ylm
-       end do
+             ylm: do y = 1,NY
+                ! optional 6th field: radial-function index (1 = u_l,
+                ! 3..5 = orthogonalized LO-shell projector, as in projmap)
+                read(lun, '(A)') confline
+                read(confline, *, IOSTAT=confios)      &
+                     &       inwf%projections(w)%iat(y), &
+                     &       inwf%projections(w)%l  (y), &
+                     &       inwf%projections(w)%m  (y), &
+                     re, im, inwf%projections(w)%rf(y)
+                if (confios /= 0) then
+                   inwf%projections(w)%rf(y) = 1
+                   read(confline, *) inwf%projections(w)%iat(y), &
+                        &            inwf%projections(w)%l  (y), &
+                        &            inwf%projections(w)%m  (y), &
+                        re, im
+                end if
+                inwf%projections(w)%coeff(y) = cmplx(re, im, DPk)
+             end do ylm
+          end do
+       end if
     end if
   end subroutine inwf_read_unit
 
@@ -1571,6 +1985,32 @@ contains
 
     call inwf_read_fname(arg%s, inwf)
   end subroutine inwf_read_argstr
+
+  !> Parse a HYBR keyword-tail logical.  Accepts the spellings a WIEN2k user
+  !> is likely to reach for; anything else is a hard error rather than a
+  !> silent false, on the same typo-protection principle as the unknown-key
+  !> croak (a mistyped `adaptive = ture' must not quietly halve throughput).
+  logical function yesno(val, key)
+    use clio, only: croak
+
+    character(len=*), intent(in) :: val, key
+    character(len=16) :: v
+    integer :: i
+    v = adjustl(val)
+    do i = 1, len_trim(v)                       ! fold to lower case
+       if (v(i:i) >= 'A' .and. v(i:i) <= 'Z') &
+            v(i:i) = achar(iachar(v(i:i)) + 32)
+    end do
+    select case (trim(v))
+    case ('t', 'true', '.true.', 'yes', 'y', 'on', '1')
+       yesno = .true.
+    case ('f', 'false', '.false.', 'no', 'n', 'off', '0')
+       yesno = .false.
+    case default
+       call croak('HYBR '//trim(key)//': want true|false, got '//trim(val))
+       yesno = .false.                          ! unreachable; quiets -Wall
+    end select
+  end function yesno
 end module inwfmod
 
 
@@ -1832,7 +2272,7 @@ end module kpoints
 !--------------- Procedures nicked from Wien2k       ------------------------
 module Wien2k
   private
-  public :: errflg, errclr, gtfnam
+  public :: errflg, errclr, gtfnam, vector_kind_probe
 contains
   subroutine ERRFLG(FNAME,MSG)
     character(*)      FNAME, MSG
@@ -2059,6 +2499,74 @@ contains
 !        Errors
 910 stop 'GTFNAM - string ERRFN too short to hold filename.'
   end subroutine GTFNAM
+
+  !> Is this WIEN2k vector file COMPLEX or REAL?  2 = complex, 1 = real,
+  !> 0 = could not tell (the caller must NOT act on 0).
+  !>
+  !> Real vs complex is a COMPILE-TIME choice (-D_COMPLEX_ selecting w2w /
+  !> w2wc) made by the caller via `x w2w -c`.  No input file records it, and
+  !> WIEN2k's "case.in1c exists => complex" convention does not settle it
+  !> either (a real MgB2 case can carry BOTH in1 and in1c).  The two
+  !> mistakes are badly asymmetric:
+  !>
+  !>   w2wc on a REAL file   -> dies loudly ("I/O past end of record"): a
+  !>                            complex read wants 2N reals from a record of N.
+  !>   w2w on a COMPLEX file -> SILENT.  Reading N reals from a record holding
+  !>                            N complex numbers is a legal SHORT read, so the
+  !>                            run completes and writes a hand-off.  Measured
+  !>                            on GaAs: Omega_I = -127.61 vs the correct 21.83.
+  !>
+  !> The test is exact, not heuristic: a band-coefficient record holds N values
+  !> of the file's own kind, hence N reals in a real file and 2N in a complex
+  !> one.  Sequential unformatted allows reading FEWER items than a record
+  !> holds but errors on MORE, so a 2N-real read succeeds iff the file is
+  !> complex.  Probing uses a SEPARATE unit on the same path, so the main read
+  !> stream is untouched and no BACKSPACE (undefined after a failed read) is
+  !> needed.
+  function vector_kind_probe(fname, nneq) result(kindcode)
+    use const, only: DPk
+
+    character(len=*), intent(in) :: fname
+    integer,          intent(in) :: nneq
+    integer :: kindcode
+
+    integer :: u, i, n, ne, ios, num
+    real(DPk) :: xk, yk, zk, e1
+    character(len=10) :: bname
+    real(DPk), allocatable :: probe(:)
+    integer,   allocatable :: g(:,:)
+
+    kindcode = 0                       ! unknown until proven otherwise
+    open(newunit=u, file=fname, status='old', form='unformatted', &
+         action='read', iostat=ios)
+    if (ios /= 0) return
+
+    do i = 1, nneq                     ! two per-atom header records each
+       read(u, iostat=ios) ; if (ios /= 0) goto 90
+       read(u, iostat=ios) ; if (ios /= 0) goto 90
+    end do
+
+    read(u, iostat=ios) xk, yk, zk, bname, n, ne
+    if (ios /= 0 .or. n < 1) goto 90
+
+    allocate(g(3,n))
+    read(u, iostat=ios) (g(1,i), g(2,i), g(3,i), i = 1, n)
+    if (ios /= 0) goto 90
+
+    read(u, iostat=ios) num, e1        ! first (band index, eigenvalue)
+    if (ios /= 0) goto 90
+
+    allocate(probe(2*n))               ! the discriminating read
+    read(u, iostat=ios) (probe(i), i = 1, 2*n)
+    if (ios == 0) then
+       kindcode = 2                    ! record held 2N reals -> complex
+    else
+       kindcode = 1                    ! over-read -> only N reals -> real
+    end if
+
+90  continue
+    close(u, iostat=ios)
+  end function vector_kind_probe
 end module Wien2k
 
 

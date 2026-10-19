@@ -5,6 +5,220 @@
                     \\==========================//
 
 
+MODIFIED VERSION, hybrid pre-Wannierization release v3.0 (2026)
+****************************************************************
+
+This is a MODIFIED version of wien2wannier, released as version 3.0.
+It is based on upstream wien2wannier 2.0 as shipped with WIEN2k, and
+it was developed and tested with WIEN2k 24.1. William P. Comaskey
+modified and extended it in 2025-2026. This paragraph is the notice
+of modification required by section 5 of the GNU GPL.
+
+Changes from wien2wannier 2.0
+*****************************
+
+This is the summary.  NEWS lists every change with the files it
+concerns.  The case.inwf modes AMN, MMN and BOTH, the def-file units and
+the output files of 2.0 are kept.  The numbers w2w writes can differ from
+those of 2.0 on the same input, for the reasons given under "Bug fixes"
+and "Improvements".
+
+New programs and modes
+
+  * The `wien2wannier' driver (SRC/wien2wannier) runs the whole chain
+    from an existing full-mesh WIEN2k case to a hand-off for Wannier90
+    and checks its inputs first.  It never runs a DFT calculation.
+  * The program `w2w_hybrid' (SRC_w2w/Makefile.hybrid) reads the .amn,
+    .mmn, .eig and .nnkp files of w2w and writes a hand-off with
+    num_bands = num_wann, which stock Wannier90 localizes with no dis_*
+    keywords.
+  * case.inwf MODE = AUTO: w2w selects the projections itself from the
+    projectability of each atom and l channel.  Band indices 0 and -1 on
+    line 2 let it choose the band window as well.
+  * MODE = AAMN runs the AUTO selection and writes only the .amn.
+  * MODE = HYBR runs the whole hybrid pre-Wannierization inside w2w and
+    writes <case>-hyb.{amn,mmn,eig}.
+  * The hybrid pre-Wannierization (w2w_hybrid and HYBR) builds per-state
+    projectability masks, freezes all states below an energy ceiling
+    (froz_emax: default auto in w2w_hybrid and HYBR, 1.0 eV above E_F in
+    the driver), minimizes Omega_I under that constraint by Grassmann
+    conjugate gradients (default) or Gauss-Seidel sweeps, and builds an
+    SCDM-based starting gauge.
+  * The window route (`w2w_hybrid --window', `wien2wannier --method
+    window') writes the same selection as ordinary Wannier90
+    disentanglement windows.
+  * New output files: <out>.masks, .anatomy, .dis (outcome of the
+    disentanglement and subspace continuity), .anchors, projmap.dat,
+    projectability.dat and autoprojection.diag.
+  * Scripts in tools/ plot the masks (plot_certificate.py), the pool
+    anatomy (plot_anatomy.py) and Wannier bands against the WIEN2k band
+    path (band_compare.py).
+
+Improvements to w2w and w2wc
+
+  * MPI: built with -DMPI, w2w and w2wc divide the k-points over ranks
+    and rank 0 writes the files.  Without -DMPI they run serially.
+  * Faster overlaps and projections (cached A_lm, tabulated Gaunt
+    coefficients, zgemm, optional FFTW with -DHAVE_FFTW).  The same
+    quantities are computed with the sums in a different order.
+  * Spin-orbit in one run: a def file that lists unit 9 makes w2w read
+    both spinor components and write the combined .amn and .mmn, instead
+    of per-spin runs followed by w2waddsp.  The driver writes such a def
+    file; `x w2w -so' does not, and the 2.0 route still works.
+  * Each projection line of an AMN or BOTH deck can carry a sixth integer
+    that selects the radial function and reaches semicore shells such as
+    Ga 3d.
+  * W2W_TAILS=1 projects onto full-cell projectors, with each u_l
+    continued outside the muffin tin by an exponential tail.
+  * Every run tests whether bmin or bmax cuts through a degenerate
+    multiplet and reports it.  W2W_EDGES (auto, warn, strict, snap) sets
+    the response.  The default, auto, moves only edges chosen by the AUTO
+    sentinels and otherwise warns.
+  * The .amn carries 16 significant digits instead of 5.  Every .amn and
+    .mmn written is accompanied by a full-precision binary copy
+    (.amn.bin, .mmn.bin).
+  * planew stops with an explanation when a plane-wave index falls
+    outside its interstitial grid, and case.outputwf reports more
+    diagnostics.
+
+Bug fixes in w2w and w2wc
+
+  * planew dropped part of the interstitial overlap of a (k, k+b) pair
+    when k+b had more plane waves than k, and it skipped the last grid
+    point.  Both are corrected, which changes some .mmn blocks.
+  * With k-parallel vector files (case.def N) the interstitial grid of
+    planew came from the last file only.  It covers all files.
+  * A bmax larger than the band count in case.energy is clamped with a
+    warning.  The eigenvalue buffer of read_vec held at most 1000 bands,
+    and vector files with more bands wrote past its end.
+  * w2w stops with a message naming the right program when it is given
+    complex vector files or w2wc is given real ones.  2.0 finished with
+    wrong numbers on complex vectors.
+  * Radial functions: Nrf rises from 4 to 5, because an LAPW l with three
+    local orbitals needs index 5.  In APW mode a second-derivative local
+    orbital (HDLO) was evaluated as a copy of u_l.  It is built as the
+    second energy derivative, and the LO coefficients use the computed
+    <LO|LO> instead of 1.
+  * The first atom of each equivalence class has the identity as its
+    local frame.  2.0 used the first symmetry operation that maps the
+    atom to itself, so the (l, m) of projections on that atom could refer
+    to a rotated frame.  The .amn of such structures changes and the .mmn
+    does not.
+  * Messages that print an integer or real array no longer stop a
+    gfortran-compiled run with "Missing comma between descriptors".
+  * A full disk stops the run.  Output files are closed with a size
+    check, where 2.0 could leave a truncated file without notice.
+
+Changes to other programs
+
+  * wplot and wplotc build second-derivative local orbitals (HDLO) as the
+    second energy derivative of u_l and normalize LO coefficients with
+    the computed <LO|LO>.  2.0 plotted such functions wrongly inside the
+    muffin tins.  The Nrf fix above (an LAPW l with three local orbitals)
+    applies to wplot and wplotc as well.
+  * wplot, wplotc and the SRC_trig programs share util_w2w.F with w2w and
+    get the same message-format fix.
+  * w2waddsp writes the .amn with 16 significant digits, stops on
+    up/dn files that differ in dimensions, k-neighbor lists or G-shifts,
+    adds .amn entries by (m,n,k) index, copies the whole title line, and
+    reads and writes binary copies.  It holds both spin arrays in memory.
+  * wplot, wplotc and w2waddsp are built by the top-level `make' but are
+    not installed by `make install'.
+
+Build and install
+
+  * `make install' installs w2w, w2wc, w2w_hybrid, w2w_hybrid_acc (when
+    built) and the driver as `wien2wannier', and nothing else.  2.0
+    built everything and copied every executable file under SRC* to
+    $WIENROOT.  `make install-cli' installs the driver alone.
+  * The build steps below build only SRC_w2w.  The top-level `make' also
+    builds wplot, wplotc and w2waddsp.  w2waddsp links
+    SRC_w2w/lib/hybrid_files.o, so SRC_w2w has to be built before
+    SRC_trig.
+  * `make -f Makefile.hybrid' builds w2w_hybrid and `make -f
+    Makefile.hybrid acc' builds the OpenMP program w2w_hybrid_acc.
+  * w2w, w2wc, wplot and wplotc identify themselves as v3.0, and the
+    package targets WIEN2k 24.1 (WIEN-VERSION), where 2.0 targeted 16.1.
+
+Removals
+
+  * SRC/x_lapw (a copy of the WIEN2k 16.1 `x' script) and
+    compile_wien2wannier.sh.  The `x' script of WIEN2k is used.
+  * The make targets dist-tmp, wien-tar and wien-dist.
+  * No case.inwf mode, def-file unit or output file of 2.0 is removed.
+
+Documentation and tests
+
+  * User guides in doc/hybrid/ (00-public-wien2wannier-cli to
+    06-paper-models), docs/reference/mathematical-background.md,
+    REFERENCES.md (literature behind each source file), INDEX.md and
+    SRC_w2w/INDEX.md (file-by-file maps), CITATION.cff and .zenodo.json.
+  * test/test_wien2wannier_cli.py tests the driver with 55 cases.
+
+The symmetry-adapted features of the development branches are not part of
+this release.
+
+This modified version remains under the GNU GPL v3 (or later); see COPYING.
+
+Citing this version. Publications that use wien2wannier 3.0 should cite
+the original wien2wannier paper, as its authors request (see below),
+together with the paper that introduces the hybrid pre-Wannierization and
+the archived release:
+
+   J. Kuneš, R. Arita, P. Wissgott, A. Toschi, H. Ikeda and K. Held,
+   "Wien2wannier: From linearized augmented plane waves to maximally
+   localized Wannier functions", Comput. Phys. Commun. 181, 1888 (2010),
+   doi:10.1016/j.cpc.2010.08.005.
+
+   W. P. Comaskey and J. L. Mendoza-Cortes, "Fully Automated Wannier
+   Disentanglement via Projectability Selection in Gaussian and Augmented
+   Plane-Wave Frameworks" (2026), to be published.
+
+   W. P. Comaskey and J. L. Mendoza-Cortes, wien2wannier 3.0 (2026), Zenodo,
+   doi:10.5281/zenodo.23485188.
+
+The calculations of the paper, including the WIEN2k and wien2wannier cases
+of its LAPW models, are archived at doi:10.5281/zenodo.23485290.
+
+CITATION.cff carries the same information in machine-readable form.
+
+Building this release (developed and tested with WIEN2k 24.1, see
+WIEN-VERSION): copy make.sys.example to make.sys and edit it (macOS ARM:
+gfortran + OpenBLAS for w2w/w2wc, e.g. -L/opt/homebrew/opt/openblas/lib
+-lopenblas, without Accelerate; Makefile.hybrid links Accelerate,
+which its OpenMP build needs on macOS). Then
+
+   cd SRC_w2w && make all              # w2w (real) + w2wc (complex)
+   make -f Makefile.hybrid             # w2w_hybrid (serial)
+   make -f Makefile.hybrid acc         # w2w_hybrid_acc (OpenMP)
+   cd .. && make install target-dir="$WIENROOT"   # optional, see INSTALL
+
+Version 3.0 replaces the programs w2w and w2wc of a WIEN2k installation
+and adds w2w_hybrid and the driver; it replaces no script. WIEN2k's own
+`x' script writes the def file that w2w 3.0 reads, so this package
+contains no copy of it. `make install' copies the programs and the
+driver only; `make install-cli target-dir="$HOME/bin"' installs the driver
+alone. INSTALL has the details.
+
+Python 3.10 or newer is required for the standard-library-only launcher;
+NumPy and SciPy are not required. The normal invocation is:
+
+   wien2wannier --input /path/to/case --seed model --k-grid 8 8 8
+
+This consumes existing DFT vectors and never runs SCF or changes their mesh.
+Use `--check` or `--dry-run` to validate without writing or computing.
+
+Public command guide: doc/hybrid/00-public-wien2wannier-cli.md;
+method quickstart: doc/hybrid/01-overview-and-quickstart.md;
+end-to-end example: doc/hybrid/05-worked-example.md.
+
+Diagnostic figures (numpy + matplotlib): tools/plot_certificate.py draws
+the window non-representability certificate from a run's <out>.masks file,
+tools/plot_anatomy.py draws the auto-trust anatomy from <out>.anatomy.
+Both accept several runs at once, one panel per run. See INDEX.md for the
+map of the tree.
+
+
 Wien2Wannier is an  interface program between Wien2k  and Wannier90 to
 obtain maximally localized Wannier functions from Wien2k calculations.
 In any published  papers arising from the use  of Wien2Wannier, please
@@ -26,16 +240,16 @@ regards Wannier90 and  the MLWF procedure, there is a  mailing list at
 <http://www.wannier.org/forum.html>.
 
 Finally, bug reports, feature requests, etc.  can be submitted at
-<https://github.com/wien2wannier/wien2wannier/issues>.
+<https://github.com/wien2wannier/wien2wannier/issues>.  Problems specific to
+version 3.0 (the hybrid pre-Wannierization) should be reported at
+<https://github.com/wcomaskey/wien2wannier/issues>.
 
 
 Installation
 ************
 
-If this version of wien2wannier came with your Wien2k distribution, it
-will be configured and compiled automatically by `siteconfig'.  If you
-wish to  upgrade wien2wannier, see  the file INSTALL  for installation
-instructions.
+See the file INSTALL.  WIEN2k itself contains wien2wannier 2.0; version
+3.0 is built separately and replaces only the programs `w2w' and `w2wc'.
 
 To construct maximally localized Wannier functions, your will need the
 Wannier90 program,  available from <http://wannier.org>.  In  order to

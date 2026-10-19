@@ -8,7 +8,7 @@
 
 SHELL=/bin/bash
 
-version = $(lastword '$version: v2.0.0-7-g4c51be8$')
+version = v3.0
 
 VERSION = $(shell git describe 2>/dev/null || echo $(version))
 
@@ -17,7 +17,7 @@ REALCOMPLEX := SRC_w2w SRC_wplot
 
 SUBDIRS := $(SIMPLE) $(REALCOMPLEX)
 
-.PHONY: all clean distclean $(SUBDIRS) dist-tmp wien-tar wien-dist install
+.PHONY: all clean distclean $(SUBDIRS) install install-cli
 
 all: SRC_w2w SRC_wplot SRC_trig
 
@@ -48,52 +48,22 @@ distclean:
 
 ### ‘install’ target
 ###
-### This is a bare-bones install procedure for updating wien2wannier
-### in an existing Wien2k directory.  Use with caution.
+### Installs what version 3.0 adds to or changes in a WIEN2k
+### installation: the programs w2w and w2wc, the standalone
+### w2w_hybrid (and w2w_hybrid_acc when it was built), and the driver.
+### It installs no script: WIEN2k's own `x' script and helper scripts
+### stay as they are.
 target-dir ?= $(WIENROOT)
-install: exe = $(shell find SRC* -type f -perm /a+x)
-install: all
-	install -t$(target-dir) $(exe)
-	install -m644 -t$(target-dir)/SRC_templates SRC_templates/*
+cli = SRC/wien2wannier
+programs = SRC_w2w/w2w SRC_w2w/w2wc
+hybrid   = $(wildcard SRC_w2w/w2w_hybrid SRC_w2w/w2w_hybrid_acc)
 
+install-cli:
+	@test -n "$(target-dir)" || { echo "target-dir or WIENROOT is required" >&2; exit 2; }
+	install -d "$(target-dir)"
+	install -m755 "$(cli)" "$(target-dir)/wien2wannier"
 
-### Distribution targets
-
-## dist variables
-Morig    := $(addsuffix /Makefile.orig,SRC_w2w SRC_wplot SRC_trig)
-dist-dir := wien2wannier-$(VERSION)-wiendist
-tarname  := wien2wannier-$(VERSION)-expand-in-wienroot
-scripts  := $(notdir $(wildcard SRC/*))
-w2wlinks := ../doc/wien2wannier_userguide.pdf ../WIEN-VERSION		\
-	    ../compile_wien2wannier.sh ../COPYING ../README ../NEWS	\
-	    ../doc/CHEATSHEET
-
-## Make a tarball for extracting directly in Wien2k root folder
-dist-tmp: distclean doc/wien2wannier_userguide.pdf $(Morig)
-	mkdir $(dist-dir); \
-	cd $(dist-dir); \
-	ln -s -t. ../SRC* \
-		../compile_wien2wannier.sh ../INSTALL ../WIEN-VERSION; \
-	cp -t. SRC/*; \
-	ln -s -tSRC_w2w $(w2wlinks); \
-	tar --exclude-vcs -chf $(tarname).tar SRC* $(scripts);
-
-## Make tarball and clean up
-wien-tar: dist-tmp
-	mv $(dist-dir)/$(tarname).tar .
-
-	cd $(dist-dir); \
-	rm SRC* $(scripts)
-
-	for l in $(notdir $(w2wlinks)); do rm SRC_w2w/$$l; done
-	rm -rf $(dist-dir) $(Morig)
-
-## Make tarball and bundle with INSTALL, compile_wien2wannier.sh
-wien-dist: dist-tmp
-	cd $(dist-dir); \
-	rm SRC* $(scripts)
-
-	tar --exclude-vcs -chzf $(dist-dir).tar.gz $(dist-dir)
-
-	for l in $(notdir $(w2wlinks)); do rm SRC_w2w/$$l; done
-	rm -rf $(dist-dir) $(Morig)
+install: SRC_w2w install-cli
+	for f in $(programs) $(hybrid); do \
+		install -m755 "$$f" "$(target-dir)/$$(basename $$f)" || exit 1; \
+	done

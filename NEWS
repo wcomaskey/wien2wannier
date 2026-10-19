@@ -1,6 +1,696 @@
                           Wien2Wannier News
                           *****************
 
+Version 3.0 (2026-10) is a modified version of wien2wannier 2.0.  It adds
+automatic pre-Wannierization (the hybrid route), a workflow driver and
+MPI parallelization, and it corrects several defects of 2.0 in w2w,
+wplot and w2waddsp.  It accompanies the paper cited in README.  The
+symmetry-adapted features of the development branches are not part of
+it.
+
+This entry lists every change from 2.0, grouped by kind, with the files
+each one concerns.  The case.inwf modes AMN, MMN and BOTH, the def-file
+units and the output files of 2.0 are kept, and projection lines with
+five fields are read as before.  The numbers w2w writes can differ from
+those of 2.0 on the same input.  The causes are the planew corrections
+and the local frame of the representative atom (both under "Bug fixes in
+w2w and w2wc") and the 16-digit .amn (under "Improvements to w2w and
+w2wc").
+
+New programs and modes
+----------------------
+
+  - New program `wien2wannier', a Python 3.10+ driver.  It runs the whole
+    chain from an existing WIEN2k case, or from existing
+    AMN/MMN/EIG/NNKP/WIN files.  It writes case.inwf and case.def, makes
+    the .win and .nnkp (through write_win_backend and `wannier90.x -pp'),
+    runs w2w or w2wc, their MPI builds (looked up as w2w_mpi and w2w_mpic,
+    or w2wc_mpi) or w2w_hybrid, and publishes
+    <seed>-hyb.{amn,mmn,eig,win} with the disentanglement record at the
+    top of the .win.  The main options are --input, --seed, --k-grid,
+    --method hybrid|window, --stage all|prepare|overlaps|hybrid|localize,
+    --num-wann, --froz-emax <eV>|auto|none (default 1.0 eV), --solver
+    (default cg), --spin, --threads, --mpi-ranks, --mpi-bind,
+    --hybrid-option KEY=VALUE, --bridge-arg and --wannier90 for the final
+    localization, and `wien2wannier --help' lists all of them.  --check
+    and --dry-run print the resolved plan without computing, and
+    --version prints the source revision and the backends found.  The
+    driver never starts a DFT calculation.  (SRC/wien2wannier)
+
+  - Input and resource checks of the driver, made before it writes
+    anything.  case.klist must be a full mesh (and match --k-grid when
+    given), the .nnkp k-points and neighbor records must match it, the
+    output directory must be separate from the input, and no stale
+    hand-off is accepted as a result (--force removes it).  The thread
+    times rank budget must fit the allocation (--allow-oversubscribe
+    lifts this), and the driver must not run inside an MPI launch.
+    (SRC/wien2wannier)
+
+  - New program `w2w_hybrid'.  It reads the <seed>.amn/.mmn/.eig/.nnkp
+    files that w2w writes and produces an isolated hand-off
+    <out>.amn/.mmn/.eig with num_bands = num_wann (default <out> =
+    <seed>-hybF), which stock Wannier90 localizes without any dis_*
+    keywords.  The steps are read, masks, disentangle, rotate, gauge and
+    write.  Options are named (--seed and --nw are required, --help
+    prints the full reference), and the shorthand `w2w_hybrid <case> <N>'
+    is accepted.  (SRC_w2w/w2w_hybrid.F, hybrid_prep.F, hybrid_core.F,
+    hybrid_grass.F, hybrid_io.F, hybrid_files.F)
+
+  - case.inwf MODE = AUTO.  w2w computes .amn and .mmn and selects the
+    projections itself.  Line 3 holds only LJmax, and line 4 is
+    `threshold max_proj write_proj [p2_weight [support_ratio]]'
+    (p2_weight defaults to T and support_ratio to 0.5).  No projection
+    list follows.  The MODE line of case.outputwf reads AUTO and the
+    projection list is headed `Auto-selected orbital projections'.
+    (SRC_w2w/util_w2w.F, main.F)
+
+  - AUTO projection selection.  AUTO ranks every (atom, l) channel by
+    its band-averaged muffin-tin projectability (|A_lm|^2 of u_l and
+    u-dot_l, plus the first local orbital weighted by <u|LO>^2).  With
+    p2_weight = T each state is weighted by 0.5*erfc((E-E_F-5 eV)/2 eV).
+    The support of a channel is its best per-state projectability.  With
+    support_ratio > 0, a channel whose support is below support_ratio
+    times the largest support is removed, and 0 turns this gate off.
+    support_ratio < 0 removes no channel.  It multiplies each channel
+    weight by its support (capped at 1) and splits the support values
+    with Otsu's method into mask channels, above the split, and the
+    rest.  max_proj > 0 caps the number of projections and ignores
+    threshold.  With max_proj = 0, threshold > 0 is a floor on
+    weight/max_weight, threshold <= 0 makes every non-negligible channel
+    eligible and places the mask channels first, and the selection stops
+    before the number of projections exceeds the window size Nb.
+    Semicore shells held in a local-orbital radial are offered as extra
+    [LO-shell] channels, which the support_ratio gate does not remove.
+    Each selected channel gives one projection per equivalent atom and m,
+    a single complex Y_lm with coefficient 1.  (SRC_w2w/modules_rc.F,
+    main.F)
+
+  - Band-window sentinels in AUTO, AAMN and HYBR.  The band indices on
+    line 2 can be sentinels.  bmin = 0 starts the window above the
+    highest gap larger than 5 eV whose upper band begins below E_F - 1 eV,
+    which removes core and semicore complexes.  bmax = 0 takes every band
+    present at all k-points, and bmax = -1 takes the highest band whose
+    bottom lies at or below E_F + 40 eV.  The resolved values are printed
+    as `AUTO bmin = ...' and `AUTO bmax = ...'.  (SRC_w2w/util_w2w.F,
+    main.F)
+
+  - AUTO output files.  Every AUTO, AAMN and HYBR run writes projmap.dat
+    in the working directory.  It maps each .amn column to global atom,
+    l, m and radial index, and it holds a `# mask_cols' line when
+    threshold <= 0 and support_ratio < 0.  With write_proj = T the run
+    also writes projectability.dat (per-state projectability by band, k,
+    atom and l) and autoprojection.diag (channel ranking, per-band table,
+    and alternative projection sets with ready AUTO and BOTH case.inwf
+    templates) there.  (SRC_w2w/main.F, modules_rc.F)
+
+  - AUTO under spin-orbit.  When def unit 9 is present, AUTO selects
+    channels from the projectability summed over both spinor components.
+    The support of a channel is the largest per-state value of that sum,
+    taken over traces of band clusters within W2W_AUTO_DEGTOL (eV, default
+    2e-6, <= 0 turns the clustering off), so the result does not depend on
+    the gauge inside a Kramers pair.  The run stops if the two components
+    use different LO radials for an (atom, l).  (SRC_w2w/main.F,
+    modules_rc.F, projection_support.F)
+
+  - case.inwf MODE = AAMN.  It runs the AUTO selection and writes only
+    the .amn, with no overlap calculation, to re-select projections for
+    an .mmn computed earlier on the same band window.  AAMN does not read
+    or check that .mmn, so the band window of the .amn has to match it.
+    (SRC_w2w/util_w2w.F)
+
+  - case.inwf MODE = HYBR.  w2w runs AUTO and then, on rank 0 and without
+    intermediate files, builds per-state projectabilities from
+    Loewdin-orthonormalized full-cell projections, builds the frozen and
+    pool masks (all pool states are admitted), minimizes Omega_I under the
+    frozen constraint (Grassmann CG by default, Gauss-Seidel selectable),
+    rotates to the eigenbasis of the projected Hamiltonian, builds an
+    SCDM-based gauge (gauge auto8 by default) and writes an isolated
+    num_bands = num_wann hand-off for stock
+    Wannier90.  The files are <case>-hyb.amn, .mmn, .eig, .masks,
+    .anatomy, .dis and .anchors, where <case> is taken from the .nnkp file
+    name.  The text rows of case.amn and case.mmn are skipped unless
+    text_io = true, and the two files then hold only their header lines.
+    (SRC_w2w/util_w2w.F, main.F, hybrid_core.F)
+
+  - HYBR input.  Line 5 is `num_wann [mix [regime]]'.  num_wann = 0 means
+    automatic and requires a numeric froz_emax, mix defaults to -2.5, and
+    regime is auto, per-state or band-level.  An optional tail of
+    `key = value' lines ends at end of file or at a blank line.  Keys and
+    defaults: froz_emax auto (or none, or a value in eV above E_F),
+    pool_factor 1.5, margin 0 (which means max(4, 4% of the need), see
+    below), gauge auto8, seedk opt16, seedloss smooth, capacity strict,
+    edges auto, sweeps 20000, relax (the mix of line 5, default -2.5),
+    adaptive true, colored false, relax_late 1.99 (or auto), taper 0.5,
+    taper_late (default: the taper value; a typed value must lie in
+    0 < x < 1), solver cg (gs, auto), text_io false, kick true, tol 1e-9,
+    rel_tol 1e-10, anderson 0.  An unknown key, a line without `=', an
+    unreadable number or an unreadable true/false value stops the run.
+    (SRC_w2w/util_w2w.F, main.F)
+
+  - HYBR capacity, pool and solver checks.  With a numeric froz_emax,
+    HYBR counts, before any .amn or .mmn work, the worst-k number of
+    window states at or below froz_emax (the need).  It either sets
+    num_wann to the smallest whole-channel count at or above the need
+    plus margin (num_wann = 0) or stops when an explicit num_wann is
+    below the need (capacity = warn continues).  The remaining checks run
+    in the hybrid stage, after the overlaps.  HYBR stops when the frozen
+    set at the applied ceiling needs more than num_wann states at some k,
+    and when the pool had to be clamped below
+    max(num_wann+1, pool_factor*num_wann) bands (capacity = warn
+    continues in both cases).  It stops if the CG gradient fails a
+    finite-difference check or its Omega_I disagrees with an independent
+    evaluation, and it refuses a negative Omega_I.  With froz_emax = auto
+    it prints a lower froz_emax to rerun with when the pocket condition
+    below holds.  (SRC_w2w/main.F)
+
+  - Frozen ceiling (--froz-emax, HYBR keyword froz_emax).  Every Bloch
+    state below an energy ceiling above E_F is frozen.  With `auto' (the
+    default of w2w_hybrid and of the HYBR keyword) the ceiling starts at
+    E_F + 8 eV and is lowered in 1 eV steps until no k-point holds more
+    states below it than num_wann.  If no step down to 1 eV fits, the run
+    stops with ranked alternatives (the highest 0.05 eV ceiling that
+    fits, a larger num_wann, or none).  A value in eV or `none' is also
+    accepted.  The log gives the ceiling applied, the worst-k demand and
+    whether the set below the ceiling is contained at every k.
+    (SRC_w2w/hybrid_prep.F, w2w_hybrid.F)
+
+  - Projectability and masks.  In w2w_hybrid the per-state
+    projectability P is computed from |A_mn|^2 and divided by its 99th
+    percentile over occupied states (--rescale occ99, the default), or
+    from a Loewdin-orthonormalized version with --rescale lowdin.  A band
+    pool of at least max(nw+1, 1.5 nw) bands is chosen.  The auto-trust
+    rule derives P thresholds from the band-averaged P of the pool.  With
+    froz_emax = none they decide the frozen set.  With a ceiling, every
+    pool state below it is frozen.  By default every pool state is
+    admitted to the disentanglement, and --p-floor <x> admits a
+    non-frozen state only if P >= x.  Further controls are --rescale,
+    --regime, --np-mask, --pool-factor, --no-froz, --all-free, --efermi
+    and the variable W2W_PAMN, which takes P from a separate .amn.
+    (SRC_w2w/hybrid_prep.F, w2w_hybrid.F)
+
+  - Pocket skip (w2w_hybrid --pocket-skip on|off, on by default).  With
+    the automatic ceiling, if the weakest link of the hand-off (smallest
+    singular value below 0.5) touches a mixed-character band (mean P >=
+    0.5) that is frozen at fewer than 25% of the k-points, w2w_hybrid
+    lowers the ceiling 0.1 eV below that band and disentangles again.  It
+    keeps the new result only if its weakest link reaches 0.5, takes at
+    most 3 steps, never goes below 1 eV and does not change the pool.
+    HYBR only prints the ceiling to pass as froz_emax and does not rerun.
+    (SRC_w2w/hybrid_prep.F, w2w_hybrid.F, main.F)
+
+  - Disentanglement solvers (--solver cg|gs|auto, HYBR keyword solver).
+    The frozen-constrained Omega_I is minimized either by conjugate
+    gradients on the Grassmann manifold (cg, the default, parallel over k,
+    stopping when the projected gradient falls below max(1e-10,
+    1e-6 |grad0|)) or by a Gauss-Seidel sweep (gs).  auto picks cg when
+    the largest free block has at least 250 states.  Before CG runs, its
+    analytic gradient is checked against finite differences and the run
+    stops if they disagree.  The final Omega_I is cross-checked against an
+    independent evaluation, and the log names the exit reason (converged,
+    stalled line search, iteration cap).  The sweep has optional
+    over-relaxation (--relax), red-black colored OpenMP order
+    (--colored), adaptive checks (--adaptive), Anderson acceleration
+    (--anderson) and a transport start (--init-transport).  W2W_CGDUMP and
+    W2W_CGLOAD save and restart a CG run.  (SRC_w2w/hybrid_grass.F,
+    hybrid_core.F, w2w_hybrid.F)
+
+  - Sweep cap and graded verdict.  The solvers stop at 20000 sweeps or
+    gradient evaluations by default (--sweeps, HYBR keyword sweeps).  A
+    Gauss-Seidel run that reaches the cap is graded.  If Omega_I still
+    fell by more than 1e-5 relative over the last tenth of the run, the
+    log and the .dis file say POOR CONVERGENCE and suggest a larger cap or
+    the CG solver.  Otherwise they report a flat tail that is usable.
+    (SRC_w2w/hybrid_core.F, w2w_hybrid.F)
+
+  - Rotation and gauge (--gauge).  After the disentanglement the subspace
+    is rotated to the eigenbasis of the projected Hamiltonian, and an
+    initial gauge is built from the projections.  The default is per-k
+    SCDM (pivoted QR) in w2w_hybrid and the auto8 dispatch in HYBR.  Other
+    modes are parallel-transport propagation (ptg), smoothing sweeps
+    (sms<N>, pts<N>), block-SCDM, Loewdin variants and u0, which loads an
+    external unitary gauge from <out>.gauge0 and refuses a non-unitary or
+    mismatched file.  The chosen anchor columns are written to
+    <out>.anchors.  (SRC_w2w/hybrid_core.F, w2w_hybrid.F)
+
+  - Subspace continuity.  Every run reports the smallest singular value
+    of the hand-off overlap blocks W(k)^H M(k,b) W(k+b) and how many links
+    fall below 0.5.  Below 1e-2 it warns that the disentangled subspace
+    jumps between two named k-points and suggests the CG solver or
+    another ceiling.  This is a diagnostic and changes nothing that is
+    written.  (SRC_w2w/hybrid_io.F, w2w_hybrid.F, main.F)
+
+  - Hand-off acceptance.  Before any hand-off file is written, every
+    eigenvalue, gauge entry and overlap is checked to be finite, and the
+    largest singular value of every (k,b) overlap block must not exceed
+    1 + 1e-6.  If a check fails the run stops and nothing is written.
+    Overlaps are never clipped.  (SRC_w2w/hybrid_io.F)
+
+  - Hybrid output files.  Each run writes <out>.dis (<case>-hyb.dis in
+    HYBR) with two comment lines, the disentanglement outcome (converged,
+    stopped at the cap with its grade, or the CG exit reason) and the
+    subspace continuity.  The wien2wannier driver puts these lines at the
+    top of the hand-off .win and repeats warnings on stderr.  <out>.masks
+    has one row per (k, pool state) with the energy relative to E_F, P and
+    the frozen and admitted flags.  <out>.anatomy has one row per pool
+    band with mean and minimum P, band bottom and the class assigned by
+    the auto-trust rule (trusted, gray, junk), plus the derived
+    thresholds.  (SRC_w2w/hybrid_io.F, w2w_hybrid.F, main.F,
+    SRC/wien2wannier)
+
+  - Window route (w2w_hybrid --window, wien2wannier --method window).
+    w2w_hybrid also expresses its selection as ordinary Wannier90
+    disentanglement windows.  The frozen window is the energy range of the
+    frozen states (lowered if a k-point would hold more than num_wann
+    frozen states).  The outer ceiling is chosen among the pool top and
+    the frozen ceiling + 8, 5, 3 or 1.5 eV by the lowest Omega_I, ranked
+    with a Gauss-Seidel sweep capped at 2000 sweeps whatever --solver
+    says.  The files are <out>-win.{win,amn,mmn,eig}, with the .amn
+    holding the SCDM anchor columns over all bands.  (SRC_w2w/w2w_hybrid.F,
+    hybrid_io.F)
+
+  - Continuity of a finished Wannier90 window run (--continuity-chk).
+    `w2w_hybrid --continuity-chk <seed>' reads a Wannier90 3.x/4.x
+    checkpoint <seed>.chk and <seed>.mmn and reports the subspace
+    continuity of the subspace Wannier90 disentangled, with the same
+    thresholds as the hand-off.  The driver runs it after localization on
+    the window route, and it never fails the run.  (SRC_w2w/w2w_hybrid.F,
+    hybrid_files.F, SRC/wien2wannier)
+
+  - File readers of w2w_hybrid and w2waddsp.  The .amn and .mmn readers
+    write and reuse binary copies <file>.bin.  A copy is used only when it
+    is at least as new as the text file (or the text file is absent) and
+    its header (AMNB or MMNB, version 1) reads correctly, and the readers
+    never write one through a symbolic link.  In w2w_hybrid and HYBR the
+    b-vector of every (k,b) block is computed from the .nnkp and checked
+    against the k = 1 shells, and the run stops if a block lies outside
+    them.  (SRC_w2w/hybrid_files.F, w2w_hybrid.F, main.F)
+
+  - Different defaults in the three entry points.  --froz-emax of the
+    driver defaults to 1.0 eV, while w2w_hybrid and the HYBR keyword
+    default to auto.  The gauge is scdm in w2w_hybrid and auto8 in HYBR.
+    P comes from |A_mn|^2 (rescaled with occ99) in w2w_hybrid and from
+    Loewdin-orthonormalized full-cell projections in HYBR.  For the
+    Gauss-Seidel solver, w2w_hybrid uses no over-relaxation (--relax 1.0)
+    and no adaptive checks, while HYBR uses relax -2.5 and adaptive
+    true.  The pocket skip is applied only by w2w_hybrid, and only with
+    --froz-emax auto.  The driver uses HYBR for WIEN2k input with
+    --method hybrid and w2w_hybrid for bridge input and for --method
+    window, and it passes its own --froz-emax (default 1.0 eV) to both,
+    so a driver run applies the pocket skip only with --froz-emax auto on
+    bridge input or the window route.  (SRC/wien2wannier,
+    SRC_w2w/w2w_hybrid.F, util_w2w.F, main.F)
+
+  - Plotting and comparison scripts in tools/.  plot_certificate.py
+    reads one or more <out>.masks files (or lcao2wannier mask dumps) and
+    draws the window certificate, which shows the frozen ceiling each
+    k-point needs, the unfrozen states inside the global frozen span, and
+    the number of states any single global frozen window would
+    misassign, above a panel of P against energy.  plot_anatomy.py reads
+    <out>.anatomy files (or lcao2wannier report JSON) and draws the pool
+    bands sorted by mean projectability, colored by class, with the
+    derived band gate and per-state threshold.  band_compare.py compares
+    Wannier bands from <seed>_hr.dat (with the Wigner-Seitz correction
+    when _wsvec.dat exists) against the WIEN2k band path and reports the
+    band distances eta and eta_max and index-paired RMS errors per energy
+    window.  It stops if the E_F conventions or the k-paths of the two
+    sides disagree, and it writes a .txt record of inputs and metrics
+    beside each figure.  band_compare_gaas.json is an example spec for
+    the GaAs worked example.  (tools/plot_certificate.py,
+    tools/plot_anatomy.py, tools/band_compare.py, tools/band_common.py,
+    tools/band_compare_gaas.json)
+
+Improvements to w2w and w2wc
+----------------------------
+
+  - MPI parallelization.  Built with -DMPI, w2w and w2wc divide the
+    k-points into contiguous blocks over ranks in l2Mmn, planew, l2Amn
+    and the AUTO projectability, reduce overlaps and projections to
+    rank 0, and let only rank 0 open and write case.outputwf, .amn, .mmn
+    and .eig.  case.outputwf prints `MPI enabled: N ranks'.  Without
+    -DMPI the wrapper does nothing and the program runs serially.
+    (SRC_w2w/mpi_w2w.F, main.F, modules_rc.F, modules.f, Makefile)
+
+  - Faster overlaps and projections.  The quantities are the same, with
+    sums in a different order.  The A_lm of almgen are cached per atom
+    class for each k-point instead of being recomputed for each of the
+    1+nntot uses.  Gaunt coefficients are tabulated once, l2Mmn uses two
+    zgemm calls when Nb >= 24, Y_lm(k+G) is evaluated once per plane
+    wave, and radint vectorizes its products.  planew loops only over
+    occupied grid points, uses zgemm, and optionally an FFTW convolution
+    (-DHAVE_FFTW).  case.outputwf reports `Overlap method', `Alm cache
+    ... MB' and, in FFTW builds, `FFT grid'.  (SRC_w2w/modules.f,
+    modules_rc.F, main.F)
+
+  - Spin-orbit in one run.  If the def file lists unit 9 (the vector file
+    of the second spin component), one w2w run reads both spinor
+    components.  The .mmn holds the spinor sum of the overlaps, and the
+    .amn has 2*Nproj columns, the first Nproj projecting the first
+    component and the next Nproj the second.  This is an alternative to
+    per-spin runs with a doubled case.inwf followed by w2waddsp, which
+    still work.  The driver writes units 9, 19 and 22 for SOC cases.
+    `x w2w -so' of WIEN2k writes none of them.  Unit 19 supplies the vsp
+    of the second component for spin-polarized SOC, and otherwise the
+    first vsp is reused.  The combined text .amn is written whatever
+    text_io says.  Collinear spin-polarized runs without SOC are
+    unchanged and still take one run per spin.  (SRC_w2w/main.F,
+    SRC/wien2wannier)
+
+  - Def unit 22 (case.inso).  When the def file lists unit 22, w2w reads
+    h k l from line 4 of case.inso and stops if that file cannot be
+    opened or parsed.  2.0 opened such a file and did not read it.  No
+    calculation in this release uses the value.  (SRC_w2w/main.F,
+    modules.f)
+
+  - Radial-function field.  In AMN and BOTH decks each projection line
+    can carry a sixth integer that selects the radial function.  1,
+    the default, is the 2.0 projector (u_l plus the first LO weighted by
+    <u|LO>).  3 to 5 select a projector built from that local-orbital
+    radial and orthogonalized to u_l, which reaches semicore shells (for
+    example Ga 3d) that u_l does not.  (SRC_w2w/util_w2w.F, modules_rc.F)
+
+  - Full-cell projector tails (W2W_TAILS=1).  The written .amn uses
+    full-cell projectors.  Each u_l is continued outside R_MT by an
+    exponential matched to its logarithmic derivative (decay constant at
+    least 0.9 a.u.), the overlap of that tail with the interstitial plane
+    waves is added, the projector is renormalized, and case.outputwf
+    prints the tail norms per atom.  HYBR always computes both the
+    muffin-tin .amn (for the gauge and hand-off) and the full-cell
+    projections (for projectability) in one pass.  (SRC_w2w/modules_rc.F,
+    main.F)
+
+  - Band-window degeneracy check (all modes).  Every run tests per
+    k-point whether the cut below bmin or above bmax splits a degenerate
+    multiplet (gap < 1e-6 Ry) and prints the result with the nearest
+    closed edges.  The default `auto' moves only AUTO-sentinel edges, by
+    at most the largest multiplet size found, and otherwise only warns.
+    The environment variable W2W_EDGES (or the HYBR keyword edges)
+    selects warn, strict (stop) or snap (move any edge, typed ones
+    included).  HYBR applies the same test to its pool edges.  If an
+    AUTO-sentinel edge is moved, the window of an AAMN .amn can differ
+    from that of the .mmn it is meant to pair with.  (SRC_w2w/main.F,
+    util_w2w.F)
+
+  - .amn number format.  Values are written with 16 significant digits
+    (format 2es24.15) instead of 5 (2e18.5).  The column widths change and
+    the order of entries does not.  (SRC_w2w/modules_rc.F, main.F)
+
+  - Binary sidecars.  Every run that writes an .amn or .mmn also writes
+    case.amn.bin or case.mmn.bin, an unformatted stream file with a header
+    (AMNB or MMNB, version 1, dimensions) that holds the same numbers at
+    full precision.  (SRC_w2w/modules_rc.F, main.F)
+
+  - .mmn writer.  planew no longer writes the .mmn pair by pair.  main
+    writes it once all overlap contributions (both spinor components and
+    the MPI reduction) are complete, with the same record layout.
+    (SRC_w2w/main.F, modules_rc.F)
+
+  - planew grid check.  planew stops with an explanation in case.outputwf
+    if any plane-wave index, of the head or of a shifted neighbor, falls
+    outside its interstitial grid, instead of placing it at a wrong
+    position or writing outside the arrays.  (SRC_w2w/modules_rc.F)
+
+  - case.outputwf diagnostics.  The file gains per-atom `NLO COUNTS'
+    lines and the lines named above (MPI, band-window check, overlap
+    method, A_lm cache, planew mask completions).  Per-atom tables such as
+    rotij/transij are printed by rank 0 only.  (SRC_w2w/modules.f,
+    modules_rc.F)
+
+Bug fixes in w2w and w2wc
+-------------------------
+
+  - planew mask.  planew marked the plane waves of the neighbor k+b only
+    up to the plane-wave count of the head k, so when the neighbor had
+    more plane waves part of that block's interstitial overlap was
+    dropped (MgB2 8x8x8: pairs 3->2 and 7->8, up to 2e-4).  The mask is
+    completed for every pair, and each completion is listed in
+    case.outputwf as `planew: head k ... neighbour plane waves added to
+    the interstitial mask'.  (SRC_w2w/modules_rc.F)
+
+  - planew grid bound.  Step 2 of planew accepted grid indices 0 <= id <
+    max and so skipped the last grid point.  It accepts id <= max.
+    (SRC_w2w/modules_rc.F)
+
+  - k-parallel vector files.  read_vec reset the largest |G| components
+    on every call, so with k-parallel vector files (case.def N) the grid
+    of planew came from the last file only.  The values accumulate over
+    all files, and the real/complex check reads the first part file.
+    (SRC_w2w/modules_rc.F, main.F)
+
+  - Band count.  A bmax larger than the smallest band count over all
+    k-points in case.energy is clamped with a WARNING in every mode.  2.0
+    did not check, and for bands the vector file did not contain at a
+    k-point it used uninitialized coefficients and stale eigenvalues.
+    read_vec also stops if a vector file holds fewer bands at a k-point
+    than bmax.  (SRC_w2w/main.F, modules_rc.F)
+
+  - read_vec eigenvalue buffer.  read_vec stored eigenvalues in a fixed
+    array E(1000) indexed by band number.  It allocates the array to the
+    largest band count met so far, so vector files with more than 1000
+    bands no longer write past its end.  (SRC_w2w/modules_rc.F)
+
+  - Real/complex vector file.  At start-up w2w and w2wc read the first
+    band-coefficient record of the vector file (of the first part for
+    k-parallel files).  It holds 2N reals only in a complex file, which
+    tells real from complex.  They stop with a message naming the right
+    program on a mismatch.  The w2w of 2.0 finished silently with wrong
+    numbers on a complex case.  (SRC_w2w/main.F, util_w2w.F)
+
+  - Radial functions per l.  Nrf rises from 4 to 5.  In LAPW mode the
+    radial index runs u, u-dot and then one per local orbital, so an l
+    with three local orbitals (Nloat = 3) needs index 5, which exceeded
+    the arrays of 2.0.  (SRC_w2w/mod_w2w.f, modules.f)
+
+  - Second-derivative local orbitals (HDLO).  In APW mode, a local
+    orbital beyond the first whose energy matches the u_l energy to
+    within 4 mRy is built as the second energy derivative of u_l
+    (five-point finite difference), and case.outputwf prints `LOCAL
+    ORBITAL(SECDER)'.  2.0 evaluated such an orbital as u_l at the same
+    energy, a copy of u_l.  The LO coefficients in abc use the computed
+    <LO|LO> instead of 1, with overlaps kept per (l, LO).
+    (SRC_w2w/modules.f)
+
+  - Local frame of the representative atom.  struct_read gives the first
+    atom of each equivalence class the identity as rotij/transij.  2.0
+    took the first symmetry operation that maps the atom to itself, which
+    depends on the order of operations in case.struct (for MgB2 a z-flip
+    plus an in-plane rotation), so the (l, m) of case.inwf projections on
+    that atom referred to a rotated frame.  The .amn of such structures
+    changes.  The .mmn does not, because only l2Amn uses rotij and
+    transij.  (SRC_w2w/util_w2w.F, modules_rc.F)
+
+  - Message formatting.  The run-time formats built by ints2str and
+    reals2str lacked commas, so gfortran stopped with `Missing comma
+    between descriptors' whenever a message printed an integer or real
+    array, for example in struct_read on a Pnma Rh3Si4 struct file.
+    wplot, wplotc and the SRC_trig programs link the same file and get
+    the same fix.  (SRC_w2w/util_w2w.F)
+
+  - Full disk.  The .amn, .mmn, .eig, their sidecars and the hand-off
+    files are closed with a size check, and the run stops if fewer bytes
+    reached the disk than were written.  gfortran reports no error when a
+    buffered write hits a full disk, so 2.0 could leave a truncated file
+    without notice.  (SRC_w2w/util_w2w.F, main.F, modules_rc.F,
+    hybrid_io.F)
+
+Changes to other programs
+-------------------------
+
+  - Bug fix, wplot and wplotc: second-derivative local orbitals (HDLO).
+    For an l treated as APW+lo, wplot recognizes a second or later LO
+    whose energy lies within 2*DELE = 4 mRy of the linearization energy
+    E_l, and builds its radial function as the second energy derivative
+    of u_l with a five-point finite-difference stencil.  2.0 had no such
+    branch and built this LO as u_l at the LO energy, a copy of u_l, so
+    plotted Wannier functions inside the muffin tins were wrong for
+    WIEN2k cases that use HDLOs.  (SRC_wplot/modules.f)
+
+  - Bug fix, wplot and wplotc: LO normalization.  The LO coefficients
+    use the computed self-overlap <LO|LO> in place of a fixed 1, in both
+    the LAPW formula and the APW+lo formula for jlo > 1.  For ordinary,
+    normalized LOs the result is unchanged up to rounding.
+    (SRC_wplot/modules.f)
+
+  - Bug fix, wplot and wplotc: radial functions per l.  wplot takes Nrf
+    from the module param of SRC_w2w/mod_w2w.f, so the rise from 4 to 5
+    described under "Bug fixes in w2w and w2wc" also lets wplot handle an
+    LAPW l with three local orbitals.  (SRC_w2w/mod_w2w.f,
+    SRC_wplot/modules.f)
+
+  - Improvement, w2waddsp: .amn precision.  The combined case.amn of a
+    SOC run keeps 16 significant digits, as the .amn of w2w does.  The
+    format changes from 2E18.5 to 2es24.15.  (SRC_trig/w2waddsp.f)
+
+  - Bug fix, w2waddsp: consistency checks.  w2waddsp stops with an error
+    when the up and dn files differ in dimensions, and for .mmn files
+    also when the k-neighbor lists or G-shifts differ.  2.0 read the
+    headers of the second file, discarded them and summed line by line.
+    .amn entries are added by their (m,n,k) indices, where 2.0 added them
+    by line position and wrote the indices of file 1.
+    (SRC_trig/w2waddsp.f, SRC_w2w/hybrid_files.F)
+
+  - Bug fix, w2waddsp: title line and error tag.  The title line of the
+    combined file is copied whole, where 2.0 cut it at the first blank.
+    The error file names W2WADDSP, where 2.0 wrote `Error in FINDBANDS'.
+    (SRC_trig/w2waddsp.f)
+
+  - New feature, w2waddsp: binary sidecars.  w2waddsp reads
+    case.{mmn,amn}{up,dn}.bin when a sidecar is not older than its text
+    file.  After a text parse it writes those .bin files next to the
+    inputs, and it writes case.mmn.bin and case.amn.bin for the outputs.
+    If the environment variable W2W_MMNTEXT is set to 0, case.mmn is
+    written as a header only and the data exist only in case.mmn.bin,
+    which Wannier90 cannot read.  To do this, w2waddsp reads both spin
+    files completely before writing and holds two nb*nb*nntot*nk complex
+    arrays for the .mmn, where 2.0 streamed line by line with constant
+    memory.  (SRC_trig/w2waddsp.f, SRC_w2w/hybrid_files.F)
+
+  - Delivery of these programs.  The changed wplot, wplotc and w2waddsp
+    are built by the top-level `make' but are not installed by `make
+    install' (see Build and install).  After a documented install,
+    `x wplot' and `x w2waddsp', and `wannier90_lapw -so', which calls
+    `x w2waddsp', still run the programs of WIEN2k, so the wplot and
+    w2waddsp changes above are not used.  (Makefile, INSTALL, README)
+
+Build and install
+-----------------
+
+  - `make install' installs w2w, w2wc, w2w_hybrid and w2w_hybrid_acc (the
+    last two only if already built with Makefile.hybrid) and the driver
+    as `wien2wannier' in target-dir (default $WIENROOT), and nothing else.
+    It depends only on SRC_w2w, and it uses `install -m755' per file
+    instead of GNU-only `install -t'.  In 2.0 it built everything and
+    copied every executable file under SRC* into WIENROOT (all
+    SRC/*_lapw scripts including x_lapw, w2w and w2wc, wplot and wplotc,
+    and the SRC_trig programs) and SRC_templates/* into
+    WIENROOT/SRC_templates.  (Makefile)
+
+  - `make install-cli target-dir=DIR' installs only the driver as
+    DIR/wien2wannier.  It stops with `target-dir or WIENROOT is required'
+    (exit 2) when neither is set.  (Makefile)
+
+  - Not installed: wplot, wplotc and w2waddsp, although this version
+    changes them, and every script of SRC.  The build steps in INSTALL
+    and README (cd SRC_w2w; make all; make -f Makefile.hybrid) do not
+    build wplot and w2waddsp at all.  `make test' installs into
+    WIENROOT_TEST, so the `x wplot' step of test/PoC runs the wplot that
+    is already there, not the one built here.  (Makefile, INSTALL,
+    README, test/PoC/PoC.sh)
+
+  - SRC_trig/Makefile links w2waddsp with SRC_w2w/lib/hybrid_files.o.  The
+    top-level `make' works because it builds SRC_w2w first.  A
+    stand-alone `make -C SRC_trig' on a clean tree fails, because
+    w2waddsp.o is compiled before hybrid_files_m.mod exists.
+    (SRC_trig/Makefile)
+
+  - SRC_w2w/Makefile.  main.f became main.F, so the main program is
+    preprocessed (#ifdef MPI, _COMPLEX_).  w2w and w2wc also compile
+    mpi_w2w.F, projection_support.F and the hybrid_*.F modules that main
+    uses for HYBR, and w2w_hybrid.F is left to Makefile.hybrid.  Explicit
+    module dependencies allow clean and parallel builds, object
+    directories are made with mkdir -p, and the header says to set FOPT,
+    not FFLAGS, on the command line.  The main program grew from 258
+    lines (main.f) to 1998 lines (main.F) and keeps the stock modes.
+    (SRC_w2w/Makefile, main.F)
+
+  - SRC_w2w/Makefile.hybrid.  `make -f Makefile.hybrid' builds the serial
+    w2w_hybrid, and `make -f Makefile.hybrid acc' builds an OpenMP
+    version, w2w_hybrid_acc, without touching the serial one.  BLAS and
+    LAPACK default to Apple Accelerate and can be replaced through LIBS
+    (OpenBLAS built with USE_LOCKING=1, or MKL, on Linux).  Module files
+    go to their own directory so stale ones cannot be picked up.
+    (SRC_w2w/Makefile.hybrid)
+
+  - Version and target.  w2w, w2wc, wplot and wplotc identify themselves
+    as v3.0.  The first line of case.outputwf reads `W2W v3.0' where 2.0
+    printed `W2W v2.0.0-7-g4c51be8', and wplot prints `wplot v3.0'.
+    WIEN-VERSION changes from `WIEN2k_16.1 (Release 1/12/2016)' to
+    `WIEN2k_24.1 (Release 1/8/2024)'.  (SRC_w2w/mod_w2w.f, main.F,
+    SRC_wplot/modules_rc.F, WIEN-VERSION)
+
+  - Repository files.  .gitattributes marks SRC/wien2wannier as
+    export-subst, so an archive made with `git archive' gets the commit
+    hash in ARCHIVE_REVISION, which the driver reports.  .gitignore lists
+    the new build products (w2w_hybrid, w2w_hybrid_acc, MPI builds) and
+    the run products (.amn, .mmn, .bin, .win, .def and others).
+    (.gitattributes, .gitignore, SRC/wien2wannier)
+
+Removals
+--------
+
+  - SRC/x_lapw.  The package no longer ships its copy of the `x' script,
+    which was the WIEN2k 16.1 version.  In 2.0, `make install' could
+    overwrite a newer WIEN2k's x_lapw with it.  The `x' script of
+    WIEN2k is used.  Its w2w, wplot, w2waddsp and wannier90 sections are
+    the same as in the removed copy, and `x w2w' of WIEN2k 24.1 writes
+    the same def file.  (SRC/x_lapw)
+
+  - compile_wien2wannier.sh.  The helper run from $WIENROOT is removed.
+    It warned about the x_lapw overwrite, re-ran siteconfig, rebuilt
+    SRC_w2w, SRC_wplot and SRC_trig, and copied w2w, w2wc, wplot and
+    wplotc into $WIENROOT.  The manual build steps in INSTALL replace it,
+    and those steps build only SRC_w2w.  (compile_wien2wannier.sh,
+    INSTALL)
+
+  - The make targets dist-tmp, wien-tar and wien-dist.  They built a
+    tarball (wien2wannier-$VERSION-expand-in-wienroot.tar) to unpack over
+    $WIENROOT, which included x_lapw, the SRC scripts and
+    compile_wien2wannier.sh.  (Makefile)
+
+  - Inside w2w: main.f (replaced by main.F), the .mmn writes of planew
+    (formats 235 and 236), the per-call reset of the largest |G|
+    components in read_vec, and a duplicated progress line printed after
+    the k loop of l2Mmn.  (SRC_w2w/main.f, modules_rc.F)
+
+  - No case.inwf mode, def-file unit or output file of 2.0 is removed.
+
+Documentation and tests
+-----------------------
+
+  - User guides in doc/hybrid/: 00 the wien2wannier command, 01 overview
+    and quick start for HYBR, 02 calculation types (regular,
+    spin-polarized, SOC), 03 the .inwf keywords, standalone options and
+    environment variables, 04 methods and tuning, 05 a GaAs worked
+    example, and 06 the commands behind each LAPW model of the paper.
+    (doc/hybrid/00-public-wien2wannier-cli.md through
+    06-paper-models.md)
+
+  - docs/reference/mathematical-background.md explains local orbitals in
+    LAPW and APW+lo, the overlaps <u|LO>, <u-dot|LO> and <LO|LO>, and the
+    LO coefficients computed from them.  In SRC_w2w/modules.f these
+    overlaps are kept per (l, LO) in the arrays pi12lo, pe12lo and
+    pilolo.  (docs/reference/mathematical-background.md)
+
+  - REFERENCES.md lists the literature behind each new source file with
+    DOIs, under the keys the source comments cite.  INDEX.md and
+    SRC_w2w/INDEX.md list each program, tool, source file and document
+    with its purpose and status.  (REFERENCES.md, INDEX.md,
+    SRC_w2w/INDEX.md)
+
+  - CITATION.cff and .zenodo.json carry the citation metadata of version
+    3.0 (authors Comaskey and Mendoza-Cortes).  CITATION.cff gives the
+    Zenodo DOI of the release, 10.5281/zenodo.23485188, and asks users to
+    cite the accompanying paper and the archived release in addition to
+    Kunes et al. (2010).  (CITATION.cff, .zenodo.json)
+
+  - README and INSTALL are rewritten.  INSTALL says which programs 3.0
+    replaces (w2w, w2wc) and adds (w2w_hybrid, driver), gives SRC_w2w-only
+    build steps, an install with a backup of w2w and w2wc, a check with
+    `wien2wannier --check' and notes on Wannier90 versions.
+    (README, INSTALL)
+
+  - Timing records from the development of the performance features
+    (colored OpenMP sweep, binary sidecars, relaxation schedules,
+    Anderson acceleration, HYBR one-shot, MPI) are included as a CSV
+    ledger with a README and an HTML report.  The cases and commit hashes
+    they name belong to the development tree, not to this repository.
+    (SRC_w2w/bench/README.md, results.csv, report.html)
+
+  - test/test_wien2wannier_cli.py holds 55 unittest tests of the driver
+    against fake backends.  They cover option validation, mesh and .nnkp
+    checks, def-file and .inwf contents, MPI and thread settings, bridge
+    mode, the window route and hand-off publication.  They do not test
+    the Fortran numerics.  (test/test_wien2wannier_cli.py)
+
 Version 2.0 introduces backward-incompatible changes in the format of
 `case.inwplot':
 

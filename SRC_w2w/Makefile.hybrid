@@ -1,0 +1,97 @@
+# Makefile.hybrid -- standalone build for the native-Fortran hybrid
+# pre-Wannierization tool (w2w_hybrid), independent of the dual w2w/w2wc build.
+#
+#   make -f Makefile.hybrid                # w2w_hybrid, optimized serial
+#   make -f Makefile.hybrid acc            # w2w_hybrid_acc, OpenMP (threads over k)
+#   make -f Makefile.hybrid clean
+#
+# The hybrid modules are clean modern Fortran (allocatables, no COMMON / no
+# INTEGER W(1) idiom), so -fopenmp is safe for them (unlike legacy WIEN2k code).
+# Adjust FC / LIBS for your toolchain.
+
+# plain '=' (not '?=') so make's built-in FC=f77 default doesn't win;
+# override on the command line with e.g.  make -f Makefile.hybrid FC=ifort
+FC      = gfortran
+# WIEN2k-safe base flags (Apple M-series + gfortran 16); harmless elsewhere.
+#
+# This file differs from the WIEN2k build recipe (-fno-aggressive-loop-
+# optimizations, no -fopenmp, -mcpu=apple-m1) in two flags: OMP=1 adds
+# -fopenmp (the hybrid modules are modern Fortran, see the header), and
+# -mcpu=apple-m1 is absent.  Adding -mcpu here would change floating point
+# and with it the last digits of every .amn/.mmn/.eig.  To build with the
+# full set:
+#   make -f Makefile.hybrid FFLAGS="-O2 -ffree-form -cpp \
+#        -ffree-line-length-none -fno-aggressive-loop-optimizations \
+#        -mcpu=apple-m1"
+FFLAGS  ?= -O2 -ffree-form -cpp -ffree-line-length-none \
+           -fno-aggressive-loop-optimizations
+# BLAS/LAPACK.  Default: Apple Accelerate — REQUIRED for OMP=1 on macOS:
+# homebrew OpenBLAS is built without USE_LOCKING, and its buffer allocator
+# both corrupts results and serializes threads when LAPACK (zheevd) is
+# called concurrently from an OpenMP region (observed: NaN + 13x slowdown
+# on Rh3Si4; Fe's small matrices dodge the buffered kernels).  Accelerate
+# zheevd is also ~1.9x faster serially on Apple Silicon.  On Linux use
+# OpenBLAS built with USE_LOCKING=1, or MKL:
+#   make -f Makefile.hybrid acc LIBS="-L... -lopenblas"
+LIBS    ?= -framework Accelerate
+
+ifdef OMP
+  FFLAGS += -fopenmp
+endif
+
+# hybrid_grass.F uses `const` (R8 kind) from the main w2w build; its .mod
+# lands in lib/ (O_DIR), which -Ilib below finds.
+#
+# This build keeps its own .mod files out of the source directory.  gfortran
+# searches the current directory before -I, so a module file left there would
+# shadow the fresh copy and can defeat a compile-time check without an error.
+# -J sets the output directory for .mod files; the explicit -I$(MODDIR) must
+# come before -Ilib, because lib/ carries hybrid_*_m.mod from the main w2w
+# build and gfortran searches the -I directories first: without it a stale
+# lib/ module shadows the one this build just wrote (symptom: a compile error
+# about a keyword argument that plainly exists in the source).
+MODDIR  := .hybmod
+FFLAGS += -J$(MODDIR) -I$(MODDIR) -Ilib
+
+OBJS = hybrid_core.o hybrid_grass.o hybrid_prep.o hybrid_io.o hybrid_files.o w2w_hybrid.o
+
+# EXE is the name of the program; the `acc' target sets it.
+EXE ?= w2w_hybrid
+
+$(EXE): $(OBJS)
+	$(FC) $(FFLAGS) -o $@ $(OBJS) $(LIBS)
+
+$(MODDIR):
+	mkdir -p $(MODDIR)
+
+# module dependencies
+hybrid_core.o:  hybrid_core.F hybrid_io.o
+hybrid_grass.o: hybrid_grass.F hybrid_core.o
+hybrid_prep.o:  hybrid_prep.F
+hybrid_io.o:    hybrid_io.F
+hybrid_files.o: hybrid_files.F
+w2w_hybrid.o:   w2w_hybrid.F hybrid_core.o hybrid_grass.o hybrid_prep.o hybrid_io.o hybrid_files.o
+
+%.o: %.F | $(MODDIR)
+	$(FC) $(FFLAGS) -c $< -o $@
+
+# OpenMP build under its own name, w2w_hybrid_acc.  The two builds share
+# object names, so the objects are removed before and after: a serial
+# w2w_hybrid that already exists is left as it is, and the next serial build
+# compiles afresh instead of linking OpenMP objects.
+acc:
+	$(MAKE) -f Makefile.hybrid clean-objects
+	$(MAKE) -f Makefile.hybrid OMP=1 EXE=w2w_hybrid_acc w2w_hybrid_acc
+	$(MAKE) -f Makefile.hybrid clean-objects
+
+clean-objects:
+	rm -f $(OBJS)
+	# *.mod is still purged from cwd: this build used to put them there, and
+	# a leftover from before the MODDIR fix would go on shadowing lib/.
+	rm -f *.mod
+	rm -rf $(MODDIR)
+
+clean: clean-objects
+	rm -f w2w_hybrid w2w_hybrid_acc
+
+.PHONY: clean clean-objects acc

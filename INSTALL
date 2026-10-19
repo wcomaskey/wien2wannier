@@ -2,70 +2,83 @@
                 Wien2Wannier Installation Instructions
                 **************************************
 
-1. wien2wannier
-===============
-
-Your Wien2k installation already includes wien2wannier.  To use that
-version, you do not need to take any extra steps.  These instructions
-are concerned with upgrading to a newer wien2wannier version.
-
-C a v e a t: This version of wien2wannier is meant to be used with the
-Wien2k version given in the file `WIEN-VERSION'.  Because wien2wannier
-is integrated into Wien2k's `x' script, this script will be replaced
-when you unpack `wien2wannier.tar'.  This can break things if you are
-using a different Wien2k version.
-
-Two distinct ways of upgrading are supported via `make'.  For most
-users, option 1 is preferred.
+This is wien2wannier 3.0, a modified version of wien2wannier 2.0.  It
+was developed and tested with the WIEN2k version named in the file
+`WIEN-VERSION' (WIEN2k 24.1).
 
 
-Option 1: complete upgrade
---------------------------
+What WIEN2k already contains
+============================
 
-This option will update all of the files in the wien2wannier
-distribution.  In particular, `x_lapw' will be overwritten!
+WIEN2k ships wien2wannier 2.0: the programs `w2w', `w2wc', `wplot',
+`wplotc' and `w2waddsp', the scripts `init_w2w', `write_inwf',
+`write_win', `prepare_w2wdir', `wannier90_lapw' and others, and an `x'
+script that knows `x w2w'.
 
-In the wien2wannier directory, run
-
-  $ make wien-tar
-
-This creates a file with a name like
-`wien2wannier-$VERSION-expand-in-wienroot.tar', whose middle part
-identifies the precise version of wien2wannier.
-
-Next, expand this file in your Wien2k directory:
-
-  $ tar -xvf *-expand-in-wienroot.tar --directory $WIENROOT
-
-Finally, you need to insert the settings from the files `COMPILER' and
-`OPTIONS' and recompile the wien2wannier executables.  There is a
-convenience script to do this, which must be run from $WIENROOT:
-
-  $ cd $WIENROOT
-  $ SRC_w2w/compile_wien2wannier.sh
+Version 3.0 replaces two of these programs, `w2w' and `w2wc', and adds
+two things WIEN2k does not have: the standalone program `w2w_hybrid'
+and the driver `wien2wannier'.  It replaces no script of WIEN2k.  The
+`x' script of WIEN2k 24.1 writes the def file that `w2w' 3.0 reads, so
+this package carries no copy of `x_lapw'.  The other scripts
+under `SRC' are those of wien2wannier 2.0; they are kept for reference
+and are not installed.
 
 
-Option 2: quick deploy
-----------------------
+1. Build
+========
 
-This option only copies the essential files (executables and
-templates).  It is intended mainly for developers as a way to quickly
-deploy and test a new version.
+  $ cp make.sys.example make.sys       # edit: compiler, BLAS/LAPACK
+  $ cd SRC_w2w
+  $ make all                           # w2w (real) and w2wc (complex)
+  $ make -f Makefile.hybrid            # w2w_hybrid (serial)
+  $ make -f Makefile.hybrid acc        # w2w_hybrid_acc (OpenMP), optional
+  $ cd ..
 
-  $ make install
+`Makefile.hybrid' links Apple Accelerate by default; on other systems
+pass your library, for example
 
-will install to $WIENROOT, you can set a different target like this
+  $ make -f Makefile.hybrid LIBS="-lopenblas"
 
-  $ make install target-dir=/over/the/rainbow
+README has the notes for macOS.
 
 
-2. Wannier90
+2. Install
+==========
+
+The programs can stay where they were built.  The driver finds them
+there (it looks beside itself, in `../SRC_w2w', in $WIENROOT and on
+PATH), or is told with `--backend-dir'.  To have `x w2w' of WIEN2k run
+version 3.0, put the two programs into WIEN2k, keeping the originals:
+
+  $ cp $WIENROOT/w2w  $WIENROOT/w2w.orig
+  $ cp $WIENROOT/w2wc $WIENROOT/w2wc.orig
+  $ make install target-dir=$WIENROOT
+
+`make install' copies `w2w', `w2wc', `w2w_hybrid' (and `w2w_hybrid_acc'
+when it was built) and the driver `wien2wannier', and nothing else.
+`make install-cli target-dir=DIR' installs only the driver.
+
+The driver needs Python 3.10 or newer and no other package.
+
+
+3. Check
+========
+
+  $ wien2wannier --version             # 3.0, and the programs it found
+  $ wien2wannier --check --input /path/to/case --seed test --k-grid 8 8 8
+
+`--check' validates an existing WIEN2k calculation and writes nothing.
+`doc/hybrid/00-public-wien2wannier-cli.md' describes the driver and
+`doc/hybrid/05-worked-example.md' a complete run.
+
+
+4. Wannier90
 ============
 
-Wannier90 should also be compiled with the same settings as before,
-because wien2wannier needs to read the binary chk file.  You can find
-these settings in `$WIENROOT/{COMPILER,OPTIONS}'.  Wannier90 can be
-downloaded from <http://wannier.org>, and we refer to its
-documentation for installation instructions. To use it together with
-wien2wannier, you need to have the executable `wannier90.x' in your
-$PATH.
+Version 3.0 hands Wannier90 an isolated problem and needs no change to
+it.  The results of the accompanying paper were obtained with the
+Wannier90 development build ff955d1, which release 4.0.2 reproduces
+bitwise.  With version 3.0 installed, `write_win' of WIEN2k prepares
+`case.win' for Wannier90 and `wannier90_lapw' calls `wannier90.x', as
+they do with version 2.0.
+

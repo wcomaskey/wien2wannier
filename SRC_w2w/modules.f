@@ -45,7 +45,23 @@ module w2w
 
   integer, parameter :: unit_amn=7,  unit_mmn  =8, unit_nnkp=11, unit_eig=12
   integer, parameter :: unit_ene=50, unit_fermi=51
-  ! Optimize IBLOCK for your hardware (32-255)
+  integer, parameter :: unit_inso=22
+
+  !> SOC magnetization direction from case.inso line 4.  h,k,l are PRIMITIVE
+  !> LATTICE coordinates -- the convention of lapwso itself, whose angle.f
+  !> contracts them with the primitive direct vectors (so for bcc Fe "0 0 1"
+  !> is the <111> body diagonal, NOT the cube axis).  Set by main.F when the
+  !> def file names an inso.
+  double precision :: soc_hkl(3) = (/ 0.d0, 0.d0, 1.d0 /)
+  logical          :: soc_hkl_set = .false.
+  ! BLAS blocking factor for almgen/l2Amn plane-wave loops.
+  ! Controls the size of stack work arrays: h_alyl is (Lmax2+1)^2 x iBlock
+  ! complex*16 entries.  For best performance, keep iBlock small enough
+  ! that h_alyl + h_blyl + h_yl fit in L1 cache:
+  !   32KB L1 -> iBlock ~ 48-64     (e.g. Apple M-series, AMD Zen)
+  !   48KB L1 -> iBlock ~ 96        (e.g. Intel Golden Cove)
+  !  256KB L2 -> iBlock ~ 128-192   (falls back to L2, still fast)
+  ! Default 128 is a good general choice.  Change here to tune.
   integer, parameter :: iBlock=128
 
   integer :: NMAT=0
@@ -70,6 +86,123 @@ contains
     YR=0
   end subroutine init_assleg
 end module assleg
+
+
+module gaunt_cache
+  !! Precomputed Gaunt coefficients for performance optimization.
+  !! Gaunt coefficients only depend on (L1,L2,LJ,M1,M2,MJ) and are
+  !! constant throughout the calculation. Precomputing them avoids
+  !! redundant recomputation in the innermost loops of l2Mmn.
+  !!
+  !! Storage: For LMAX=5, we need coefficients for L1,L2,LJ in [0,5]
+  !! and M values in [-L,L]. Using linearized indexing:
+  !!   index(L,M) = L*(L+1) + M + 1  (1-based, size = (LMAX+1)^2)
+  !!
+  !! Reference: Abramowitz & Stegun, "Handbook of Mathematical Functions"
+
+  use param, only: Lmax2
+  use const, only: R8
+
+  implicit none
+  private; save
+
+  ! Cache dimensions: indices run from 1 to (Lmax2+1)^2
+  integer, parameter :: GMAX = (Lmax2+1)**2
+
+  ! Gaunt coefficient cache: gaunt_tab(idx1, idx2, idxj)
+  ! where idx = L*(L+1) + M + 1
+  real(R8), allocatable, public :: gaunt_tab(:,:,:)
+  logical, public :: gaunt_initialized = .false.
+
+  public :: init_gaunt_cache, cleanup_gaunt_cache, get_gaunt
+
+contains
+
+  subroutine init_gaunt_cache()
+    !! Initialize Gaunt coefficient cache by precomputing all needed values
+    use assleg, only: YR, N
+
+    implicit none
+
+    integer  :: L1, L2, LJ, M1, M2, MJ, idx1, idx2, idxj, I
+    real(R8) :: S
+    real(R8), parameter :: W(6) = (/ &
+         0.24914704581340D+0, 0.23349253653836D+0, &
+         0.20316742672307D+0, 0.16007832854335D+0, &
+         0.10693932599532D+0, 0.04717533638651D+0 /)
+
+    if (gaunt_initialized) return
+
+    ! Allocate cache
+    if (.not. allocated(gaunt_tab)) then
+       allocate(gaunt_tab(GMAX, GMAX, GMAX))
+    endif
+    gaunt_tab = 0.0_R8
+
+    ! Precompute all Gaunt coefficients
+    ! gaunt(L2,LJ,L1,M2,MJ,M1) = integral of Y*(L2,M2) * Y(LJ,MJ) * Y(L1,M1)
+    do L1 = 0, Lmax2
+       do M1 = -L1, L1
+          idx1 = L1*(L1+1) + M1 + 1
+
+          do L2 = 0, Lmax2
+             do M2 = -L2, L2
+                idx2 = L2*(L2+1) + M2 + 1
+
+                do LJ = 0, Lmax2
+                   do MJ = -LJ, LJ
+                      idxj = LJ*(LJ+1) + MJ + 1
+
+                      ! Selection rule for integral of Y*(L2,M2)*Y(LJ,MJ)*Y(L1,M1):
+                      ! the phi integral gives delta(-M2+MJ+M1), i.e. M2 = M1 + MJ
+                      ! (this is the convention every l2Mmn call site uses).  The
+                      ! original fill condition had MJ's sign flipped, which left
+                      ! every MJ /= 0 entry zero and silently reduced the e^{ibr}
+                      ! expansion to its m-diagonal (z-axis) part -- exact for
+                      ! b || z, wrong for every other b direction.
+                      ! Also: triangle inequality and L1+L2+LJ even (the half-
+                      ! range quadrature is only valid for even parity).
+                      if (M2 /= M1 + MJ) cycle
+                      if (LJ < abs(L1-L2) .or. LJ > L1+L2) cycle
+                      if (mod(L1+L2+LJ, 2) /= 0) cycle
+
+                      ! Compute Gaunt coefficient using Gaussian quadrature
+                      S = 0.0_R8
+                      do I = 1, N
+                         S = S + W(I) * YR(I, idx2) * YR(I, idxj) * YR(I, idx1)
+                      end do
+
+                      gaunt_tab(idx2, idxj, idx1) = S
+                   end do
+                end do
+             end do
+          end do
+       end do
+    end do
+
+    gaunt_initialized = .true.
+  end subroutine init_gaunt_cache
+
+  subroutine cleanup_gaunt_cache()
+    implicit none
+    if (allocated(gaunt_tab)) deallocate(gaunt_tab)
+    gaunt_initialized = .false.
+  end subroutine cleanup_gaunt_cache
+
+  real(R8) pure function get_gaunt(L2, LJ, L1, M2, MJ, M1)
+    !! Fast lookup of precomputed Gaunt coefficient
+    implicit none
+    integer, intent(in) :: L1, L2, LJ, M1, M2, MJ
+    integer :: idx1, idx2, idxj
+
+    idx1 = L1*(L1+1) + M1 + 1
+    idx2 = L2*(L2+1) + M2 + 1
+    idxj = LJ*(LJ+1) + MJ + 1
+
+    get_gaunt = gaunt_tab(idx2, idxj, idx1)
+  end function get_gaunt
+
+end module gaunt_cache
 
 
 module bessel
@@ -164,13 +297,16 @@ end module pairs
 
 
 module lolog
-  use param, only: Lmax2, lomax
+  use param, only: Lmax2, lomax, Nrf
 
   implicit none
   private; save
 
   integer, public :: Nlo, Nlov, Nlon, n_rad(0:lmax2), ilo(0:lomax)
   logical, public :: loor(0:lomax), lapw(0:lmax2)
+  ! Flag: is_hdlo(l,irf) = .true. if radial function irf for angular
+  ! momentum l is a second-derivative local orbital (HDLO/CONT 2)
+  logical, public :: is_hdlo(0:lmax2, Nrf) = .false.
 end module lolog
 
 
@@ -195,6 +331,39 @@ module loabc
 
   ! abc calculates the cofficients a,b,c of the lo
   real(R8), public :: alo(0:LOmax, Nloat, Nrf)
+
+  ! Overlap integrals for multiple LOs (indexed by l, jlo)
+  ! pi12lo(l,jlo) = <u | LO_jlo> overlap between LAPW u and LO
+  ! pe12lo(l,jlo) = <u_dot | LO_jlo> overlap between LAPW u-dot and LO
+  ! pilolo(l,jlo1,jlo2) = <LO_jlo1 | LO_jlo2> LO self/cross overlap
+  real(R8), allocatable, public :: pi12lo(:,:)   ! (0:lomax, nloat)
+  real(R8), allocatable, public :: pe12lo(:,:)   ! (0:lomax, nloat)
+  real(R8), allocatable, public :: pilolo(:,:,:) ! (0:lomax, nloat, nloat)
+
+  public :: init_loabc, cleanup_loabc
+
+contains
+  subroutine init_loabc()
+    !! Initialize allocatable overlap arrays for multiple LO handling
+    implicit none
+
+    if (.not. allocated(pi12lo)) allocate(pi12lo(0:lomax, nloat))
+    if (.not. allocated(pe12lo)) allocate(pe12lo(0:lomax, nloat))
+    if (.not. allocated(pilolo)) allocate(pilolo(0:lomax, nloat, nloat))
+
+    pi12lo = 0.0_R8
+    pe12lo = 0.0_R8
+    pilolo = 0.0_R8
+  end subroutine init_loabc
+
+  subroutine cleanup_loabc()
+    !! Deallocate overlap arrays
+    implicit none
+
+    if (allocated(pi12lo)) deallocate(pi12lo)
+    if (allocated(pe12lo)) deallocate(pe12lo)
+    if (allocated(pilolo)) deallocate(pilolo)
+  end subroutine cleanup_loabc
 end module loabc
 
 
@@ -212,16 +381,17 @@ end module radfu
 
 !---------------------------  Procedure modules  ---------------------------
 module     abc_m; contains
-subroutine abc(l, rmt, pei, pi12lo, pe12lo, jlo, lapw)
+subroutine abc(l, rmt, pei, pi12lo_val, pe12lo_val, pilolo_val, jlo, lapw)
   use param,  only: unit_out, Nrf
   use loabc,  only: alo
   use atspdt, only: P, DP
   use const,  only: R8
+  use mpi_w2w, only: is_root
 
   implicit none
 
   integer,  intent(in) :: l, jlo
-  real(R8), intent(in) :: rmt, pei, pi12lo, pe12lo
+  real(R8), intent(in) :: rmt, pei, pi12lo_val, pe12lo_val, pilolo_val
   logical,  intent(in) :: lapw
 
   integer  :: irf
@@ -239,15 +409,15 @@ subroutine abc(l, rmt, pei, pi12lo, pe12lo, jlo, lapw)
      xac= xac * rmt**2
      xbc=p(l,irf)*dp(l,1)-dp(l,irf)*p(l,1)
      xbc= -xbc * rmt**2
-     clo=xac*(xac+2.0D0*pi12lo)+xbc* &
-          (xbc*pei+2.0D0*pe12lo)+1.0D0
+     clo=xac*(xac+2.0D0*pi12lo_val)+xbc* &
+          (xbc*pei+2.0D0*pe12lo_val)+pilolo_val
      clo=1.0D0/sqrt(clo)
-     write(unit_out,*)clo
+     if (is_root) write(unit_out,*)clo
      if (clo.gt.2.0D2) clo=2.0d2
      alo(l,jlo,1)=clo*xac
      alo(l,jlo,2)=clo*xbc
      alo(l,jlo,irf)=clo
-     write(unit_out, fmt_alo) l, alo(l,jlo,1), alo(l,jlo,2), alo(l,jlo,irf)
+     if (is_root) write(unit_out, fmt_alo) l, alo(l,jlo,1), alo(l,jlo,2), alo(l,jlo,irf)
   else
      if (jlo.eq.1) then
         alonorm=sqrt(1.d0+(P(l,1)/P(l,2))**2 * PEI)
@@ -255,11 +425,11 @@ subroutine abc(l, rmt, pei, pi12lo, pe12lo, jlo, lapw)
         alo(l,jlo,2)=-P(l,1)/P(l,2)/alonorm
      else
         xbc=-P(l,1)/P(l,1+jlo)
-        xac=sqrt(1+xbc**2+2*xbc*PI12LO)
+        xac=sqrt(1.d0+pilolo_val*xbc**2+2.d0*xbc*pi12lo_val)
         alo(l,jlo,1)=1.d0/xac
         alo(l,jlo,1+jlo)=xbc/xac
      end if
-     write (unit_out, fmt_alo) l, alo(l, jlo, :)
+     if (is_root) write (unit_out, fmt_alo) l, alo(l, jlo, :)
   end if
   return
 end subroutine abc
@@ -269,6 +439,7 @@ end module     abc_m
 module     rint13_m; contains
 subroutine rint13(stru, jatom, A, B, X, Y, S)
   !     PERFORM RADIAL INTEGRALS REQUIRED BY BHDK13
+  !     Modified Simpson's rule on logarithmic radial grid
   !                            D.D.KOELLING
 
   use param,     only: Nrad
@@ -282,28 +453,36 @@ subroutine rint13(stru, jatom, A, B, X, Y, S)
   real(R8),       intent(in)  :: A(Nrad), B(Nrad), X(Nrad), Y(Nrad)
   real(R8),       intent(out) :: S
 
-  integer  :: j, j1
+  integer  :: j, j1, Npt
   real(R8) :: d, cin, r,r1, z2,z4, p1,p2
 
   cin = merge(1/clight**2, 1e-22_R8, stru%rel)
 
   D=exp(stru%DX(JATOM))
+  Npt=stru%Npt(JATOM)
 
-  J=3-mod(stru%Npt(JATOM),2)
+  J=3-mod(Npt,2)
   J1=J-1
   R=stru%R0(JATOM)*(D**(J-1))
   R1=R/D
   Z4=0
   Z2=0
-10 Z4=Z4+R*(A(J)*X(J)+CIN*B(J)*Y(J))
-  R=R*D
-  J=J+1
-  if(J >= stru%Npt(JATOM)) goto 20
-  Z2=Z2+R*(A(J)*X(J)+CIN*B(J)*Y(J))
-  R=R*D
-  J=J+1
-  goto 10
-20 P1=stru%R0(JATOM)*(A(1)*X(1)+CIN*B(1)*Y(1))
+
+  ! Simpson's rule: alternate weight-4 and weight-2 points
+  ! J steps by 2 each iteration; each iteration accumulates
+  ! one weight-4 point (at J) and one weight-2 point (at J+1)
+  do while (J < Npt)
+     Z4=Z4+R*(A(J)*X(J)+CIN*B(J)*Y(J))
+     R=R*D
+     J=J+1
+     if (J >= Npt) exit
+     Z2=Z2+R*(A(J)*X(J)+CIN*B(J)*Y(J))
+     R=R*D
+     J=J+1
+  end do
+
+  ! Endpoint contributions and composite Simpson's formula
+  P1=stru%R0(JATOM)*(A(1)*X(1)+CIN*B(1)*Y(1))
   P2=R1*(A(J1)*X(J1)+CIN*B(J1)*Y(J1))
   S=2*Z2+4*Z4+R*(A(J)*X(J)+CIN*B(J)*Y(J))+P2
   S=(stru%DX(JATOM)*S+P1)/3.0D0
@@ -318,11 +497,16 @@ subroutine atpar(stru, jatom, itape, jtape)
 
   use param,      only: unit_out, Nrad, Nloat, lomax, Lmax2
   use structmod,  only: struct_t
-  use lolog,      only: nlo,nlov,nlon,loor,ilo,lapw,n_rad
+  use lolog,      only: nlo,nlov,nlon,loor,ilo,lapw,n_rad,is_hdlo
   use atspdt,     only: P, DP
   use const,      only: R8, clight
   use uhelp,      only: A, B
   use radfu,      only: RF1, RF2
+  use loabc,      only: init_loabc, alo, &
+       &                pi12lo_arr => pi12lo, &
+       &                pe12lo_arr => pe12lo, &
+       &                pilolo_arr => pilolo
+  use mpi_w2w,    only: is_root
 
   !! procedure includes
   use diracout_m
@@ -338,10 +522,11 @@ subroutine atpar(stru, jatom, itape, jtape)
 
   real(R8) :: VR(Nrad), AE(Nrad), BE(Nrad)
   logical  :: rlo(1:nloat, 0:lomax)
+  logical  :: is_secder
   real(r8) :: emist(0:lomax,nloat),E(0:LMAX2),elo(0:LOMAX,nloat),pei(0:lmax2)
   integer  :: imax,irf, jlo, kappa, i,k,l, node,nodes,nodel, m
   real(R8) :: dele,delei, fl, ei,e1, uvb,duvb,uv,duv,uve,duve, ovlp, trx
-  real(R8) :: try, r_m, pi12lo, pe12lo, cross
+  real(R8) :: try, r_m, cross, deles
 
   !.....READ TOTAL SPHERICAL POTENTIAL V(0,0) OF TAPEjtape=VSP
   !     NORM OF V(0,0)=V00(R)*R/SQRT(4.D0*PI)
@@ -354,7 +539,7 @@ subroutine atpar(stru, jatom, itape, jtape)
 
   VR(1:stru%Npt(jatom)) = VR(1:stru%Npt(jatom)) / 2
 
-  write(unit_out,*)'ATPAR'
+  if (is_root) write(unit_out,*)'ATPAR'
   nlo=0
   nlov=0
   nlon=0
@@ -408,9 +593,15 @@ subroutine atpar(stru, jatom, itape, jtape)
      end do
   end if
 
+  ! DIAGNOSTIC: Print nlo counts AFTER nlon computation
+  if (is_root) then
+  write(unit_out,'(A,3I5)') '  NLO COUNTS: nlo, nlov, nlon =', nlo, nlov, nlon
+  write(unit_out,'(A,I5)') '  NPW = N - (nlo+nlon+nlov) where nlo+nlon+nlov =', nlo+nlon+nlov
+
   write(unit_out, "(/10X,'ATOMIC PARAMETERS FOR ',A10/)") stru%aname(JATOM)
   write(unit_out, "(10X,' ENERGY PARAMETERS ARE',7F7.2)") E
   write(unit_out, "(/11X,1HL,5X,4HU(R),10X, 5HU'(R),9X,5HDU/DE,8X,6HDU'/DE,6X,7HNORM-U')")
+  end if
 
   lloop: do l=0,LMAX2
      DELE=2.0D-3
@@ -474,11 +665,13 @@ subroutine atpar(stru, jatom, itape, jtape)
      P(l,2)=UVE+TRY*P(l,1)
      DP(l,2)=DUVE+TRY*DP(l,1)
      call rint13(stru, jatom, AE, BE, AE, BE, PEI(l))
-     write(unit_out, "(10X,I2,5E14.6,5X,3I2)") &
+     if (is_root) write(unit_out, "(10X,I2,5E14.6,5X,3I2)") &
           L,P(l,1),DP(l,1),P(l,2),DP(l,2)
   end do lloop
 
 ! nun fur lo
+  call init_loabc()
+  is_hdlo = .false.
   loloop: do l=0,lomax
      irf=2
      iloloop: do jlo=1,ilo(l)
@@ -488,6 +681,14 @@ subroutine atpar(stru, jatom, itape, jtape)
            DELEI=0.25D0/DELE
            FL=L
            EI=elo(l,jlo)/2.d0
+
+           ! Detect HDLO (second-derivative LO): if the LO energy
+           ! parameter matches the primary u function energy within
+           ! tolerance AND it's APW mode AND jlo>1, then it's a
+           ! second-derivative local orbital (CONT 2 in case.in1c).
+           is_secder = (.not.lapw(l)) .and. (jlo > 1) .and. &
+                (abs(elo(l,jlo) - e(l)) < 2.0d0*DELE)
+           is_hdlo(l, irf) = is_secder
 
            ! Calculate function at EI
            if(rlo(jlo,l)) then
@@ -501,31 +702,128 @@ subroutine atpar(stru, jatom, itape, jtape)
                       2.d0*vr(m)/r_m)/(2.d0*clight))
                  b(m)=b(m)*clight
               enddo
-           else
+
+              call RINT13(stru, jatom, A, B, A, B, OVLP)
+              TRX=1.0d0/sqrt(OVLP)
+              P(l,irf)=TRX*UV
+              DP(l,irf)=TRX*DUV
+              IMAX=stru%Npt(JATOM)
+              do M=1,IMAX
+                 rf1(M,l,irf)=TRX*A(M)
+                 rf2(M,l,irf)=TRX*B(M)
+              end do
+           else if(is_secder) then
+              ! HDLO: compute second energy derivative using
+              ! 5-point finite difference stencil:
+              !   d²u/dE² ≈ [-u(E-2h) + 16u(E-h) - 30u(E)
+              !              + 16u(E+h) - u(E+2h)] / (12h²)
+              DELES = DELE * 2.0d0
+
+              ! f(EI): center point with coefficient -30
               call outwin(stru, jatom, Vr, ei, fl, uv, duv, nodes)
+              call RINT13(stru, jatom, A, B, A, B, OVLP)
+              TRX=1.0d0/sqrt(OVLP)
+              UV  = -30.0d0*TRX*UV
+              DUV = -30.0d0*TRX*DUV
+              IMAX=stru%Npt(JATOM)
+              do M=1,IMAX
+                 AE(M) = -30.0d0*TRX*A(M)
+                 BE(M) = -30.0d0*TRX*B(M)
+              end do
+
+              ! f(EI - 2h): coefficient -1
+              E1 = EI - 2.0d0*DELES
+              call outwin(stru, jatom, Vr, E1, fl, UVB, DUVB, NODEL)
+              call RINT13(stru, jatom, A, B, A, B, OVLP)
+              TRX=1.0d0/sqrt(OVLP)
+              UV  = UV  - TRX*UVB
+              DUV = DUV - TRX*DUVB
+              do M=1,IMAX
+                 AE(M) = AE(M) - TRX*A(M)
+                 BE(M) = BE(M) - TRX*B(M)
+              end do
+
+              ! f(EI - h): coefficient +16
+              E1 = EI - DELES
+              call outwin(stru, jatom, Vr, E1, fl, UVB, DUVB, NODEL)
+              call RINT13(stru, jatom, A, B, A, B, OVLP)
+              TRX=1.0d0/sqrt(OVLP)
+              UV  = UV  + 16.0d0*TRX*UVB
+              DUV = DUV + 16.0d0*TRX*DUVB
+              do M=1,IMAX
+                 AE(M) = AE(M) + 16.0d0*TRX*A(M)
+                 BE(M) = BE(M) + 16.0d0*TRX*B(M)
+              end do
+
+              ! f(EI + 2h): coefficient -1
+              E1 = EI + 2.0d0*DELES
+              call outwin(stru, jatom, Vr, E1, fl, UVE, DUVE, NODE)
+              call RINT13(stru, jatom, A, B, A, B, OVLP)
+              TRX=1.0d0/sqrt(OVLP)
+              UV  = UV  - TRX*UVE
+              DUV = DUV - TRX*DUVE
+              do M=1,IMAX
+                 AE(M) = AE(M) - TRX*A(M)
+                 BE(M) = BE(M) - TRX*B(M)
+              end do
+
+              ! f(EI + h): coefficient +16, complete the stencil
+              E1 = EI + DELES
+              call outwin(stru, jatom, Vr, E1, fl, UVE, DUVE, NODE)
+              call RINT13(stru, jatom, A, B, A, B, OVLP)
+              TRX=1.0d0/sqrt(OVLP)
+              ! Complete: divide by 12*4*h² = 48*h²
+              P(l,irf) = (UV + 16.0d0*TRX*UVE) &
+                   / (12.0d0*4.0d0*DELES*DELES)
+              DP(l,irf) = (DUV + 16.0d0*TRX*DUVE) &
+                   / (12.0d0*4.0d0*DELES*DELES)
+              do M=1,IMAX
+                 rf1(M,l,irf) = (AE(M) + 16.0d0*TRX*A(M)) &
+                      / (12.0d0*4.0d0*DELES*DELES)
+                 rf2(M,l,irf) = (BE(M) + 16.0d0*TRX*B(M)) &
+                      / (12.0d0*4.0d0*DELES*DELES)
+              end do
+              if (is_root) write(unit_out,*) '            LOCAL ORBITAL(SECDER)'
+           else
+              ! Regular LO: compute function at energy EI
+              call outwin(stru, jatom, Vr, ei, fl, uv, duv, nodes)
+
+              call RINT13(stru, jatom, A, B, A, B, OVLP)
+              TRX=1.0d0/sqrt(OVLP)
+              P(l,irf)=TRX*UV
+              DP(l,irf)=TRX*DUV
+              IMAX=stru%Npt(JATOM)
+              do M=1,IMAX
+                 rf1(M,l,irf)=TRX*A(M)
+                 rf2(M,l,irf)=TRX*B(M)
+              end do
            endif
 
-           call RINT13(stru, jatom, A, B, A, B, OVLP)
-           TRX=1.0d0/sqrt(OVLP)
-           P(l,irf)=TRX*UV
-           DP(l,irf)=TRX*DUV
-           IMAX=stru%Npt(JATOM)
            n_rad(l)=irf
-           do M=1,IMAX
-              rf1(M,l,irf)=TRX*A(M)
-              rf2(M,l,irf)=TRX*B(M)
-           end do
 
+           ! Compute and STORE overlap integrals for this specific jlo
+           ! <u | LO_jlo> overlap
            call RINT13(stru, jatom, rf1(:,l,1), rf2(:,l,1), &
-                &      rf1(:,l,irf), rf2(:,l,irf), pi12lo)
-           call RINT13(stru, jatom, rf1(1,l,2), rf2(1,l,2), &
-                &      rf1(:,l,irf), rf2(:,l,irf), pe12lo)
+                &      rf1(:,l,irf), rf2(:,l,irf), pi12lo_arr(l,jlo))
+           ! <u_dot | LO_jlo> overlap
+           call RINT13(stru, jatom, rf1(:,l,2), rf2(:,l,2), &
+                &      rf1(:,l,irf), rf2(:,l,irf), pe12lo_arr(l,jlo))
+           ! <LO_jlo | LO_jlo> self-overlap (diagonal)
+           call RINT13(stru, jatom, rf1(:,l,irf), rf2(:,l,irf), &
+                &      rf1(:,l,irf), rf2(:,l,irf), pilolo_arr(l,jlo,jlo))
+        else
+           ! For jlo=1 with non-LAPW (APW+lo), set overlap defaults
+           pi12lo_arr(l,jlo) = 0.0d0
+           pe12lo_arr(l,jlo) = 0.0d0
+           pilolo_arr(l,jlo,jlo) = 1.0d0
         end if
-        call abc (l, stru%RMT(jatom), pei(l), pi12lo, pe12lo, jlo, lapw(l))
+        call abc(l, stru%RMT(jatom), pei(l), &
+             pi12lo_arr(l,jlo), pe12lo_arr(l,jlo), &
+             pilolo_arr(l,jlo,jlo), jlo, lapw(l))
      end do iloloop
   end do loloop
 
-  write(unit_out, "('number of rad. functions per L:',8I3)") &
+  if (is_root) write(unit_out, "('number of rad. functions per L:',8I3)") &
        n_rad(0 : lmax2)
 end subroutine atpar
 end module     atpar_m
@@ -721,9 +1019,11 @@ subroutine radint(stru, jatom, ljmax, bm)
   real(R8),       intent(in) :: bm
 
   real(R8) :: A(Nrad), B(Nrad), X(Nrad), Y(Nrad), RX
-  integer  :: L_index,l1,l2,lj, R_index, i, if1,if2
+  integer  :: L_index,l1,l2,lj, R_index, i, if1,if2, Npt
 
-  do  I=1,stru%Npt(JATOM)
+  Npt = stru%Npt(JATOM)
+
+  do  I=1,Npt
      RX=stru%R0(JATOM)*exp(stru%dx(JATOM)*(i-1))*BM
      call sphbes(LJMAX+1,RX,rj(:,I))
   enddo
@@ -739,14 +1039,14 @@ subroutine radint(stru, jatom, ljmax, bm)
            L_index=L_index+1
            R_index=0
            do IF1=1,n_rad(l1)
+              ! Precompute rf1*rj and rf2*rj products (independent of if2)
+              ! using array syntax to enable vectorization
+              A(1:Npt) = rf1(1:Npt,l1,if1) * rj(lj,1:Npt)
+              B(1:Npt) = rf2(1:Npt,l1,if1) * rj(lj,1:Npt)
               do IF2=1,n_rad(l2)
                  R_index=R_index+1
-                 do  I=1,stru%Npt(JATOM)
-                    A(i)=rf1(i,l1,if1)*rj(lj,i)
-                    B(i)=rf2(i,l1,if1)*rj(lj,i)
-                    X(i)=rf1(i,l2,if2)
-                    Y(i)=rf2(i,l2,if2)
-                 enddo
+                 X(1:Npt) = rf1(1:Npt,l2,if2)
+                 Y(1:Npt) = rf2(1:Npt,l2,if2)
                  call RINT13(stru, jatom, A,B, X,Y, ri_mat(r_index,l_index))
 
               end do

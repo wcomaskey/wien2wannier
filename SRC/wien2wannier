@@ -1,0 +1,2110 @@
+#!/usr/bin/env python3
+"""Public workflow driver for automatic hybrid pre-Wannierization.
+
+The launcher intentionally uses only the Python standard library.  Numerical
+work remains in the existing w2w/w2wc, MPI, and w2w_hybrid executables.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass, field
+from fractions import Fraction
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+from typing import Iterable, Sequence
+
+
+VERSION = "3.0"
+# Filled in by `git archive` (export-subst in .gitattributes); a checkout keeps the placeholder.
+ARCHIVE_REVISION = "$Format:%H$"
+THREAD_ENV = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+BACKEND_INPUT_ENV = ("W2W_STRUCT", "W2W_PAMN", "W2W_CGLOAD")
+# The repository Makefile names the complex MPI build w2w_mpic (C_EXECNAME =
+# R_EXECNAME + c); a WIEN2k installation names the same program w2wc_mpi.
+BACKEND_ALIASES = {"w2w_mpic": ("w2w_mpic", "w2wc_mpi")}
+
+
+class CliError(RuntimeError):
+    """An actionable user-facing CLI error."""
+
+
+class GroupedHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Keep examples readable while retaining argparse's option wrapping."""
+
+    def _format_action_invocation(self, action: argparse.Action) -> str:
+        if not action.option_strings:
+            return super()._format_action_invocation(action)
+        if action.nargs == 0:
+            return ", ".join(action.option_strings)
+        metavar = self._format_args(action, action.dest.upper())
+        return ", ".join(action.option_strings) + " " + metavar
+
+
+class ConsistentStoreAction(argparse.Action):
+    """Allow equivalent aliases while rejecting contradictory repetitions."""
+
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace, values: object, option_string: str | None = None) -> None:
+        previous = getattr(namespace, self.dest, None)
+        if previous is not None and previous != values:
+            parser.error(
+                f"conflicting values for {option_string or self.dest}: "
+                f"already selected {previous}, then received {values}"
+            )
+        setattr(namespace, self.dest, values)
+
+
+def _git_revision_from(directory: Path) -> str | None:
+    """Read a nearby Git revision without requiring the git executable."""
+    marker = directory / ".git"
+    if not marker.exists():
+        return None
+    gitdir = marker
+    if marker.is_file():
+        text = marker.read_text(errors="replace").strip()
+        if not text.startswith("gitdir:"):
+            return None
+        gitdir = Path(text.split(":", 1)[1].strip())
+        if not gitdir.is_absolute():
+            gitdir = (directory / gitdir).resolve()
+    head = gitdir / "HEAD"
+    if not head.is_file():
+        return None
+    value = head.read_text(errors="replace").strip()
+    if not value.startswith("ref:"):
+        return value[:12] if re.fullmatch(r"[0-9a-fA-F]{12,40}", value) else None
+    ref = value.split(None, 1)[1]
+    ref_roots = [gitdir]
+    commondir_file = gitdir / "commondir"
+    if commondir_file.is_file():
+        common = Path(commondir_file.read_text(errors="replace").strip())
+        if not common.is_absolute():
+            common = (gitdir / common).resolve()
+        ref_roots.append(common)
+    for ref_root in ref_roots:
+        loose = ref_root / ref
+        if loose.is_file():
+            return loose.read_text(errors="replace").strip()[:12]
+        packed = ref_root / "packed-refs"
+        if packed.is_file():
+            for line in packed.read_text(errors="replace").splitlines():
+                fields = line.split()
+                if len(fields) == 2 and fields[1] == ref:
+                    return fields[0][:12]
+    return None
+
+
+def source_revision() -> str:
+    here = Path(__file__).resolve().parent
+    for directory in (here.parent, here):
+        revision = _git_revision_from(directory)
+        if revision:
+            return revision
+    if not ARCHIVE_REVISION.startswith("$Format"):
+        return f"{ARCHIVE_REVISION[:12]} (release archive)"
+    return "unavailable (installed copy)"
+
+
+def detected_capabilities() -> str:
+    here = Path(__file__).resolve().parent
+    directories = [here, here.parent / "SRC_w2w"]
+    wienroot = os.environ.get("WIENROOT")
+    if wienroot:
+        directories.append(Path(wienroot).expanduser())
+    names = ("w2w", "w2wc", "w2w_mpi", "w2w_mpic", "w2w_hybrid", "w2w_hybrid_acc")
+    detected = []
+    for name in names:
+        found = locate_executable(name, directories)
+        if found:
+            detected.append(name if found[1] == name else f"{name} (as {found[1]})")
+    return ", ".join(detected) if detected else "none on current PATH/install directory"
+
+
+def version_text() -> str:
+    return (
+        f"wien2wannier {VERSION}\n"
+        f"source revision: {source_revision()}\n"
+        "supported: integrated real/complex/SOC; serial, threaded-library, and MPI resources; "
+        "standalone AMN/MMN bridge (serial or OpenMP build)\n"
+        f"detected backends: {detected_capabilities()}"
+    )
+
+
+@dataclass(frozen=True)
+class WienInputs:
+    directory: Path
+    case: str
+    spin: str
+    complex_vectors: bool
+    struct: Path
+    klist: Path
+    vector: Path
+    energy: Path
+    vsp: Path
+    fermi: Path
+    vector2: Path | None = None
+    vsp2: Path | None = None
+    inso: Path | None = None
+    win: Path | None = None
+    nnkp: Path | None = None
+
+
+@dataclass(frozen=True)
+class ResourcePlan:
+    mode: str
+    threads: int
+    mpi_ranks: int
+    backend: Path | None
+    launcher: Path | None = None
+    launcher_args: tuple[str, ...] = ()
+    binding: str = ""
+
+    def command(self, arguments: Sequence[str]) -> list[str]:
+        if self.backend is None:
+            return []
+        base = [str(self.backend), *arguments]
+        if self.mode == "mpi":
+            if self.launcher is None:
+                raise CliError("internal error: MPI resource plan lacks a launcher")
+            return [str(self.launcher), "-n", str(self.mpi_ranks), *self.launcher_args, *base]
+        return base
+
+
+@dataclass
+class Workflow:
+    args: argparse.Namespace
+    input_kind: str
+    input_dir: Path
+    output_dir: Path
+    seed: str
+    resource: ResourcePlan
+    wien: WienInputs | None = None
+    bridge_seed: str | None = None
+    bridge_files: dict[str, Path] = field(default_factory=dict)
+    mesh: tuple[int, int, int] | None = None
+    nk: int | None = None
+    preprocess: Path | None = None
+    write_win_backend: Path | None = None
+    window_backend: Path | None = None
+    def_records: list[tuple[int, str, str, str, int]] = field(default_factory=list)
+
+
+def positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("want an integer") from exc
+    if value < 1:
+        raise argparse.ArgumentTypeError("want a positive integer")
+    return value
+
+
+def froz_emax_value(text: str) -> float | str:
+    """--froz-emax: a ceiling in eV above E_F, or `auto` (walked down from E_F+8 eV, the published release
+    protocol) or `none` (no ceiling). The words are passed to the backend unchanged; they need --num-wann."""
+    word = text.strip().lower()
+    if word in ("auto", "none"):
+        return word
+    try:
+        return float(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("want a ceiling in eV, auto, or none") from exc
+
+
+def froz_emax_text(value: float | str) -> str:
+    return value if isinstance(value, str) else f"{value} eV"
+
+
+def nonnegative_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("want an integer") from exc
+    if value < 0:
+        raise argparse.ArgumentTypeError("want an integer >= 0")
+    return value
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="wien2wannier",
+        formatter_class=GroupedHelpFormatter,
+        description=(
+            "Automatic band/projection selection and hybrid pre-Wannierization "
+            "for an existing WIEN2k calculation.\n\n"
+            "Examples:\n"
+            "  wien2wannier --input ./Si --seed si-model --k-grid 8 8 8 --threads 8\n"
+            "  wien2wannier --input ./Fe --seed fe-soc --spin soc --num-wann 18 "
+            "--wannier90 /opt/w90/wannier90.x\n\n"
+            "The default stage, all, prepares neighbours and writes a complete "
+            "isolated <seed>-hyb handoff. It never launches a DFT calculation. "
+            "Final Wannier90 localization is added only by --wannier90."
+        ),
+        epilog=(
+            "Required existing WIEN files:\n"
+            "  scalar: case.{struct,klist,vector,energy,vsp,fermi}\n"
+            "  collinear: add/select vector{up|dn}, energy{up|dn}, vsp{up|dn}\n"
+            "  SOC: case.inso plus vectorso or vectorsoup, vectorsodn, energyso or\n"
+            "       energysoup; spin-polarized SOC also needs vspup and vspdn.\n"
+            "  Supply case.win and case.nnkp, or make write_win_backend and wannier90.x\n"
+            "  available so prepare can create them. Every vector/mesh is pre-existing.\n"
+            "Bridge input requires <bridge-seed>.{eig,nnkp,win} plus AMN/MMN text,\n"
+            "  .amn.bin/.mmn.bin sidecars, or both; projmap.dat is optional.\n\n"
+            "Integrated HYBR keyword forwarding (--hybrid-option KEY=VALUE):\n"
+            "  margin=INTEGER [0=capacity policy]; gauge=scdm|ptg|autoN|tflN|smsN|\n"
+            "    ptsN|lowdin|ldsN|bscdm|bsmsN|slwdN|slwaN|slwfN|slwpN|u0|identity\n"
+            "    [auto8]; seedk=optN|best|median|K\n"
+            "    [opt16]; seedloss=smooth|blind|local|abel|absm [smooth];\n"
+            "  capacity=strict|warn [strict]; edges=auto|warn|strict|snap [auto];\n"
+            "  sweeps=POSITIVE_INTEGER [20000]; relax=NONZERO_FACTOR [-2.5];\n"
+            "    adaptive=BOOL [true]; relax_late=FACTOR|auto [1.99];\n"
+            "    taper=RATIO with 0<RATIO<1 [0.5]; taper_late=RATIO with 0<RATIO<1\n"
+            "    [same as taper]; kick=BOOL [true];\n"
+            "  text_io=BOOL [false]; tol=POSITIVE_ABS_OMEGA_I_CHANGE [1e-9 Angstrom^2];\n"
+            "    rel_tol=POSITIVE_REL_CHANGE [1e-10]; anderson=DEPTH_GE_0 [0].\n"
+            "  BOOL accepts true/false, yes/no, on/off, 1/0. Dedicated public options\n"
+            "  control froz_emax (eV, auto, or none) [1.0], pool_factor [1.5], solver [cg], and\n"
+            "  colored update order [off]. A gauge string's N is a smoothing count.\n"
+            "  W2W_EDGES/W2W_SEEDK/W2W_SEEDLOSS are inherited when their public option\n"
+            "  is absent; an explicit matching --hybrid-option takes precedence. Bridge\n"
+            "  mode preserves them because its native environment controls have no public\n"
+            "  integrated-option equivalent. W2W_STRUCT, W2W_PAMN, and W2W_CGLOAD are\n"
+            "  validated input files; relative values are made absolute from invocation\n"
+            "  cwd before the backend changes to output-dir. Backend output paths such as\n"
+            "  W2W_CGDUMP remain relative to output-dir. Other W2W_* controls are inherited.\n"
+            "  With the named-option bridge backend, repeat --bridge-arg=--option and\n"
+            "  --bridge-arg=value for native-only controls; run w2w_hybrid --help for\n"
+            "  that surface. Recognized legacy positional backends receive the public\n"
+            "  pool/solver/colored controls through a compatibility adapter but reject\n"
+            "  --bridge-arg. Unknown bridge interfaces fail before output is written.\n\n"
+            "Resource scope: --mpi-ranks selects only an MPI integrated w2w backend.\n"
+            "Wannier90 -pp and final --wannier90 localization run as one process; use an\n"
+            "explicit site wrapper as PATH only if that wrapper needs no extra arguments.\n"
+            "Integrated runs assign --threads to the per-rank BLAS/library budget, through\n"
+            "OMP_NUM_THREADS as well as the BLAS variables: the native programs have no\n"
+            "OpenMP regions, and an OpenMP-built BLAS reads only OMP_NUM_THREADS. The\n"
+            "OpenMP bridge assigns OMP_NUM_THREADS=N and every BLAS pool=1; serial bridge\n"
+            "uses one of each. Scheduler per-task, task-count, and node budgets are checked.\n"
+            "With --parallel mpi and more than one thread per rank, --mpi-bind auto asks the\n"
+            "MPI launcher for --version and, for Open MPI, adds --bind-to none: Open MPI\n"
+            "otherwise binds each of up to two ranks to one core, which its threads would\n"
+            "share. Other launchers keep their own binding. --mpi-bind none always adds\n"
+            "--bind-to none; --mpi-bind launcher never adds a binding option.\n"
+            "Invoke one Python driver: an enclosing OMPI/PMI/PMIX/MV2 world larger than one\n"
+            "is rejected; the driver itself launches the requested native MPI ranks.\n\n"
+            "Python dependency: Python >= 3.10 standard library only; NumPy and SciPy are not\n"
+            "required by this launcher. Numerical executables retain their compiled dependencies."
+        ),
+    )
+    io = parser.add_argument_group("Input and output")
+    io.add_argument("--input", metavar="PATH", help="WIEN2k case directory, .struct path, or bridge directory (required for runs)")
+    io.add_argument("--seed", metavar="NAME", help="output basename; automatic handoff is NAME-hyb (required for runs)")
+    io.add_argument("--output-dir", metavar="PATH", help="output directory [./<seed>-w2w]; parent calculation is not modified by default")
+    io.add_argument("--method", choices=("hybrid", "window"), default="hybrid", help="hybrid = per-state masks and the isolated <seed>-hyb handoff [default]; window = the automatic window route: the same selection expressed as Wannier90 disentanglement windows (frozen window = the frozen states' energy hull, outer ceiling chosen by Omega_I), written to <seed>-hyb-win.{amn,mmn,eig,win} for stock disentanglement; needs --num-wann N")
+    io.add_argument("--input-kind", choices=("auto", "wien", "bridge"), default="auto", help="integrated WIEN frontend or pre-generated AMN/MMN bridge [auto]")
+    io.add_argument("--case", metavar="NAME", help="input WIEN2k case basename [input directory name]")
+    io.add_argument("--bridge-seed", metavar="NAME", help="input AMN/MMN/EIG/NNKP/WIN basename [--case or input directory name]")
+
+    automatic = parser.add_argument_group("Automatic selection")
+    automatic.add_argument("--num-wann", "--nw", action=ConsistentStoreAction, type=nonnegative_int, metavar="N", help="target functions; omitted or 0 uses integrated capacity inference; bridge mode requires N > 0")
+    automatic.add_argument("--k-grid", type=positive_int, nargs=3, metavar=("NX", "NY", "NZ"), help="required existing full-BZ mesh; validated against case.klist, never generated by DFT")
+    automatic.add_argument("--froz-emax", type=froz_emax_value, default=1.0, metavar="EV|auto|none", help="frozen ceiling above E_F in eV, which also drives automatic num_wann [1.0 eV]; auto walks the ceiling down from E_F+8 eV (the published release protocol) and none disables it, both with --num-wann N")
+    automatic.add_argument("--band-min", type=nonnegative_int, default=0, metavar="N", help="first DFT band; 0 asks the integrated backend to find the core gap [0]")
+    automatic.add_argument("--band-max", type=int, default=-1, metavar="N", help="last DFT band; -1 uses the E_F+40 eV integrated policy, 0 uses every common band [-1]")
+    automatic.add_argument("--projection-threshold", type=float, default=0.0, metavar="RATIO", help="relative automatic projection threshold; 0 uses ranked cliff selection [0.0]")
+    automatic.add_argument("--max-projections", type=nonnegative_int, default=0, metavar="N", help="automatic candidate cap; 0 means no explicit cap [0]")
+    automatic.add_argument("--ljmax", type=nonnegative_int, default=4, metavar="L", help="maximum LAPW angular expansion used by projection discovery [4]")
+    automatic.add_argument("--support-ratio", type=float, default=0.5, metavar="RATIO", help="automatic projection support gate; 0 disables [0.5]")
+
+    stages = parser.add_argument_group("Run stages")
+    stages.add_argument("--stage", choices=("all", "prepare", "overlaps", "hybrid", "localize"), default="all", help="all=full handoff; prepare=controls+NNKP; overlaps=raw AUTO export; hybrid=hybrid handoff; localize=existing handoff [all]")
+    stages.add_argument("--wannier90", metavar="PATH", help="external Wannier90 executable; with all/hybrid, add final localization; required by localize")
+    stages.add_argument("--wannier90-preprocess", metavar="PATH", help="Wannier90 executable used only for -pp neighbour generation [PATH lookup]")
+
+    resources = parser.add_argument_group("Resources")
+    resources.add_argument("--threads", type=positive_int, default=1, metavar="N", help="BLAS/OpenMP thread budget per rank [1]")
+    resources.add_argument("--parallel", choices=("auto", "serial", "threads", "mpi"), default="auto", help="resource mechanism; does not select a solver or update order [auto]")
+    resources.add_argument("--mpi-ranks", type=positive_int, default=1, metavar="N", help="MPI ranks for integrated w2w only; preprocessing/localization stay single-process [1]")
+    resources.add_argument("--mpi-launcher", metavar="PATH", help="mpiexec/mpirun path for --parallel mpi [PATH lookup]")
+    resources.add_argument("--mpi-bind", choices=("auto", "none", "launcher"), default="auto", help="MPI process binding: auto adds Open MPI's --bind-to none when ranks run more than one thread; none always adds it; launcher adds nothing [auto]")
+    resources.add_argument("--allow-oversubscribe", action="store_true", help="allow mpi-ranks * threads to exceed detected allocation [off]")
+
+    diagnostics = parser.add_argument_group("Diagnostics")
+    mode = diagnostics.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true", help="validate inputs, mesh, executables, spin and resources; never writes or computes")
+    mode.add_argument("--dry-run", action="store_true", help="print the resolved invocation and def contract; never writes or computes")
+    verbosity = diagnostics.add_mutually_exclusive_group()
+    verbosity.add_argument("--verbose", action="store_true", help="print resolved commands and enable w2w_hybrid progress tracing (bridge and window routes)")
+    verbosity.add_argument("--quiet", action="store_true", help="suppress routine output; backend warnings, diagnostics, and failures remain visible")
+    diagnostics.add_argument("--version", action="version", version=version_text())
+
+    advanced = parser.add_argument_group("Advanced backend options")
+    advanced.add_argument("--spin", choices=("auto", "none", "up", "dn", "soc"), default="auto", help="calculation channel; ambiguous collinear inputs require up or dn [auto]")
+    advanced.add_argument("--vector-format", choices=("auto", "real", "complex"), default="auto", help="native vector representation; SOC is always complex [auto]")
+    advanced.add_argument("--solver", choices=("gs", "cg", "auto"), default="cg", help="hybrid Omega_I solver: cg (Grassmann CG), gs (Gauss-Seidel sweep) or auto; independent of resource mode [cg]")
+    advanced.add_argument("--pool-factor", type=float, default=1.5, metavar="RATIO", help="minimum DFT-band pool relative to num_wann [1.5]")
+    advanced.add_argument("--colored-gs", action="store_true", help="explicitly request colored GS update order; changes the algorithm [off]")
+    advanced.add_argument("--hybrid-option", action="append", default=[], metavar="KEY=VALUE", help="repeatable integrated HYBR .inwf keyword forwarding; unknown/reserved keys fail")
+    advanced.add_argument("--bridge-arg", action="append", default=[], metavar="ARG", help="repeatable literal argument forwarded to w2w_hybrid; use --bridge-arg=--flag")
+    advanced.add_argument("--backend-dir", metavar="PATH", help="directory containing w2w/w2wc/w2w_hybrid and helper executables")
+    advanced.add_argument("--force", action="store_true", help="replace conflicting files in output-dir [off]")
+    return parser
+
+
+def require_name(value: str | None, option: str) -> str:
+    if value is None or not value.strip():
+        raise CliError(f"{option} is required")
+    if Path(value).name != value or value in {".", ".."}:
+        raise CliError(f"{option} must be a basename, not a path: {value!r}")
+    if any(character in value for character in ("\0", "\n", "\r")):
+        raise CliError(f"{option} contains a forbidden control character")
+    return value
+
+
+def resolve_input_path(raw: str | None) -> tuple[Path, str | None]:
+    if raw is None:
+        raise CliError("--input is required")
+    path = Path(raw).expanduser().resolve()
+    if not path.exists():
+        raise CliError(f"input path does not exist: {path}")
+    if path.is_file():
+        if path.suffix != ".struct":
+            raise CliError("a file --input must be a WIEN2k .struct file")
+        return path.parent, path.stem
+    if not path.is_dir():
+        raise CliError(f"input is neither a directory nor .struct file: {path}")
+    return path, None
+
+
+def existing(path: Path, role: str) -> Path:
+    if not path.is_file() or path.stat().st_size == 0:
+        raise CliError(f"missing or empty {role}: {path}")
+    return path.resolve()
+
+
+def choose_existing(directory: Path, case: str, suffixes: Sequence[str], role: str) -> Path:
+    choices = [directory / f"{case}.{suffix}" for suffix in suffixes]
+    for path in choices:
+        if path.is_file() and path.stat().st_size > 0:
+            return path.resolve()
+    raise CliError(f"missing {role}; looked for " + ", ".join(str(path) for path in choices))
+
+
+def meaningful_inso(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+    lines = [line.strip() for line in path.read_text(errors="replace").splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    if len(lines) < 4:
+        return False
+    fields = lines[3].split()
+    if len(fields) < 3:
+        return False
+    try:
+        return all(math.isfinite(float(value)) for value in fields[:3])
+    except ValueError:
+        return False
+
+
+def infer_spin(directory: Path, case: str, requested: str) -> str:
+    if requested != "auto":
+        return requested
+    if meaningful_inso(directory / f"{case}.inso"):
+        return "soc"
+    has_up = (directory / f"{case}.vectorup").is_file()
+    has_dn = (directory / f"{case}.vectordn").is_file()
+    if has_up and has_dn:
+        raise CliError("both collinear vectorup and vectordn exist; select --spin up or --spin dn")
+    if has_up:
+        return "up"
+    if has_dn:
+        return "dn"
+    return "none"
+
+
+def resolve_wien_inputs(directory: Path, case: str, args: argparse.Namespace) -> WienInputs:
+    struct = existing(directory / f"{case}.struct", "structure file")
+    klist = existing(directory / f"{case}.klist", "full-BZ k-list")
+    spin = infer_spin(directory, case, args.spin)
+    vector2 = vsp2 = inso = None
+    if spin == "soc":
+        inso = existing(directory / f"{case}.inso", "SOC input")
+        vector = choose_existing(directory, case, ("vectorsoup", "vectorso"), "first SOC vector component")
+        vector2 = choose_existing(directory, case, ("vectorsodn",), "second SOC vector component")
+        if vector.name.endswith("vectorsoup"):
+            energy = choose_existing(directory, case, ("energysoup", "energyso"), "SOC energy file")
+            vsp = choose_existing(directory, case, ("vspup",), "first spin potential")
+            vsp2 = choose_existing(directory, case, ("vspdn",), "second spin potential")
+            fermi = choose_existing(directory, case, ("fermiup", "fermi"), "Fermi energy")
+        else:
+            energy = choose_existing(directory, case, ("energyso", "energysoup"), "SOC energy file")
+            vsp = choose_existing(directory, case, ("vsp", "vspup"), "potential")
+            possible_vsp2 = directory / f"{case}.vspdn"
+            if possible_vsp2.is_file() and possible_vsp2.stat().st_size > 0:
+                vsp2 = possible_vsp2.resolve()
+            fermi = choose_existing(directory, case, ("fermi", "fermiup"), "Fermi energy")
+    elif spin in {"up", "dn"}:
+        vector = choose_existing(directory, case, (f"vector{spin}",), f"{spin} vector")
+        energy = choose_existing(directory, case, (f"energy{spin}",), f"{spin} energy")
+        vsp = choose_existing(directory, case, (f"vsp{spin}",), f"{spin} potential")
+        fermi = choose_existing(directory, case, (f"fermi{spin}", "fermi"), "Fermi energy")
+    else:
+        vector = choose_existing(directory, case, ("vector",), "vector file")
+        energy = choose_existing(directory, case, ("energy",), "energy file")
+        vsp = choose_existing(directory, case, ("vsp",), "potential")
+        fermi = choose_existing(directory, case, ("fermi",), "Fermi energy")
+
+    if args.vector_format == "real" and spin == "soc":
+        raise CliError("SOC vectors require the complex w2wc backend; --vector-format real is invalid")
+    complex_vectors = spin == "soc"
+    if args.vector_format == "complex":
+        complex_vectors = True
+    elif args.vector_format == "real":
+        complex_vectors = False
+    elif (directory / f"{case}.in1c").is_file() and (directory / f"{case}.in1c").stat().st_size > 0:
+        complex_vectors = True
+
+    win = directory / f"{case}.win"
+    nnkp = directory / f"{case}.nnkp"
+    return WienInputs(
+        directory=directory,
+        case=case,
+        spin=spin,
+        complex_vectors=complex_vectors,
+        struct=struct,
+        klist=klist,
+        vector=vector,
+        energy=energy,
+        vsp=vsp,
+        fermi=fermi,
+        vector2=vector2,
+        vsp2=vsp2,
+        inso=inso,
+        win=win.resolve() if win.is_file() else None,
+        nnkp=nnkp.resolve() if nnkp.is_file() else None,
+    )
+
+
+def parse_klist_record(line: str) -> tuple[int, int, int, int] | None:
+    if line.lstrip().upper().startswith("END"):
+        return None
+    fields = line.split()
+    try:
+        if len(fields) >= 5:
+            return tuple(int(fields[index]) for index in (1, 2, 3, 4))  # type: ignore[return-value]
+    except ValueError:
+        pass
+    if len(line) >= 50:
+        try:
+            return tuple(int(line[start:start + 10]) for start in (10, 20, 30, 40))  # type: ignore[return-value]
+        except ValueError:
+            return None
+    return None
+
+
+def inspect_klist(path: Path) -> tuple[tuple[int, int, int], list[tuple[Fraction, Fraction, Fraction]]]:
+    lines = path.read_text(errors="replace").splitlines()
+    records: list[tuple[int, int, int, int]] = []
+    for lineno, line in enumerate(lines, 1):
+        if line.lstrip().upper().startswith("END"):
+            break
+        record = parse_klist_record(line)
+        if record is None:
+            raise CliError(f"malformed WIEN k-list record at {path}:{lineno}")
+        if record[3] <= 0:
+            raise CliError(f"invalid k-list divisor at {path}:{lineno}")
+        records.append(record)
+    if not records:
+        raise CliError(f"k-list contains no points: {path}")
+    coordinates = [
+        tuple(Fraction(value, divisor) for value in (kx, ky, kz))
+        for kx, ky, kz, divisor in records
+    ]
+    header = re.search(r"div:\s*\(\s*(\d+)\s+(\d+)\s+(\d+)\s*\)", lines[0], re.IGNORECASE)
+    if header:
+        mesh = tuple(int(header.group(index)) for index in (1, 2, 3))
+    else:
+        raise CliError(
+            f"{path} lacks the WIEN full-mesh 'div: (NX NY NZ)' header; "
+            "the driver will not infer or manufacture a DFT mesh"
+        )
+    if mesh[0] * mesh[1] * mesh[2] != len(records):
+        raise CliError(
+            f"{path} is not a complete {mesh[0]} x {mesh[1]} x {mesh[2]} full-BZ mesh "
+            f"({len(records)} records)"
+        )
+    return mesh, coordinates
+
+
+def same_vector_multiset(
+    vectors: list[tuple[float, float, float]],
+    reference: list[tuple[float, float, float]],
+    tolerance: float,
+) -> bool:
+    """True when the two lists hold the same vectors, in any order, to `tolerance` per component.
+
+    A `.nnkp` prints its k-points with eight decimals, so the neighbour vectors of
+    different k-points agree only to about 1e-8 of a reciprocal-lattice vector on
+    a mesh whose fractions do not terminate (divisions of 3, 6, 12). Comparing
+    rounded values exactly rejects such a mesh whenever a component falls next
+    to a rounding boundary.
+    """
+    remaining = list(reference)
+    for vector in vectors:
+        for index, candidate in enumerate(remaining):
+            if all(abs(a - b) <= tolerance for a, b in zip(vector, candidate)):
+                del remaining[index]
+                break
+        else:
+            return False
+    return not remaining
+
+
+def inspect_nnkp(path: Path) -> tuple[list[tuple[float, float, float]], int]:
+    lines = path.read_text(errors="replace").splitlines()
+    reciprocal: list[tuple[float, float, float]] | None = None
+    for index, line in enumerate(lines):
+        if line.strip().lower() != "begin recip_lattice":
+            continue
+        rows: list[tuple[float, float, float]] = []
+        for row_line in lines[index + 1:]:
+            if not row_line.strip():
+                continue
+            if row_line.strip().lower() == "end recip_lattice":
+                break
+            fields = row_line.split()
+            if len(fields) < 3:
+                raise CliError(f"malformed reciprocal-lattice record in {path}: {row_line!r}")
+            try:
+                row = tuple(float(value) for value in fields[:3])
+            except ValueError as exc:
+                raise CliError(f"malformed reciprocal-lattice record in {path}: {row_line!r}") from exc
+            if not all(math.isfinite(value) for value in row):
+                raise CliError(f"NNKP reciprocal lattice must be finite in {path}")
+            rows.append(row)  # type: ignore[arg-type]
+        if len(rows) != 3:
+            raise CliError(f"NNKP reciprocal lattice must contain three rows: {path}")
+        invert3(rows)
+        reciprocal = rows
+        break
+    if reciprocal is None:
+        raise CliError(f"NNKP lacks a begin recip_lattice block required by the native backend: {path}")
+    points: list[tuple[float, float, float]] | None = None
+    for index, line in enumerate(lines):
+        if line.strip().lower() == "begin kpoints":
+            tail = lines[index + 1:]
+            for offset, candidate in enumerate(tail):
+                if candidate.strip():
+                    try:
+                        count = int(candidate.split()[0])
+                    except (ValueError, IndexError) as exc:
+                        raise CliError(f"malformed k-point count in {path}") from exc
+                    points = []
+                    for point_line in tail[offset + 1:]:
+                        if not point_line.strip():
+                            continue
+                        if point_line.strip().lower() == "end kpoints":
+                            break
+                        fields = point_line.split()
+                        if len(fields) < 3:
+                            raise CliError(f"malformed k-point record in {path}: {point_line!r}")
+                        try:
+                            point = tuple(float(value) for value in fields[:3])
+                        except ValueError as exc:
+                            raise CliError(f"malformed k-point record in {path}: {point_line!r}") from exc
+                        if not all(math.isfinite(value) for value in point):
+                            raise CliError(f"NNKP k-point coordinates must be finite in {path}: {point_line!r}")
+                        points.append(point)  # type: ignore[arg-type]
+                    if len(points) != count:
+                        raise CliError(f"NNKP declares {count} k-points but contains {len(points)}: {path}")
+                    break
+    if points is None:
+        raise CliError(f"NNKP lacks a begin kpoints block: {path}")
+    for index, line in enumerate(lines):
+        if line.strip().lower() != "begin nnkpts":
+            continue
+        tail = lines[index + 1:]
+        nonempty = [(offset, value) for offset, value in enumerate(tail) if value.strip()]
+        if not nonempty:
+            break
+        first_offset, first = nonempty[0]
+        try:
+            nntot = int(first.split()[0])
+        except (ValueError, IndexError) as exc:
+            raise CliError(f"malformed neighbour count in {path}") from exc
+        if nntot < 1:
+            raise CliError(f"NNKP neighbour count must be positive in {path}")
+        records: list[tuple[int, int, int, int, int]] = []
+        for record_line in tail[first_offset + 1:]:
+            stripped = record_line.strip()
+            if not stripped:
+                continue
+            if stripped.lower() == "end nnkpts":
+                break
+            fields = stripped.split()
+            if len(fields) < 5:
+                raise CliError(f"malformed neighbour record in {path}: {record_line!r}")
+            try:
+                records.append(tuple(int(value) for value in fields[:5]))  # type: ignore[arg-type]
+            except ValueError as exc:
+                raise CliError(f"malformed neighbour record in {path}: {record_line!r}") from exc
+        required = len(points) * nntot
+        if len(records) != required:
+            raise CliError(
+                f"NNKP neighbour block contains {len(records)} records; expected "
+                f"{len(points)} k-points x {nntot} neighbours = {required}: {path}"
+            )
+        counts = [0] * len(points)
+        seen: set[tuple[int, int, int, int, int]] = set()
+        reference_norms: list[float | None] = [None] * nntot
+        reference_vectors: list[tuple[float, float, float]] | None = None
+        block_vectors: list[tuple[float, float, float]] = []
+        # ten times the error eight printed decimals leave in a neighbour vector
+        vector_tolerance = 1.0e-7 * max(
+            1.0, max(abs(value) for row in reciprocal for value in row))
+        for record_index, record in enumerate(records):
+            source, target, gx, gy, gz = record
+            if not 1 <= source <= len(points) or not 1 <= target <= len(points):
+                raise CliError(f"NNKP neighbour index out of range in {path}: {record}")
+            expected_source = record_index // nntot + 1
+            slot = record_index % nntot
+            if source != expected_source:
+                raise CliError(
+                    f"NNKP neighbour record order is invalid at record {record_index + 1}: "
+                    f"source {source}, expected {expected_source} in {path}"
+                )
+            fractional_vector = tuple(
+                points[target - 1][axis] + (gx, gy, gz)[axis] - points[source - 1][axis]
+                for axis in range(3)
+            )
+            vector = tuple(
+                sum(fractional_vector[axis] * reciprocal[axis][cart] for axis in range(3))
+                for cart in range(3)
+            )
+            norm2 = sum(value * value for value in vector)
+            if reference_norms[slot] is None:
+                reference_norms[slot] = norm2
+            elif abs(math.sqrt(norm2) - math.sqrt(reference_norms[slot])) > 2.0 * vector_tolerance:  # type: ignore[arg-type]
+                raise CliError(
+                    f"NNKP neighbour slot {slot + 1} changes reciprocal-length shell at "
+                    f"source k-point {source}; ordering is inconsistent in {path}"
+                )
+            block_vectors.append(vector)  # type: ignore[arg-type]
+            if slot == nntot - 1:
+                if reference_vectors is None:
+                    reference_vectors = block_vectors
+                elif not same_vector_multiset(block_vectors, reference_vectors, vector_tolerance):
+                    raise CliError(
+                        f"NNKP neighbour displacement multiset changes at source k-point "
+                        f"{source}; target/G records are inconsistent in {path}"
+                    )
+                block_vectors = []
+            counts[source - 1] += 1
+            if record in seen:
+                raise CliError(f"duplicate NNKP neighbour record in {path}: {record}")
+            seen.add(record)
+        if any(count != nntot for count in counts):
+            raise CliError(f"NNKP does not provide {nntot} neighbours for every k-point: {path}")
+        return points, nntot
+    raise CliError(f"NNKP lacks a begin nnkpts block: {path}")
+
+
+def invert3(matrix: Sequence[Sequence[float]]) -> list[list[float]]:
+    a, b, c = matrix[0]
+    d, e, f = matrix[1]
+    g, h, i = matrix[2]
+    determinant = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    if abs(determinant) < 1.0e-15:
+        raise CliError("singular lattice matrix in WIEN structure")
+    cofactors = [
+        [e * i - f * h, c * h - b * i, b * f - c * e],
+        [f * g - d * i, a * i - c * g, c * d - a * f],
+        [d * h - e * g, b * g - a * h, a * e - b * d],
+    ]
+    return [[value / determinant for value in row] for row in cofactors]
+
+
+def native_klist_coordinates(
+    struct: Path,
+    raw: Sequence[tuple[Fraction, Fraction, Fraction]],
+) -> list[tuple[float, float, float]]:
+    """Mirror inwfmod::get_kmesh_klist's orthogonal RR conversion."""
+    lines = struct.read_text(errors="replace").splitlines()
+    if len(lines) < 4:
+        raise CliError(f"WIEN structure header is incomplete: {struct}")
+    lattice = lines[1][:4].strip().upper()
+    try:
+        cell = [float(lines[3][start:start + 10]) for start in range(0, 60, 10)]
+    except ValueError:
+        fields = lines[3].split()
+        if len(fields) < 6:
+            raise CliError(f"cannot parse lattice constants/angles from {struct}:4")
+        try:
+            cell = [float(value) for value in fields[:6]]
+        except ValueError as exc:
+            raise CliError(f"cannot parse lattice constants/angles from {struct}:4") from exc
+    lengths = cell[:3]
+    angles = [90.0 if abs(value) < 1.0e-5 else value for value in cell[3:]]
+    if any(not math.isfinite(value) or value <= 0 for value in lengths):
+        raise CliError(f"invalid lattice constants in {struct}:4")
+    if any(not math.isfinite(value) for value in angles):
+        raise CliError(f"invalid lattice angles in {struct}:4")
+    radians = [math.radians(value) for value in angles]
+    cosbc, cosac, cosab = (math.cos(value) for value in radians)
+    sinbc = math.sin(radians[0])
+    ortho = False
+    prim_rec = [[0.0] * 3 for _ in range(3)]
+    tau = 2.0 * math.pi
+    pia = [tau / value for value in lengths]
+    if lattice[:1] in {"P", "S"}:
+        discriminant = sinbc ** 2 - cosac ** 2 - cosab ** 2 + 2.0 * cosbc * cosac * cosab
+        if discriminant <= 0.0 or abs(sinbc) < 1.0e-15:
+            raise CliError(f"invalid primitive lattice angles in {struct}:4")
+        root = math.sqrt(discriminant)
+        prim_rec = [
+            [pia[0] * sinbc / root,
+             pia[1] * (-cosab + cosbc * cosac) / (sinbc * root),
+             pia[2] * (-cosac + cosbc * cosab) / (sinbc * root)],
+            [0.0, pia[1] / sinbc, -pia[2] * cosbc / sinbc],
+            [0.0, 0.0, pia[2]],
+        ]
+        ortho = all(abs(value - math.pi / 2.0) <= 1.0e-4 for value in radians)
+    elif lattice[:1] == "F":
+        ortho = True
+        prim_rec = [
+            [-pia[0], pia[0], pia[0]],
+            [pia[1], -pia[1], pia[1]],
+            [pia[2], pia[2], -pia[2]],
+        ]
+    elif lattice[:1] == "B":
+        ortho = True
+        prim_rec = [
+            [0.0, pia[0], pia[0]],
+            [pia[1], 0.0, pia[1]],
+            [pia[2], pia[2], 0.0],
+        ]
+    elif lattice.startswith("CXY"):
+        ortho = True
+        prim_rec = [
+            [pia[0], pia[0], 0.0],
+            [-pia[1], pia[1], 0.0],
+            [0.0, 0.0, pia[2]],
+        ]
+    elif lattice.startswith("CYZ"):
+        ortho = True
+        prim_rec = [
+            [pia[0], 0.0, 0.0],
+            [0.0, pia[1], pia[1]],
+            [0.0, -pia[2], pia[2]],
+        ]
+    elif lattice.startswith("CXZ") and abs(radians[2] - math.pi / 2.0) <= 1.0e-4:
+        ortho = True
+        prim_rec = [
+            [pia[0], 0.0, pia[0]],
+            [0.0, pia[1], 0.0],
+            [-pia[2], 0.0, pia[2]],
+        ]
+    elif lattice[:1] not in {"H", "R", "C"}:
+        raise CliError(f"unsupported WIEN lattice type in {struct}: {lattice!r}")
+    if not ortho:
+        return [tuple(float(value) for value in point) for point in raw]
+    inverse = invert3(prim_rec)
+    prim_dir = [[inverse[column][row] * tau for column in range(3)] for row in range(3)]
+    rr = [
+        [prim_dir[row][column] / lengths[row] for row in range(3)]
+        for column in range(3)
+    ]
+    return [
+        tuple(sum(rr[row][column] * float(point[column]) for column in range(3)) for row in range(3))
+        for point in raw
+    ]
+
+
+def validate_nnkp_coordinates(path: Path, expected: Sequence[tuple[float, float, float]], tolerance: float = 5.0e-8) -> None:
+    actual, _ = inspect_nnkp(path)
+    if len(actual) != len(expected):
+        raise CliError(f"NNKP has {len(actual)} k-points but existing WIEN klist/vector mesh has {len(expected)}")
+    for index, (got, want) in enumerate(zip(actual, expected), 1):
+        if any(abs(got[axis] - want[axis]) > tolerance for axis in range(3)):
+            raise CliError(
+                f"NNKP k-point coordinates/order disagree with the existing WIEN klist/vector mesh "
+                f"at index {index}: got {got}, expected {want}"
+            )
+
+
+def validate_full_mesh(
+    path: Path,
+    mesh: tuple[int, int, int],
+    points: Sequence[tuple[float, float, float]],
+    tolerance: float = 5.0e-8,
+) -> None:
+    """Validate a complete shifted tensor grid in native primitive coordinates."""
+    if len(points) != mesh[0] * mesh[1] * mesh[2]:
+        raise CliError(f"{path} record count does not match its div header")
+    origin = points[0]
+    indices: set[tuple[int, int, int]] = set()
+    for point_number, point in enumerate(points, 1):
+        if not all(math.isfinite(value) for value in point):
+            raise CliError(f"non-finite primitive k-point at {path} index {point_number}")
+        index: list[int] = []
+        for axis, count in enumerate(mesh):
+            scaled = (point[axis] - origin[axis]) * count
+            nearest = round(scaled)
+            if abs(scaled - nearest) > tolerance * max(1, count):
+                raise CliError(
+                    f"{path} is not a uniform shifted {mesh[0]} x {mesh[1]} x {mesh[2]} "
+                    f"primitive mesh at point {point_number}, axis {axis + 1}"
+                )
+            index.append(nearest % count)
+        key = tuple(index)
+        if key in indices:
+            raise CliError(f"k-list has duplicate primitive folded points: {path}")
+        indices.add(key)
+    if len(indices) != len(points):
+        raise CliError(f"{path} does not contain every point of its declared full mesh")
+
+
+def backend_directories(args: argparse.Namespace) -> list[Path]:
+    directories: list[Path] = []
+    if args.backend_dir:
+        directories.append(Path(args.backend_dir).expanduser().resolve())
+    here = Path(__file__).resolve().parent
+    directories.extend((here, here.parent / "SRC_w2w", here.parent / "SRC_trig"))
+    wienroot = os.environ.get("WIENROOT")
+    if wienroot:
+        directories.append(Path(wienroot).expanduser().resolve())
+    unique: list[Path] = []
+    for directory in directories:
+        if directory not in unique:
+            unique.append(directory)
+    return unique
+
+
+def locate_executable(name_or_path: str, directories: Iterable[Path] = ()) -> tuple[Path, str] | None:
+    """Return the resolved executable and the file name that matched.
+
+    Directories are searched in order, each for every accepted name of the
+    program, before PATH, so an earlier directory wins over a later one
+    whichever name it uses.
+    """
+    candidate = Path(name_or_path).expanduser()
+    if candidate.parent != Path(".") or candidate.is_absolute():
+        resolved = candidate.resolve()
+        return (resolved, candidate.name) if resolved.is_file() and os.access(resolved, os.X_OK) else None
+    names = BACKEND_ALIASES.get(name_or_path, (name_or_path,))
+    for directory in directories:
+        for name in names:
+            resolved = directory / name
+            if resolved.is_file() and os.access(resolved, os.X_OK):
+                return resolved.resolve(), name
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return Path(found).resolve(), name
+    return None
+
+
+def find_executable(name_or_path: str, directories: Iterable[Path] = ()) -> Path | None:
+    found = locate_executable(name_or_path, directories)
+    return found[0] if found else None
+
+
+def require_executable(name_or_path: str, role: str, directories: Iterable[Path] = ()) -> Path:
+    found = find_executable(name_or_path, directories)
+    if found is None:
+        names = " or ".join(BACKEND_ALIASES.get(name_or_path, (name_or_path,)))
+        raise CliError(f"{role} executable is unavailable: {names}")
+    return found
+
+
+def validate_backend_input_environment() -> None:
+    for name in BACKEND_INPUT_ENV:
+        raw = os.environ.get(name)
+        if not raw:
+            continue
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        present = path.is_file() and path.stat().st_size > 0
+        if name == "W2W_PAMN" and not present:
+            sidecar = append_suffix(path, ".bin")
+            present = sidecar.is_file() and sidecar.stat().st_size > 0
+        if not present:
+            raise CliError(
+                f"{name} names a missing or empty backend input: {path}; relative paths "
+                "are resolved from the directory where wien2wannier was invoked"
+            )
+
+
+def positive_environment_integer(name: str) -> int | None:
+    match = re.match(r"\s*(\d+)", os.environ.get(name, ""))
+    return int(match.group(1)) if match and int(match.group(1)) > 0 else None
+
+
+def validate_resource_budget(args: argparse.Namespace, mode: str) -> None:
+    if args.allow_oversubscribe:
+        return
+    ranks = args.mpi_ranks if mode == "mpi" else 1
+    per_task = positive_environment_integer("SLURM_CPUS_PER_TASK")
+    tasks = positive_environment_integer("SLURM_NTASKS")
+    on_node = positive_environment_integer("SLURM_CPUS_ON_NODE")
+    if per_task is not None and args.threads > per_task:
+        raise CliError(
+            f"requested {args.threads} threads/rank but SLURM_CPUS_PER_TASK={per_task}; "
+            "reduce --threads or use --allow-oversubscribe"
+        )
+    if tasks is not None and ranks > tasks:
+        raise CliError(
+            f"requested {ranks} MPI ranks but SLURM_NTASKS={tasks}; "
+            "reduce --mpi-ranks or use --allow-oversubscribe"
+        )
+    total = ranks * args.threads
+    if on_node is not None and total > on_node:
+        raise CliError(
+            f"requested {total} CPUs ({ranks} ranks x {args.threads} threads) but "
+            f"SLURM_CPUS_ON_NODE={on_node}; reduce resources or use --allow-oversubscribe"
+        )
+    if any(value is not None for value in (per_task, tasks, on_node)):
+        return
+    for name in ("PBS_NP", "NSLOTS"):
+        allocation = positive_environment_integer(name)
+        if allocation is not None:
+            if total > allocation:
+                raise CliError(
+                    f"requested {total} CPUs but {name}={allocation}; reduce resources or "
+                    "use --allow-oversubscribe"
+                )
+            return
+    allocation = os.cpu_count() or 1
+    if total > allocation:
+        raise CliError(
+            f"requested {total} CPUs ({ranks} ranks x {args.threads} threads) but "
+            f"detected host count is {allocation}; reduce resources or use --allow-oversubscribe"
+        )
+
+
+def reject_enclosing_mpi_world() -> None:
+    for name in ("OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "PMIX_SIZE", "MV2_COMM_WORLD_SIZE"):
+        size = positive_environment_integer(name)
+        if size is not None and size > 1:
+            raise CliError(
+                f"wien2wannier is already running inside an MPI world ({name}={size}); "
+                "invoke one Python driver and let --parallel mpi launch the native ranks"
+            )
+
+
+def mpi_launcher_family(launcher: Path) -> tuple[str | None, str]:
+    """Identify the MPI launcher from one `--version` call; never raises."""
+    try:
+        result = subprocess.run(
+            [str(launcher), "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return None, f"{launcher.name} --version failed: {error.__class__.__name__}"
+    text = result.stdout or ""
+    match = re.search(r"\(Open MPI\)\s*(\S+)", text)
+    if result.returncode == 0 and match:
+        return "openmpi", f"Open MPI {match.group(1)}"
+    first = next((line.strip() for line in text.splitlines() if line.strip()), "no output")
+    return None, f"not identified as Open MPI: {first[:60]!r}, --version rc {result.returncode}"
+
+
+def mpi_binding(args: argparse.Namespace, launcher: Path) -> tuple[tuple[str, ...], str]:
+    """Launcher options that let each rank's threads use more than one core.
+
+    Open MPI's documented default binds each rank to a single core when it
+    starts two ranks or fewer, so the N threads of a rank would share that core.
+    `--bind-to none` leaves placement to the operating system. Binding changes
+    run time, never the products, so an unidentified launcher is left alone.
+    """
+    if args.mpi_bind == "launcher":
+        return (), "left to the launcher (--mpi-bind launcher)"
+    if args.mpi_bind == "none":
+        return ("--bind-to", "none"), "--bind-to none (--mpi-bind none)"
+    if args.threads == 1:
+        return (), "left to the launcher (one thread per rank)"
+    family, description = mpi_launcher_family(launcher)
+    if family == "openmpi":
+        return ("--bind-to", "none"), f"--bind-to none ({description}, {args.threads} threads per rank)"
+    return (), f"left to the launcher ({description})"
+
+
+def resolve_resources(
+    args: argparse.Namespace,
+    input_kind: str,
+    complex_vectors: bool,
+    directories: Sequence[Path],
+    needs_backend: bool,
+) -> ResourcePlan:
+    mode = args.parallel
+    if mode == "auto":
+        mode = "mpi" if args.mpi_ranks > 1 else ("threads" if args.threads > 1 else "serial")
+    if mode == "serial" and (args.threads != 1 or args.mpi_ranks != 1):
+        raise CliError("--parallel serial requires --threads 1 and --mpi-ranks 1")
+    if mode == "threads" and args.mpi_ranks != 1:
+        raise CliError("--parallel threads requires --mpi-ranks 1")
+    if input_kind == "bridge" and mode == "mpi":
+        raise CliError("bridge backend does not support MPI; use --parallel serial or threads")
+    if args.stage == "localize" and mode == "mpi":
+        raise CliError("--stage localize runs Wannier90 as one process; MPI mode is unsupported")
+    validate_resource_budget(args, mode)
+    if not needs_backend:
+        return ResourcePlan(mode, args.threads, args.mpi_ranks, None)
+    if input_kind == "bridge":
+        executable = "w2w_hybrid_acc" if mode == "threads" and args.threads > 1 else "w2w_hybrid"
+    elif mode == "mpi":
+        executable = "w2w_mpic" if complex_vectors else "w2w_mpi"
+    else:
+        executable = "w2wc" if complex_vectors else "w2w"
+    backend = require_executable(executable, "scientific backend", directories)
+    launcher = None
+    if mode == "mpi":
+        if args.mpi_ranks < 1:
+            raise CliError("--mpi-ranks must be positive")
+        if args.mpi_launcher:
+            launcher = require_executable(args.mpi_launcher, "MPI launcher")
+        else:
+            launcher = find_executable("mpiexec") or find_executable("mpirun")
+            if launcher is None:
+                raise CliError("MPI mode needs mpiexec or mpirun; set --mpi-launcher PATH")
+        launcher_args, binding = mpi_binding(args, launcher)
+        return ResourcePlan(
+            mode, args.threads, args.mpi_ranks, backend, launcher, launcher_args, binding
+        )
+    return ResourcePlan(mode, args.threads, args.mpi_ranks, backend, launcher)
+
+
+def def_records(inputs: WienInputs, seed: str) -> list[tuple[int, str, str, str, int]]:
+    records: list[tuple[int, str, str, str, int]] = [
+        (5, f"{seed}.inwf", "old", "formatted", 0),
+        (6, f"{seed}.outputwf", "unknown", "formatted", 0),
+        (7, f"{seed}.amn", "unknown", "formatted", 0),
+        (8, f"{seed}.mmn", "unknown", "formatted", 0),
+    ]
+    if inputs.vector2 is not None:
+        records.append((9, str(inputs.vector2), "old", "unformatted", 0))
+    records.extend(
+        (
+            (10, str(inputs.vector), "old", "unformatted", 0),
+            (11, f"{seed}.nnkp", "old", "formatted", 0),
+            (12, f"{seed}.eig", "unknown", "formatted", 0),
+            (18, str(inputs.vsp), "old", "formatted", 0),
+        )
+    )
+    if inputs.vsp2 is not None:
+        records.append((19, str(inputs.vsp2), "old", "formatted", 0))
+    records.append((20, str(inputs.struct), "old", "formatted", 0))
+    if inputs.inso is not None:
+        records.append((22, str(inputs.inso), "old", "formatted", 0))
+    records.extend(
+        (
+            (50, str(inputs.energy), "old", "formatted", 0),
+            (51, str(inputs.fermi), "old", "formatted", 0),
+        )
+    )
+    return sorted(records, key=lambda record: record[0])
+
+
+def format_def(records: Sequence[tuple[int, str, str, str, int]]) -> str:
+    lines: list[str] = []
+    for unit, filename, status, form, recl in records:
+        if any(character in filename for character in ("\0", "\n", "\r")):
+            raise CliError(f"def filename contains a forbidden control character: {filename!r}")
+        escaped = filename.replace("'", "''")
+        lines.append(f"{unit:3d},'{escaped}', '{status}', '{form}', {recl}\n")
+    return "".join(lines)
+
+
+def parse_hybrid_options(args: argparse.Namespace) -> list[tuple[str, str]]:
+    allowed = {
+        "margin", "gauge", "seedk", "seedloss", "capacity", "edges", "sweeps",
+        "relax", "adaptive", "relax_late", "taper_late", "taper", "text_io", "kick",
+        "tol", "rel_tol", "anderson",
+    }
+    reserved = {"froz_emax", "pool_factor", "solver", "colored"}
+    parsed: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw in args.hybrid_option:
+        if "=" not in raw:
+            raise CliError(f"--hybrid-option requires KEY=VALUE, got {raw!r}")
+        key, value = (part.strip() for part in raw.split("=", 1))
+        if key in reserved:
+            raise CliError(f"HYBR keyword {key!r} has a dedicated public option")
+        if key not in allowed:
+            raise CliError(f"unsupported integrated HYBR keyword {key!r}")
+        if not value:
+            raise CliError(f"HYBR keyword {key!r} has an empty value")
+        if key in seen:
+            raise CliError(f"duplicate HYBR keyword {key!r}")
+        seen.add(key)
+        if key in {"margin", "sweeps", "anderson"}:
+            try:
+                integer = int(value)
+            except ValueError as exc:
+                raise CliError(f"HYBR {key}: want an integer, got {value!r}") from exc
+            if key == "sweeps" and integer < 1:
+                raise CliError("HYBR sweeps must be a positive integer")
+            if key == "anderson" and integer < 0:
+                raise CliError("HYBR anderson must be >= 0")
+        elif key in {"relax", "taper", "taper_late", "tol", "rel_tol"}:
+            try:
+                number = float(value)
+            except ValueError as exc:
+                raise CliError(f"HYBR {key}: want a real number, got {value!r}") from exc
+            if not math.isfinite(number):
+                raise CliError(f"HYBR {key} must be finite")
+            if key == "relax" and number == 0.0:
+                raise CliError("HYBR relax cannot be 0")
+            if key in {"taper", "taper_late"} and not 0.0 < number < 1.0:
+                raise CliError(f"HYBR {key} must satisfy 0 < value < 1")
+            if key in {"tol", "rel_tol"} and number <= 0.0:
+                raise CliError(f"HYBR {key} must be positive")
+        elif key == "relax_late" and value != "auto":
+            try:
+                number = float(value)
+            except ValueError as exc:
+                raise CliError(f"HYBR relax_late: want a real number or auto, got {value!r}") from exc
+            if not math.isfinite(number):
+                raise CliError("HYBR relax_late must be finite")
+        elif key in {"adaptive", "text_io", "kick"}:
+            if value.lower() not in {
+                "t", "true", ".true.", "yes", "y", "on", "1",
+                "f", "false", ".false.", "no", "n", "off", "0",
+            }:
+                raise CliError(f"HYBR {key}: want true or false, got {value!r}")
+        elif key == "capacity" and value not in {"strict", "warn"}:
+            raise CliError("HYBR capacity: want strict or warn")
+        elif key == "edges" and value not in {"auto", "warn", "strict", "snap"}:
+            raise CliError("HYBR edges: want auto, warn, strict, or snap")
+        elif key == "gauge" and not re.fullmatch(
+            r"(?:scdm|ptg|u0|bscdm|lowdin|identity|ident|(?:auto|tfl|sms|pts|lds|bsms|slwd|slwa|slwf|slwp)\d*)",
+            value,
+        ):
+            raise CliError(f"HYBR gauge mode is unsupported: {value!r}")
+        elif key == "seedk" and not re.fullmatch(r"(?:opt\d*|best|median|[1-9]\d*)", value):
+            raise CliError(f"HYBR seedk policy is unsupported: {value!r}")
+        elif key == "seedloss" and value not in {"smooth", "blind", "local", "abel", "absm"}:
+            raise CliError(f"HYBR seedloss policy is unsupported: {value!r}")
+        parsed.append((key, value))
+    return parsed
+
+
+def make_inwf(args: argparse.Namespace, hybrid: bool) -> str:
+    if args.band_max < -1:
+        raise CliError("--band-max must be -1, 0, or a positive band index")
+    if args.band_min > 0 and args.band_max > 0 and args.band_max < args.band_min:
+        raise CliError("--band-max is below --band-min")
+    if not math.isfinite(args.projection_threshold) or not 0.0 <= args.projection_threshold <= 1.0:
+        raise CliError("--projection-threshold must be between 0 and 1")
+    if not math.isfinite(args.support_ratio) or not 0.0 <= args.support_ratio <= 1.0:
+        raise CliError("--support-ratio must be between 0 and 1")
+    if not math.isfinite(args.pool_factor) or args.pool_factor <= 1.0:
+        raise CliError("--pool-factor must be greater than 1")
+    if isinstance(args.froz_emax, str):
+        if not args.num_wann:
+            raise CliError(f"--froz-emax {args.froz_emax} needs --num-wann N: the automatic num_wann is the "
+                           "frozen capacity at a numeric ceiling")
+    elif not math.isfinite(args.froz_emax):
+        raise CliError("--froz-emax must be finite")
+    mode = "HYBR" if hybrid else "AUTO"
+    lines = [
+        mode,
+        f"{args.band_min} {args.band_max}",
+        str(args.ljmax),
+        f"{args.projection_threshold} {args.max_projections} T T {args.support_ratio}",
+    ]
+    if hybrid:
+        num_wann = 0 if args.num_wann is None else args.num_wann
+        lines.extend(
+            (
+                str(num_wann),
+                f"froz_emax = {args.froz_emax}",
+                f"pool_factor = {args.pool_factor}",
+                f"solver = {args.solver}",
+                f"colored = {'true' if args.colored_gs else 'false'}",
+            )
+        )
+        lines.extend(f"{key} = {value}" for key, value in parse_hybrid_options(args))
+    return "\n".join(lines) + "\n"
+
+
+def resolve_workflow(args: argparse.Namespace) -> Workflow:
+    reject_enclosing_mpi_world()
+    seed = require_name(args.seed, "--seed")
+    input_dir, input_case = resolve_input_path(args.input)
+    if args.output_dir:
+        output_dir = Path(args.output_dir).expanduser().resolve()
+    else:
+        output_dir = (Path.cwd() / f"{seed}-w2w").resolve()
+        try:
+            output_dir.relative_to(input_dir)
+        except ValueError:
+            pass
+        else:
+            output_dir = (input_dir.parent / f"{seed}-w2w").resolve()
+    try:
+        common = Path(os.path.commonpath((str(input_dir.resolve()), str(output_dir))))
+    except ValueError:
+        common = Path()
+    if common in {input_dir.resolve(), output_dir}:
+        raise CliError(
+            "--output-dir must be physically separate from --input (not equal, inside it, "
+            "or its parent); --force never authorizes modifying parent inputs"
+        )
+    kind = args.input_kind
+    case_hint = args.case or input_case or input_dir.name
+    bridge_hint = args.bridge_seed or args.case or input_dir.name
+    if kind == "auto":
+        has_struct = (input_dir / f"{case_hint}.struct").is_file()
+        bridge_complete = all(
+            (input_dir / f"{bridge_hint}.{suffix}").is_file()
+            or (suffix in {"amn", "mmn"} and (input_dir / f"{bridge_hint}.{suffix}.bin").is_file())
+            for suffix in ("amn", "mmn", "eig", "nnkp")
+        )
+        kind = "wien" if has_struct else ("bridge" if bridge_complete else "wien")
+    directories = backend_directories(args)
+    needs_backend = args.stage in {"all", "overlaps", "hybrid"}
+    if kind == "wien":
+        case = require_name(case_hint, "--case")
+        wien = resolve_wien_inputs(input_dir, case, args)
+        mesh, raw_kpoints = inspect_klist(wien.klist)
+        expected_kpoints = native_klist_coordinates(wien.struct, raw_kpoints)
+        validate_full_mesh(wien.klist, mesh, expected_kpoints)
+        nk = len(raw_kpoints)
+        if args.k_grid and tuple(args.k_grid) != mesh:
+            requested = " x ".join(str(value) for value in args.k_grid)
+            actual = " x ".join(str(value) for value in mesh)
+            raise CliError(f"requested --k-grid {requested} does not match existing case.klist mesh {actual}")
+        if wien.nnkp is not None:
+            validate_nnkp_coordinates(wien.nnkp, expected_kpoints)
+        resource = resolve_resources(args, kind, wien.complex_vectors, directories, needs_backend)
+        workflow = Workflow(args, kind, input_dir, output_dir, seed, resource, wien=wien, mesh=mesh, nk=nk)
+        workflow.def_records = def_records(wien, seed)
+        format_def(workflow.def_records)
+        needs_preprocess = args.stage in {"all", "prepare", "overlaps", "hybrid"} and wien.nnkp is None
+        needs_win_builder = args.stage in {"all", "prepare", "overlaps", "hybrid"} and wien.win is None
+        if needs_win_builder:
+            workflow.write_win_backend = require_executable("write_win_backend", "WIN preparation backend", directories)
+        if needs_preprocess:
+            if args.wannier90_preprocess:
+                workflow.preprocess = require_executable(args.wannier90_preprocess, "Wannier90 preprocessor")
+            elif args.wannier90:
+                workflow.preprocess = require_executable(args.wannier90, "Wannier90 preprocessor")
+            else:
+                workflow.preprocess = require_executable("wannier90.x", "Wannier90 preprocessor")
+        if args.stage != "localize":
+            if args.stage == "overlaps" and args.hybrid_option:
+                raise CliError("--hybrid-option does not apply to the raw AUTO overlaps stage")
+            make_inwf(args, hybrid=args.stage != "overlaps" and args.method != "window")
+            if args.stage in {"all", "hybrid"} and args.method == "window":
+                # the window route runs the raw AUTO export in w2w and then the
+                # standalone on it; the standalone sets the windows
+                if args.hybrid_option:
+                    raise CliError("--hybrid-option applies to the integrated HYBR frontend; --method window uses --bridge-arg")
+                if args.num_wann is None or args.num_wann == 0:
+                    raise CliError("--method window requires --num-wann N with N > 0")
+                window_executable = "w2w_hybrid_acc" if resource.mode == "threads" and args.threads > 1 else "w2w_hybrid"
+                workflow.window_backend = require_executable(window_executable, "window-route backend", directories)
+            if args.stage in {"all", "hybrid"} and args.method != "window":
+                forwarded = dict(parse_hybrid_options(args))
+                if forwarded.get("gauge") == "u0":
+                    existing(
+                        output_dir / f"{seed}-hyb.gauge0",
+                        "external u0 gauge input",
+                    )
+        elif args.method == "window":
+            validate_existing_window(workflow)
+        else:
+            validate_existing_handoff(workflow)
+        validate_backend_input_environment()
+        return workflow
+    if kind != "bridge":
+        raise CliError(f"unsupported input kind: {kind}")
+    bridge_seed = require_name(bridge_hint, "--bridge-seed")
+    files = {
+        suffix: existing(input_dir / f"{bridge_seed}.{suffix}", f"bridge {suffix.upper()}")
+        for suffix in ("eig", "nnkp", "win")
+    }
+    for suffix in ("amn", "mmn"):
+        text_path = input_dir / f"{bridge_seed}.{suffix}"
+        binary_path = input_dir / f"{bridge_seed}.{suffix}.bin"
+        if text_path.is_file() and text_path.stat().st_size > 0:
+            files[suffix] = text_path.resolve()
+        if binary_path.is_file() and binary_path.stat().st_size > 0:
+            files[f"{suffix}.bin"] = binary_path.resolve()
+        if suffix not in files and f"{suffix}.bin" not in files:
+            raise CliError(
+                f"missing bridge {suffix.upper()}; need nonempty {text_path} or {binary_path}"
+            )
+    if args.stage == "overlaps":
+        raise CliError("bridge inputs already contain overlaps; use --stage hybrid or all")
+    if args.stage in {"all", "hybrid"} and (args.num_wann is None or args.num_wann == 0):
+        raise CliError("bridge mode requires --num-wann N with N > 0")
+    if args.stage in {"all", "hybrid"} and bridge_seed == f"{seed}-hyb":
+        raise CliError(
+            "--bridge-seed collides with the generated <seed>-hyb output namespace; "
+            "choose a different --seed or --output-dir"
+        )
+    resource = resolve_resources(args, kind, False, directories, needs_backend)
+    workflow = Workflow(args, kind, input_dir, output_dir, seed, resource, bridge_seed=bridge_seed, bridge_files=files)
+    if args.hybrid_option:
+        raise CliError("--hybrid-option applies to the integrated WIEN frontend; use --bridge-arg for bridge mode")
+    make_inwf(args, hybrid=True)
+    if args.stage == "localize":
+        if args.method == "window":
+            validate_existing_window(workflow)
+        else:
+            validate_existing_handoff(workflow)
+    validate_backend_input_environment()
+    return workflow
+
+
+def display_command(command: Sequence[str]) -> str:
+    import shlex
+    return " ".join(shlex.quote(part) for part in command)
+
+
+def localizer_path(args: argparse.Namespace) -> Path | None:
+    if args.stage == "localize" and not args.wannier90:
+        raise CliError("--stage localize requires --wannier90 PATH")
+    if not args.wannier90:
+        return None
+    return require_executable(args.wannier90, "Wannier90 localizer")
+
+
+def bridge_command(workflow: Workflow) -> list[str]:
+    args = workflow.args
+    forbidden = {"--seed", "--nw", "--num-wann", "--out"}
+    if any(value in forbidden for value in args.bridge_arg):
+        raise CliError("--bridge-arg cannot override --seed, --num-wann, or --out")
+    interface = bridge_interface(workflow)
+    if interface == "named":
+        command_args = [
+            "--seed", str(workflow.bridge_seed),
+            "--nw", str(args.num_wann),
+            "--out", f"{workflow.seed}-hyb",
+            "--froz-emax", str(args.froz_emax),
+            "--pool-factor", str(args.pool_factor),
+            "--solver", args.solver,
+            *args.bridge_arg,
+        ]
+        if args.colored_gs:
+            command_args.append("--colored")
+    else:
+        if args.bridge_arg:
+            raise CliError(
+                "the detected positional bridge backend cannot accept --bridge-arg; "
+                "use the standalone executable directly for backend-specific controls"
+            )
+        # Compatibility with development-era w2w_hybrid binaries.  Positions
+        # 1--19 are the documented legacy contract; position 20 added solver.
+        command_args = [
+            str(workflow.bridge_seed), str(args.num_wann), f"{workflow.seed}-hyb",
+            "occ99", "auto", str(args.froz_emax), "0.0", "2000", "1e-10", "10",
+            "1" if args.colored_gs else "0", "0", "1.0", "scdm", "0", "0",
+            "none", "none", str(args.pool_factor), args.solver,
+        ]
+    return workflow.resource.command(command_args)
+
+
+def bridge_interface(workflow: Workflow) -> str:
+    backend = workflow.resource.backend
+    if backend is None:
+        raise CliError("internal error: bridge workflow lacks a backend")
+    try:
+        payload = backend.read_bytes()
+    except OSError as exc:
+        raise CliError(f"cannot inspect bridge backend interface {backend}: {exc}") from exc
+    named_markers = (b"--seed", b"--nw", b"--out", b"--pool-factor", b"--solver")
+    if all(marker in payload for marker in named_markers):
+        return "named"
+    positional_markers = (
+        b"usage: w2w_hybrid <seed>", b"pool factor =", b"arg 20 (solver)"
+    )
+    if all(marker in payload for marker in positional_markers):
+        return "positional"
+    raise CliError(
+        f"unrecognized bridge backend interface: {backend}; need the named-option "
+        "release interface or the documented 20-position compatibility interface"
+    )
+
+
+def integrated_command(workflow: Workflow) -> list[str]:
+    return workflow.resource.command([f"{workflow.seed}.def"])
+
+
+def plan_lines(workflow: Workflow) -> list[str]:
+    args = workflow.args
+    lines = [
+        f"input kind: {workflow.input_kind}",
+        f"input: {workflow.input_dir}",
+        f"output: {workflow.output_dir}",
+        f"seed: {workflow.seed}",
+        f"stage: {args.stage}",
+        f"resources: {workflow.resource.mode}, {workflow.resource.mpi_ranks} rank(s), {workflow.resource.threads} thread(s)/rank",
+    ]
+    bridge_openmp = (
+        workflow.input_kind == "bridge" and workflow.resource.mode == "threads"
+        and workflow.resource.threads > 1
+    )
+    omp_threads = workflow.resource.threads
+    blas_threads = 1 if bridge_openmp else workflow.resource.threads
+    note = "" if bridge_openmp else " (no OpenMP regions; OMP sizes an OpenMP-built BLAS)"
+    lines.append(f"thread layers: OMP={omp_threads}, BLAS={blas_threads} per rank{note}")
+    if workflow.resource.mode == "mpi" and workflow.resource.binding:
+        lines.append(f"MPI binding: {workflow.resource.binding}")
+    if workflow.mesh is not None and workflow.nk is not None:
+        lines.append(f"mesh: {workflow.mesh[0]} x {workflow.mesh[1]} x {workflow.mesh[2]} ({workflow.nk} k-points)")
+    if workflow.wien is not None:
+        lines.extend(
+            (
+                f"spin: {workflow.wien.spin}",
+                f"vector format: {'complex' if workflow.wien.complex_vectors else 'real'}",
+                f"backend: {workflow.resource.backend.name if workflow.resource.backend else '(not used by this stage)'}",
+                f"target: {'automatic num_wann from frozen capacity at ' + str(args.froz_emax) + ' eV above E_F' if args.num_wann in (None, 0) else str(args.num_wann)}",
+            )
+        )
+        lines.extend(f"def unit {unit:2d} {filename}" for unit, filename, _, _, _ in workflow.def_records)
+        if workflow.wien.nnkp is not None:
+            lines.append(f"neighbors: reuse validated {workflow.wien.nnkp}")
+        else:
+            lines.append(f"neighbors: {display_command([str(workflow.preprocess), '-pp', workflow.seed])}")
+    else:
+        if workflow.resource.backend is None:
+            interface_description = "not needed for prepare stage"
+        else:
+            interface_description = (
+                "named options" if bridge_interface(workflow) == "named"
+                else "legacy positional adapter"
+            )
+        lines.extend(
+            (
+                f"bridge input seed: {workflow.bridge_seed}",
+                f"backend: {workflow.resource.backend.name if workflow.resource.backend else '(not used by this stage)'}",
+                f"bridge interface: {interface_description}",
+            )
+        )
+    if args.stage in {"all", "overlaps", "hybrid"}:
+        if args.stage == "overlaps":
+            lines.append("scientific controls: AUTO raw projection/overlap export")
+        elif workflow.input_kind == "bridge":
+            lines.append(
+                "scientific controls: standalone bridge, "
+                f"solver={args.solver}, froz_emax={froz_emax_text(args.froz_emax)}, "
+                f"pool_factor={args.pool_factor}, colored={'true' if args.colored_gs else 'false'}, "
+                f"forwarded={display_command(args.bridge_arg) if args.bridge_arg else '(none)'}"
+            )
+        else:
+            forwarded = dict(parse_hybrid_options(args))
+            effective: dict[str, str] = {}
+            for key, variable, default in (
+                ("edges", "W2W_EDGES", "auto"),
+                ("seedk", "W2W_SEEDK", "opt16"),
+                ("seedloss", "W2W_SEEDLOSS", "smooth"),
+            ):
+                effective[key] = forwarded.get(key) or os.environ.get(variable) or default
+            lines.append(
+                "scientific controls: "
+                f"solver={args.solver}, gauge={forwarded.get('gauge', 'auto8')}, "
+                f"edges={effective['edges']}, seedk={effective['seedk']}, "
+                f"seedloss={effective['seedloss']}, froz_emax={froz_emax_text(args.froz_emax)}, "
+                f"pool_factor={args.pool_factor}, colored={'true' if args.colored_gs else 'false'}"
+            )
+        command = bridge_command(workflow) if workflow.input_kind == "bridge" else integrated_command(workflow)
+        lines.append("scientific command: " + display_command(command))
+    if args.method == "window" and args.stage in {"all", "hybrid"}:
+        lines.append("window route: " + display_command(window_command(workflow)) + f"  -> {workflow.seed}-hyb-win.{{amn,mmn,eig,win}}")
+    if args.wannier90 and args.stage in {"all", "hybrid", "localize"}:
+        target = f"{workflow.seed}-hyb-win" if args.method == "window" else f"{workflow.seed}-hyb"
+        lines.append("localize: " + display_command([str(localizer_path(args)), target]))
+    return lines
+
+
+def write_checked(path: Path, data: str, force: bool) -> None:
+    if path.exists() or path.is_symlink():
+        if not path.is_symlink() and path.is_file() and path.read_text(errors="replace") == data:
+            return
+        if not force:
+            raise CliError(f"refusing to replace conflicting output file {path}; use --force")
+        if path.is_dir() and not path.is_symlink():
+            raise CliError(f"refusing to replace output directory with a file: {path}")
+        path.unlink()
+    path.write_text(data)
+
+
+def copy_checked(source: Path, destination: Path, force: bool) -> None:
+    if destination.exists() and os.path.samefile(source, destination):
+        return
+    if destination.exists() or destination.is_symlink():
+        if destination.is_file() and source.read_bytes() == destination.read_bytes():
+            return
+        if not force:
+            raise CliError(f"refusing to replace conflicting output file {destination}; use --force")
+        if destination.is_dir() and not destination.is_symlink():
+            raise CliError(f"refusing to replace output directory with a file: {destination}")
+        destination.unlink()
+    shutil.copy2(source, destination)
+
+
+def symlink_checked(source: Path, destination: Path, force: bool) -> None:
+    if destination.exists() and os.path.samefile(source, destination):
+        return
+    if destination.exists() or destination.is_symlink():
+        if not force:
+            raise CliError(f"refusing to replace conflicting bridge link {destination}; use --force")
+        destination.unlink()
+    destination.symlink_to(source.resolve())
+
+
+def process_env(workflow: Workflow) -> dict[str, str]:
+    env = os.environ.copy()
+    for name in BACKEND_INPUT_ENV:
+        raw = env.get(name)
+        if raw:
+            path = Path(raw).expanduser()
+            env[name] = str(path if path.is_absolute() else (Path.cwd() / path).resolve())
+    explicit = {raw.split("=", 1)[0].strip() for raw in workflow.args.hybrid_option if "=" in raw}
+    for key, name in (
+        ("edges", "W2W_EDGES"), ("seedk", "W2W_SEEDK"), ("seedloss", "W2W_SEEDLOSS")
+    ):
+        if workflow.input_kind == "wien" and key in explicit:
+            env.pop(name, None)
+    bridge_openmp = (
+        workflow.input_kind == "bridge"
+        and workflow.resource.mode == "threads"
+        and workflow.resource.threads > 1
+    )
+    # The native w2w programs (built without -fopenmp) and Wannier90 3.x have no
+    # OpenMP regions of their own, so OMP_NUM_THREADS reaches only an OpenMP-built
+    # BLAS. Such a BLAS (Homebrew OpenBLAS 0.3.33) takes its pool size from
+    # OMP_NUM_THREADS and ignores OPENBLAS_NUM_THREADS, so both carry the budget.
+    # The OpenMP bridge keeps every BLAS pool at 1 to avoid nested pools.
+    for name in THREAD_ENV:
+        if name == "OMP_NUM_THREADS":
+            env[name] = str(workflow.resource.threads)
+        else:
+            env[name] = "1" if bridge_openmp else str(workflow.resource.threads)
+    if workflow.args.verbose:
+        env["W2W_VERBOSE"] = "1"
+    return env
+
+
+DIAGNOSTIC_LINE = re.compile(
+    r"(?:warning|error|failed|not\s+converged|sweep\s+cap|refus|invalid)", re.IGNORECASE
+)
+
+
+def warning_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if DIAGNOSTIC_LINE.search(line)]
+
+
+def run_external(command: Sequence[str], workflow: Workflow) -> None:
+    if workflow.args.verbose:
+        print("+ " + display_command(command))
+    kwargs: dict[str, object] = {
+        "cwd": workflow.output_dir,
+        "env": process_env(workflow),
+        "check": False,
+    }
+    if workflow.args.quiet:
+        kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    result = subprocess.run(command, **kwargs)
+    if result.returncode != 0:
+        if workflow.args.quiet:
+            if result.stdout:
+                sys.stderr.write(str(result.stdout))
+            if result.stderr:
+                sys.stderr.write(str(result.stderr))
+        raise CliError(f"command failed with exit code {result.returncode}: {display_command(command)}")
+    if workflow.args.quiet:
+        if result.stderr:
+            sys.stderr.write(str(result.stderr))
+        for line in warning_lines(str(result.stdout or "")):
+            print(line, file=sys.stderr)
+
+
+def emit_native_file_diagnostics(workflow: Workflow) -> None:
+    if not workflow.args.quiet or workflow.input_kind != "wien":
+        return
+    path = workflow.output_dir / f"{workflow.seed}.outputwf"
+    if not path.is_file():
+        return
+    lines = warning_lines(path.read_text(errors="replace"))
+    if lines:
+        print(f"{path}: native diagnostics:", file=sys.stderr)
+        for line in lines:
+            print(line, file=sys.stderr)
+
+
+def generate_win(workflow: Workflow, inwf_path: Path) -> None:
+    assert workflow.wien is not None
+    args = workflow.args
+    destination = workflow.output_dir / f"{workflow.seed}.win"
+    if workflow.wien.win is not None:
+        copy_checked(workflow.wien.win, destination, args.force)
+        return
+    if workflow.write_win_backend is None:
+        raise CliError("no source .win or write_win_backend available")
+    band = workflow.wien.directory / f"{workflow.wien.case}.klist_band"
+    template_candidates = [
+        Path(__file__).resolve().parent / "SRC_templates" / "case.win",
+        Path(__file__).resolve().parent.parent / "SRC_templates" / "case.win",
+    ]
+    template = next((path for path in template_candidates if path.is_file()), None)
+    template_text = template.read_text() if template else "num_bands = 1\nnum_wann = 1\nwrite_hr = true\n"
+    command = [
+        str(workflow.write_win_backend),
+        str(inwf_path), str(workflow.wien.struct), str(workflow.wien.klist), str(band),
+        "num_bands", "1", "num_wann", "1", "guiding_centres", "false",
+    ]
+    if args.verbose:
+        print("+ " + display_command(command))
+    result = subprocess.run(
+        command,
+        cwd=workflow.output_dir,
+        env=process_env(workflow),
+        input=template_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        if result.stderr:
+            sys.stderr.write(result.stderr)
+        raise CliError(f"WIN preparation failed with exit code {result.returncode}: {display_command(command)}")
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    write_checked(destination, result.stdout, args.force)
+
+
+def prepare_wien(workflow: Workflow) -> None:
+    assert workflow.wien is not None
+    args = workflow.args
+    hybrid = args.stage != "overlaps" and args.method != "window"
+    inwf_path = workflow.output_dir / f"{workflow.seed}.inwf"
+    write_checked(inwf_path, make_inwf(args, hybrid=hybrid), args.force)
+    write_checked(workflow.output_dir / f"{workflow.seed}.def", format_def(workflow.def_records), args.force)
+    generate_win(workflow, inwf_path)
+    nnkp_destination = workflow.output_dir / f"{workflow.seed}.nnkp"
+    if workflow.wien.nnkp is not None:
+        copy_checked(workflow.wien.nnkp, nnkp_destination, args.force)
+    else:
+        if workflow.preprocess is None:
+            raise CliError("NNKP generation requires Wannier90 -pp")
+        run_external([str(workflow.preprocess), "-pp", workflow.seed], workflow)
+        if not nnkp_destination.is_file():
+            raise CliError(f"Wannier90 -pp did not create {nnkp_destination}")
+    _, raw_kpoints = inspect_klist(workflow.wien.klist)
+    validate_nnkp_coordinates(
+        nnkp_destination,
+        native_klist_coordinates(workflow.wien.struct, raw_kpoints),
+    )
+
+
+def prepare_bridge(workflow: Workflow) -> None:
+    assert workflow.bridge_seed is not None
+    for suffix, source in workflow.bridge_files.items():
+        symlink_checked(source, workflow.output_dir / f"{workflow.bridge_seed}.{suffix}", workflow.args.force)
+    for suffix in ("amn.bin", "mmn.bin"):
+        if suffix in workflow.bridge_files:
+            continue
+        stale = workflow.output_dir / f"{workflow.bridge_seed}.{suffix}"
+        if stale.exists() or stale.is_symlink():
+            if not workflow.args.force:
+                raise CliError(
+                    f"refusing stale bridge cache {stale}; the selected source has no matching "
+                    "sidecar (use --force to remove it)"
+                )
+            if stale.is_dir() and not stale.is_symlink():
+                raise CliError(f"refusing to replace output directory with a file: {stale}")
+            stale.unlink()
+    projmap = workflow.input_dir / "projmap.dat"
+    if projmap.is_file():
+        symlink_checked(projmap.resolve(), workflow.output_dir / "projmap.dat", workflow.args.force)
+
+
+def append_suffix(path: Path, suffix: str) -> Path:
+    return Path(str(path) + suffix)
+
+
+def handoff_dimensions(amn: Path) -> tuple[int, int, int]:
+    try:
+        with amn.open(errors="replace") as stream:
+            next(stream)
+            fields = next(stream).split()
+        nb, nk, nw = (int(value) for value in fields[:3])
+    except (OSError, StopIteration, ValueError) as exc:
+        raise CliError(f"cannot read handoff dimensions from {amn}") from exc
+    if nb < 1 or nk < 1 or nw < 1:
+        raise CliError(f"invalid handoff dimensions in {amn}: {nb} {nk} {nw}")
+    return nb, nk, nw
+
+
+def validate_backend_products(workflow: Workflow) -> None:
+    error_file = workflow.output_dir / f"{workflow.seed}.error"
+    if error_file.is_file():
+        diagnostic = error_file.read_text(errors="replace").strip()
+        if diagnostic:
+            first_line = diagnostic.splitlines()[0]
+            raise CliError(f"native error file is nonempty ({error_file}): {first_line}")
+    if workflow.input_kind != "wien":
+        return
+    raw = workflow.output_dir / workflow.seed
+    for suffix in (".amn", ".mmn", ".eig"):
+        existing(append_suffix(raw, suffix), "raw overlap output")
+    _, nk, _ = handoff_dimensions(append_suffix(raw, ".amn"))
+    if workflow.nk is not None and nk != workflow.nk:
+        raise CliError(f"raw overlap output has {nk} k-points but the validated mesh has {workflow.nk}")
+
+
+def validate_existing_handoff(workflow: Workflow) -> tuple[int, int, int]:
+    localizer_path(workflow.args)
+    base = workflow.output_dir / f"{workflow.seed}-hyb"
+    for suffix in (".amn", ".mmn", ".eig", ".win"):
+        existing(append_suffix(base, suffix), "existing handoff file")
+    dimensions = handoff_dimensions(append_suffix(base, ".amn"))
+    if dimensions[0] != dimensions[2]:
+        raise CliError(
+            f"existing hybrid handoff is not isolated: num_bands={dimensions[0]}, "
+            f"num_wann={dimensions[2]}"
+        )
+    if workflow.nk is not None and dimensions[1] != workflow.nk:
+        raise CliError(
+            f"existing handoff has {dimensions[1]} k-points but the validated WIEN mesh has {workflow.nk}"
+        )
+    return dimensions
+
+
+def scientific_products(workflow: Workflow) -> list[Path]:
+    args = workflow.args
+    output = workflow.output_dir
+    products: list[Path] = []
+    if args.stage in {"all", "overlaps", "hybrid"}:
+        if workflow.input_kind == "wien":
+            products.extend(
+                output / name
+                for name in (
+                    f"{workflow.seed}.outputwf", f"{workflow.seed}.amn", f"{workflow.seed}.amn.bin",
+                    f"{workflow.seed}.mmn", f"{workflow.seed}.mmn.bin", f"{workflow.seed}.eig",
+                    f"{workflow.seed}.error", "projmap.dat", "projectability.dat", "autoprojection.diag",
+                )
+            )
+        if args.stage in {"all", "hybrid"}:
+            base = output / f"{workflow.seed}-hyb"
+            products.extend(append_suffix(base, suffix) for suffix in (".amn", ".mmn", ".eig", ".win", ".anchors", ".vdis", ".masks", ".anatomy", ".dis"))
+            if args.method == "window":
+                products.extend(append_suffix(base, "-win" + suffix) for suffix in (".amn", ".mmn", ".eig", ".win"))
+    if args.wannier90 and args.stage in {"all", "hybrid", "localize"}:
+        base = output / (f"{workflow.seed}-hyb-win" if args.method == "window" else f"{workflow.seed}-hyb")
+        products.extend(
+            append_suffix(base, suffix)
+            for suffix in (".wout", ".chk", "_centres.xyz", "_hr.dat", "_band.dat", "_band.gnu")
+        )
+    unique: list[Path] = []
+    for path in products:
+        if path not in unique:
+            unique.append(path)
+    return unique
+
+
+def preflight_scientific_outputs(workflow: Workflow, remove: bool) -> None:
+    conflicts = [path for path in scientific_products(workflow) if path.exists() or path.is_symlink()]
+    if not conflicts:
+        return
+    if not workflow.args.force:
+        listing = ", ".join(str(path) for path in conflicts[:4])
+        if len(conflicts) > 4:
+            listing += f", ... ({len(conflicts)} total)"
+        raise CliError(f"pre-existing scientific output would be replaced: {listing}; use --force")
+    if not remove:
+        return
+    for path in conflicts:
+        if path.is_dir() and not path.is_symlink():
+            raise CliError(f"refusing to remove scientific output directory: {path}")
+        path.unlink()
+
+
+def isolated_win(source_text: str, nw: int) -> str:
+    lines = source_text.splitlines()
+    output: list[str] = []
+    in_projections = False
+    seen_bands = seen_wann = seen_guiding = False
+    for line in lines:
+        stripped = line.strip()
+        lowered = stripped.lower()
+        if lowered.startswith("begin projections"):
+            in_projections = True
+            continue
+        if in_projections:
+            if lowered.startswith("end projections"):
+                in_projections = False
+            continue
+        if not stripped or stripped[0] in "#!":
+            output.append(line)
+            continue
+        key = re.split(r"\s*[=:]\s*", stripped, maxsplit=1)[0].lower()
+        if key.startswith("dis_") or key == "exclude_bands":
+            continue
+        if key == "num_bands":
+            output.append(f"num_bands = {nw}")
+            seen_bands = True
+        elif key == "num_wann":
+            output.append(f"num_wann = {nw}")
+            seen_wann = True
+        elif key == "guiding_centres":
+            output.append("guiding_centres = false")
+            seen_guiding = True
+        else:
+            output.append(line)
+    prefix: list[str] = []
+    if not seen_bands:
+        prefix.append(f"num_bands = {nw}")
+    if not seen_wann:
+        prefix.append(f"num_wann = {nw}")
+    if not seen_guiding:
+        prefix.append("guiding_centres = false")
+    return "\n".join([*prefix, *output]).rstrip() + "\n"
+
+
+def publish_handoff(workflow: Workflow) -> None:
+    base = workflow.output_dir / f"{workflow.seed}-hyb"
+    required = [append_suffix(base, suffix) for suffix in (".amn", ".mmn", ".eig")]
+    for path in required:
+        existing(path, "hybrid handoff file")
+    nb, nk, nw = handoff_dimensions(append_suffix(base, ".amn"))
+    if nb != nw:
+        raise CliError(f"hybrid handoff is not isolated: num_bands={nb}, num_wann={nw}")
+    if workflow.nk is not None and nk != workflow.nk:
+        raise CliError(f"handoff has {nk} k-points but the validated WIEN mesh has {workflow.nk}")
+    if workflow.input_kind == "bridge":
+        assert workflow.bridge_seed is not None
+        source_win = workflow.output_dir / f"{workflow.bridge_seed}.win"
+    else:
+        source_win = workflow.output_dir / f"{workflow.seed}.win"
+    win_text = isolated_win(source_win.read_text(errors="replace"), nw)
+    # The hybrid stage's outcome (converged, stopped at the sweep cap with a
+    # graded tail, or the CG exit) and the subspace continuity, from <seed>-hyb.dis,
+    # head the .win so the record travels with the files Wannier90 reads.
+    status_path = append_suffix(base, ".dis")
+    status = []
+    if status_path.is_file():
+        status = [line for line in status_path.read_text(errors="replace").splitlines() if line.startswith("!")]
+        if status:
+            win_text = "\n".join(status) + "\n" + win_text
+    write_checked(append_suffix(base, ".win"), win_text, workflow.args.force)
+    if not workflow.args.quiet:
+        print(f"handoff: {base}.{{amn,mmn,eig,win}} (num_wann={nw}, k-points={nk})")
+        for line in status:
+            print(line.lstrip("! "))
+    for line in status:
+        if "WARNING" in line or "POOR CONVERGENCE" in line:
+            print(f"{status_path}: {line.lstrip('! ')}", file=sys.stderr)
+
+
+def window_command(workflow: Workflow) -> list[str]:
+    """The standalone on the raw seed with --window: the same automatic
+    selection, also written as Wannier90 windows to <seed>-hyb-win.*."""
+    args = workflow.args
+    if workflow.input_kind == "bridge":
+        if bridge_interface(workflow) != "named":
+            raise CliError("--method window needs the named-option w2w_hybrid backend")
+        return [*bridge_command(workflow), "--window"]
+    assert workflow.window_backend is not None
+    forbidden = {"--seed", "--nw", "--num-wann", "--out"}
+    if any(value in forbidden for value in args.bridge_arg):
+        raise CliError("--bridge-arg cannot override --seed, --num-wann, or --out")
+    command = [
+        str(workflow.window_backend),
+        "--seed", workflow.seed,
+        "--nw", str(args.num_wann),
+        "--out", f"{workflow.seed}-hyb",
+        "--froz-emax", str(args.froz_emax),
+        "--pool-factor", str(args.pool_factor),
+        "--solver", args.solver,
+        *args.bridge_arg,
+        "--window",
+    ]
+    if args.colored_gs:
+        command.append("--colored")
+    return command
+
+
+def window_win(source_text: str, snippet_text: str) -> str:
+    """Complete the standalone's window snippet with the seed's geometry and
+    k-points: the snippet's keys (num_bands, num_wann, dis_*) replace the
+    source's, the projections block is dropped (the -win.amn carries the
+    anchor columns), guiding centres are off."""
+    values: dict[str, str] = {}
+    comments: list[str] = []
+    for line in snippet_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped[0] in "!#":
+            comments.append(line)
+            continue
+        key, value = re.split(r"\s*[=:]\s*", stripped, maxsplit=1)
+        values[key.lower()] = value.strip()
+    output: list[str] = []
+    seen: set[str] = set()
+    in_projections = False
+    for line in source_text.splitlines():
+        stripped = line.strip()
+        lowered = stripped.lower()
+        if lowered.startswith("begin projections"):
+            in_projections = True
+            continue
+        if in_projections:
+            if lowered.startswith("end projections"):
+                in_projections = False
+            continue
+        if not stripped or stripped[0] in "#!":
+            output.append(line)
+            continue
+        key = re.split(r"\s*[=:]\s*", stripped, maxsplit=1)[0].lower()
+        if key.startswith("dis_") or key == "exclude_bands":
+            continue
+        if key in values:
+            output.append(f"{key} = {values[key]}")
+            seen.add(key)
+        elif key == "guiding_centres":
+            output.append("guiding_centres = false")
+            seen.add(key)
+        else:
+            output.append(line)
+    prefix = [f"{key} = {value}" for key, value in values.items() if key not in seen]
+    if "guiding_centres" not in seen:
+        prefix.append("guiding_centres = false")
+    return "\n".join([*comments, *prefix, *output]).rstrip() + "\n"
+
+
+def validate_existing_window(workflow: Workflow) -> None:
+    localizer_path(workflow.args)
+    base = workflow.output_dir / f"{workflow.seed}-hyb-win"
+    for suffix in (".amn", ".mmn", ".eig", ".win"):
+        existing(append_suffix(base, suffix), "existing window-route file")
+
+
+def publish_window(workflow: Workflow) -> None:
+    base = workflow.output_dir / f"{workflow.seed}-hyb-win"
+    for suffix in (".amn", ".mmn", ".eig", ".win"):
+        existing(append_suffix(base, suffix), "window-route file")
+    nb, nk, nw = handoff_dimensions(append_suffix(base, ".amn"))
+    if workflow.nk is not None and nk != workflow.nk:
+        raise CliError(f"window route has {nk} k-points but the validated WIEN mesh has {workflow.nk}")
+    if workflow.input_kind == "bridge":
+        assert workflow.bridge_seed is not None
+        source_win = workflow.output_dir / f"{workflow.bridge_seed}.win"
+    else:
+        source_win = workflow.output_dir / f"{workflow.seed}.win"
+    snippet_path = append_suffix(base, ".win")
+    snippet = snippet_path.read_text(errors="replace")
+    if "begin kpoints" in snippet.lower():
+        return  # already completed by an earlier publish
+    snippet_path.write_text(window_win(source_win.read_text(errors="replace"), snippet))
+    if not workflow.args.quiet:
+        print(f"window route: {base}.{{amn,mmn,eig,win}} (num_bands={nb}, num_wann={nw}, k-points={nk}); "
+              "Wannier90 disentangles inside the written windows")
+
+
+def window_continuity(workflow: Workflow, seed: str) -> None:
+    """Window route, after localization: the subspace continuity of the subspace Wannier90
+    disentangled, from <seed>.chk and <seed>.mmn (w2w_hybrid --continuity-chk). The
+    hand-off reports its own before Wannier90 runs; in the window route Wannier90 chose
+    the subspace, so it is measured afterwards with the same thresholds. A diagnostic:
+    it never fails the run."""
+    backend = workflow.window_backend
+    if backend is None and workflow.input_kind == "bridge":
+        backend = workflow.resource.backend
+    if backend is None:
+        backend = find_executable("w2w_hybrid", backend_directories(workflow.args))
+    if backend is None:
+        print("window route: subspace continuity not checked (w2w_hybrid not found)", file=sys.stderr)
+        return
+    try:
+        run_external([str(backend), "--continuity-chk", seed], workflow)
+    except CliError as exc:
+        print(f"window route: subspace continuity not checked ({exc})", file=sys.stderr)
+
+
+def execute(workflow: Workflow) -> None:
+    args = workflow.args
+    preflight_scientific_outputs(workflow, remove=True)
+    localize_seed = f"{workflow.seed}-hyb-win" if args.method == "window" else f"{workflow.seed}-hyb"
+    if args.stage == "localize":
+        localizer = localizer_path(args)
+        if args.method == "window":
+            validate_existing_window(workflow)
+        else:
+            validate_existing_handoff(workflow)
+        run_external([str(localizer), localize_seed], workflow)
+        if args.method == "window":
+            window_continuity(workflow, localize_seed)
+        return
+    workflow.output_dir.mkdir(parents=True, exist_ok=True)
+    if workflow.input_kind == "wien":
+        prepare_wien(workflow)
+    else:
+        prepare_bridge(workflow)
+    if args.stage == "prepare":
+        return
+    if workflow.input_kind == "bridge":
+        command = window_command(workflow) if args.method == "window" else bridge_command(workflow)
+    else:
+        command = integrated_command(workflow)
+    run_external(command, workflow)
+    emit_native_file_diagnostics(workflow)
+    validate_backend_products(workflow)
+    if args.stage in {"all", "hybrid"}:
+        if args.method == "window":
+            if workflow.input_kind == "wien":
+                run_external(window_command(workflow), workflow)
+            publish_window(workflow)
+        else:
+            publish_handoff(workflow)
+        if args.wannier90:
+            run_external([str(localizer_path(args)), localize_seed], workflow)
+            if args.method == "window":
+                window_continuity(workflow, localize_seed)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        workflow = resolve_workflow(args)
+        preflight_scientific_outputs(workflow, remove=False)
+        lines = plan_lines(workflow)
+        if args.check or args.dry_run:
+            if not args.quiet:
+                print(("check OK" if args.check else "dry-run") + ":")
+                print("\n".join("  " + line for line in lines))
+            return 0
+        if args.verbose:
+            print("resolved workflow:")
+            print("\n".join("  " + line for line in lines))
+        execute(workflow)
+        return 0
+    except CliError as exc:
+        print(f"wien2wannier: error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
